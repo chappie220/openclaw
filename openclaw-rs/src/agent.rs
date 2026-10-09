@@ -6,6 +6,15 @@ use crate::config::AgentConfig;
 use crate::llm::{ChatMessage, Client, Completion, ToolCall, ToolSpec};
 use crate::store::Store;
 
+tokio::task_local! {
+    static CURRENT_SESSION: String;
+}
+
+/// The session whose turn is running on this task, for tools that act on it.
+pub fn current_session() -> Option<String> {
+    CURRENT_SESSION.try_with(Clone::clone).ok()
+}
+
 /// What the agent reports while a turn runs; front ends render these.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
@@ -55,6 +64,17 @@ impl<M: Model, T: Tools> Agent<M, T> {
     /// Runs one turn and returns the final assistant text. Every message is
     /// persisted as it is produced, so an interrupted turn keeps its progress.
     pub async fn run_turn(
+        &self,
+        session: &str,
+        input: &str,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<String> {
+        CURRENT_SESSION
+            .scope(session.to_owned(), self.turn(session, input, on_event))
+            .await
+    }
+
+    async fn turn(
         &self,
         session: &str,
         input: &str,

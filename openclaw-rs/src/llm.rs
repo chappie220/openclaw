@@ -160,7 +160,9 @@ impl Client {
             .connect_timeout(Duration::from_secs(20))
             .read_timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
-            .context("cannot build HTTP client")?;
+            .context(
+                "cannot build HTTP client; if no CA certificates load, install ca-certificates or fix SSL_CERT_FILE",
+            )?;
         Ok(Self {
             http,
             base_url: config.base_url.trim_end_matches('/').to_owned(),

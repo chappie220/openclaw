@@ -114,6 +114,18 @@ struct MemorySearchArgs {
 }
 
 #[derive(Deserialize)]
+struct CronAddArgs {
+    name: String,
+    schedule: String,
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+struct CronRemoveArgs {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct MemoryDeleteArgs {
     id: i64,
 }
@@ -156,6 +168,49 @@ impl BuiltinTools {
             .map(|m| format!("#{} {}", m.id, m.content))
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+
+    fn cron_add(&self, args: CronAddArgs) -> Result<String, String> {
+        let session = crate::agent::current_session()
+            .ok_or("error: cron_add can only schedule from a conversation")?;
+        let job = self
+            .store
+            .job_add(&args.name, &args.schedule, &session, &args.prompt)
+            .map_err(|e| format!("error: {e:#}"))?;
+        Ok(format!(
+            "scheduled {:?}; next run {}",
+            job.name,
+            format_time(job.next_run)
+        ))
+    }
+
+    fn cron_list(&self) -> Result<String, String> {
+        let jobs = self.store.job_list().map_err(|e| format!("error: {e:#}"))?;
+        if jobs.is_empty() {
+            return Ok("no scheduled jobs".into());
+        }
+        Ok(jobs
+            .iter()
+            .map(|j| {
+                format!(
+                    "{} [{}] session={} next={} prompt={:?}",
+                    j.name,
+                    j.schedule,
+                    j.session,
+                    format_time(j.next_run),
+                    j.prompt
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn cron_remove(&self, args: CronRemoveArgs) -> Result<String, String> {
+        match self.store.job_remove(&args.name) {
+            Ok(true) => Ok(format!("removed job {:?}", args.name)),
+            Ok(false) => Err(format!("error: no job named {:?}", args.name)),
+            Err(e) => Err(format!("error: {e:#}")),
+        }
     }
 
     fn memory_delete(&self, args: MemoryDeleteArgs) -> Result<String, String> {
@@ -358,6 +413,14 @@ impl BuiltinTools {
     }
 }
 
+fn format_time(unix: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local.timestamp_opt(unix, 0).single().map_or_else(
+        || "never".into(),
+        |t| t.format("%Y-%m-%d %H:%M %Z").to_string(),
+    )
+}
+
 fn parse<T: DeserializeOwned>(call: &ToolCall) -> Result<T, String> {
     serde_json::from_str(&call.function.arguments)
         .map_err(|err| format!("error: invalid arguments for {}: {err}", call.function.name))
@@ -416,6 +479,25 @@ impl Tools for BuiltinTools {
             "Delete a saved memory by its #id when it is wrong or outdated.",
             json!({"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}),
         ));
+        specs.push(ToolSpec::function(
+            "cron_add",
+            "Schedule a prompt to run in this conversation on a 5-field cron schedule (minute hour day month weekday, server local time). Use it for reminders and recurring checks; the result shows the next run time.",
+            json!({"type": "object", "properties": {
+                "name": {"type": "string", "description": "Unique job name"},
+                "schedule": {"type": "string", "description": "e.g. '0 9 * * 1-5' for 09:00 on weekdays"},
+                "prompt": {"type": "string", "description": "What to do when the job runs"}
+            }, "required": ["name", "schedule", "prompt"]}),
+        ));
+        specs.push(ToolSpec::function(
+            "cron_list",
+            "List scheduled jobs with their next run time.",
+            json!({"type": "object", "properties": {}}),
+        ));
+        specs.push(ToolSpec::function(
+            "cron_remove",
+            "Remove a scheduled job by name.",
+            json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
+        ));
         if self.config.write != Permission::Deny {
             specs.push(ToolSpec::function(
                 "write_file",
@@ -470,6 +552,9 @@ impl Tools for BuiltinTools {
             "memory_save" => parse(call).and_then(|args| self.memory_save(args)),
             "memory_search" => parse(call).and_then(|args| self.memory_search(args)),
             "memory_delete" => parse(call).and_then(|args| self.memory_delete(args)),
+            "cron_add" => parse(call).and_then(|args| self.cron_add(args)),
+            "cron_list" => self.cron_list(),
+            "cron_remove" => parse(call).and_then(|args| self.cron_remove(args)),
             other => Err(format!("error: unknown tool {other}")),
         };
         result.unwrap_or_else(|err| err)

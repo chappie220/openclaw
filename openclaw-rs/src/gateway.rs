@@ -16,7 +16,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::agent::{Agent, AgentEvent, Model, Tools};
 use crate::llm::Role;
@@ -26,6 +26,7 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 /// An unanswered approval is declined so a turn never waits forever.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SESSION_NAME: usize = 64;
+const SCHEDULER_TICK: Duration = Duration::from_secs(20);
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -74,6 +75,10 @@ enum ServerMsg {
     Sessions {
         sessions: Vec<SessionItem>,
     },
+    /// A turn nobody watched (a scheduled job) changed this session.
+    Updated {
+        session: String,
+    },
 }
 
 #[derive(Serialize, Clone)]
@@ -92,6 +97,7 @@ struct SessionItem {
 pub struct Gateway<M: Model, T: Tools> {
     agent: Arc<Agent<M, T>>,
     token: Option<String>,
+    updates: broadcast::Sender<ServerMsg>,
     /// One turn per session at a time; later sends queue behind it.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -103,6 +109,7 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         Arc::new(Self {
             agent,
             token,
+            updates: broadcast::channel(64).0,
             session_locks: Mutex::new(HashMap::new()),
         })
     }
@@ -118,6 +125,49 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
     fn session_lock(&self, session: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.session_locks.lock().unwrap_or_else(|p| p.into_inner());
         locks.entry(session.to_owned()).or_default().clone()
+    }
+
+    /// Runs a turn with nobody to approve tools, queued behind other turns of the session.
+    pub async fn run_unattended(&self, session: &str, prompt: &str) -> Result<String> {
+        let lock = self.session_lock(session);
+        let _turn = lock.lock().await;
+        let result = self.agent.run_turn(session, prompt, &mut |_| {}).await;
+        let _ = self.updates.send(ServerMsg::Updated {
+            session: session.to_owned(),
+        });
+        result
+    }
+
+    /// Runs due cron jobs; jobs added by the CLI or tools are picked up on the next tick.
+    pub async fn run_scheduler(self: Shared<M, T>) {
+        let mut tick = tokio::time::interval(SCHEDULER_TICK);
+        loop {
+            tick.tick().await;
+            let jobs = match self.agent.store.job_claim_due(crate::store::now()) {
+                Ok(jobs) => jobs,
+                Err(err) => {
+                    eprintln!("scheduler: cannot read jobs: {err:#}");
+                    continue;
+                }
+            };
+            for job in jobs {
+                let gateway = self.clone();
+                tokio::spawn(async move {
+                    let prompt = format!("[scheduled job {:?}] {}", job.name, job.prompt);
+                    let status = match gateway.run_unattended(&job.session, &prompt).await {
+                        Ok(_) => "ok".to_owned(),
+                        Err(err) => format!("error: {err:#}"),
+                    };
+                    eprintln!(
+                        "scheduler: job {:?} in session {:?}: {status}",
+                        job.name, job.session
+                    );
+                    if let Err(err) = gateway.agent.store.job_record(job.id, &status) {
+                        eprintln!("scheduler: cannot record job {:?}: {err:#}", job.name);
+                    }
+                });
+            }
+        }
     }
 
     fn authorized(&self, presented: Option<&str>) -> bool {
@@ -237,6 +287,21 @@ async fn connection<M: Model + 'static, T: Tools + 'static>(
             }
         }
     });
+    let mut updates = gateway.updates.subscribe();
+    let relay_out = out.clone();
+    let relay = tokio::spawn(async move {
+        loop {
+            match updates.recv().await {
+                Ok(msg) => {
+                    if relay_out.send(msg).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>> = Arc::default();
     let next_id = Arc::new(AtomicU64::new(1));
     while let Some(Ok(frame)) = stream.next().await {
@@ -294,6 +359,7 @@ async fn connection<M: Model + 'static, T: Tools + 'static>(
     }
     // Dropping pending senders declines approvals nobody can answer any more.
     pending.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    relay.abort();
     drop(out);
     let _ = writer.await;
 }

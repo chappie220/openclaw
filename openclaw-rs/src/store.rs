@@ -46,6 +46,19 @@ CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
   INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
 END;
 "#,
+    r#"
+CREATE TABLE jobs (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  schedule TEXT NOT NULL,
+  session TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  next_run INTEGER NOT NULL,
+  last_run INTEGER,
+  last_status TEXT
+);
+CREATE INDEX jobs_by_next_run ON jobs(next_run);
+"#,
 ];
 
 #[derive(Clone)]

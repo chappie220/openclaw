@@ -12,8 +12,21 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Tools: shell and files, with approval | phase 2 ✅ |
 | Long-term memory search (SQLite FTS5) | phase 3 ✅ |
 | Gateway HTTP/WebSocket + Web UI | phase 4 ✅ |
-| Scheduled tasks / heartbeat, OpenRC service | phase 5 |
+| Scheduled tasks / heartbeat, OpenRC service | phase 5 ✅ |
 | QQ channel (official QQ Bot API) | phase 6 |
+
+## Build for Raspberry Pi (Alpine, aarch64)
+
+Alpine uses musl, so build a static binary. Cross-compile from any Linux host:
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+pip install ziglang && cargo install cargo-zigbuild
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+scp target/aarch64-unknown-linux-musl/release/openclaw-rs pi:/usr/local/bin/
+```
+
+Or build on the Pi itself: `apk add cargo build-base && cargo build --release`.
 
 ## Usage
 
@@ -45,6 +58,36 @@ bind = "127.0.0.1:18789"
 # token = "..."   # prefer OPENCLAW_RS_TOKEN
 ```
 
+## Scheduled jobs
+
+`serve` runs jobs on standard 5-field cron schedules in the host's local time.
+A job's prompt runs as a turn in its session; tools set to `ask` are declined
+because nobody is there to approve. A job missed while the Gateway was down
+runs once at startup, then follows its schedule. A heartbeat is a job:
+
+```sh
+openclaw-rs cron add heartbeat "*/30 * * * *" -s main "Check my notes and reminders"
+openclaw-rs cron list
+openclaw-rs cron remove heartbeat
+```
+
+The model can also create, list and remove jobs (`cron_add`, `cron_list`,
+`cron_remove`); a job it creates runs in the conversation that asked for it.
+
+## OpenRC service
+
+```sh
+export OPENROUTER_API_KEY=sk-or-... OPENCLAW_RS_TOKEN=...
+doas openclaw-rs service install --user pi   # or sudo -E
+rc-service openclaw-rs status
+tail -f /var/log/openclaw-rs.log
+doas openclaw-rs service uninstall           # keeps state and logs
+```
+
+The service runs as the given account with state in its `~/.openclaw-rs`,
+under `supervise-daemon` with automatic restart. The two variables above are
+copied into `/etc/conf.d/openclaw-rs` (mode 0600).
+
 Long-term memory is a SQLite FTS5 index with the trigram tokenizer, so Chinese
 text matches by substring without word segmentation. Space-separated terms
 match any; terms shorter than three characters fall back to `LIKE`. The model
@@ -53,7 +96,7 @@ gets `memory_save`, `memory_search` and `memory_delete` tools.
 State lives in `~/.openclaw-rs` (override with `OPENCLAW_RS_HOME`):
 
 - `config.toml`: optional settings
-- `state.sqlite`: sessions, messages and memories
+- `state.sqlite`: sessions, messages, memories and scheduled jobs
 
 ```toml
 [model]

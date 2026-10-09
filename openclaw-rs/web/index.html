@@ -140,6 +140,11 @@ function renderSessions(list) {
 
 function handle(m) {
   if (m.type === "sessions") return renderSessions(m.sessions);
+  if (m.type === "updated") {
+    send({ type: "sessions" });
+    if (m.session === current && !busy.has(current)) send({ type: "history", session: current });
+    return;
+  }
   if (m.session && m.session !== current) {
     if (m.type === "done" || m.type === "error") { busy.delete(m.session); send({ type: "sessions" }); return; }
     if (m.type !== "approval") return;
