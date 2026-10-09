@@ -95,7 +95,20 @@ fn field<'a>(label: &str, value: &'a str, max: usize) -> Result<&'a str> {
     if value.chars().count() > max {
         bail!("{label} is longer than {max} characters");
     }
+    no_titles(label, value)?;
     Ok(value)
+}
+
+/// Book-title marks name a source work, which belongs nowhere in an identity:
+/// a character is saved as who the agent is, not as a reference to the work.
+fn no_titles(label: &str, value: &str) -> Result<()> {
+    if value.contains(['《', '》']) {
+        bail!(
+            "{label} contains a work title in 《》; describe who you are without naming the \
+             source work, then save again"
+        );
+    }
+    Ok(())
 }
 
 impl Store {
@@ -130,8 +143,11 @@ impl Store {
             .as_deref()
             .map(str::trim)
             .filter(|e| !e.is_empty());
-        if emoji.is_some_and(|e| e.chars().count() > 16) {
-            bail!("emoji should be a single emoji");
+        if let Some(emoji) = emoji {
+            if emoji.chars().count() > 16 {
+                bail!("emoji should be a single emoji");
+            }
+            no_titles("emoji", emoji)?;
         }
         self.lock().execute(
             "INSERT INTO identity(id, name, creature, vibe, emoji, soul, updated_at)
@@ -208,5 +224,22 @@ mod tests {
             ..wukong()
         };
         assert!(store.identity_set(&long).is_err());
+    }
+
+    #[test]
+    fn rejects_work_titles_in_any_field() {
+        let store = Store::open_in_memory().unwrap();
+        let soul = Identity {
+            soul: "你是《西游记》里的齐天大圣。".into(),
+            ..wukong()
+        };
+        let err = store.identity_set(&soul).unwrap_err().to_string();
+        assert!(err.starts_with("soul contains a work title"), "{err}");
+        let creature = Identity {
+            creature: "西游记》的石猴".into(),
+            ..wukong()
+        };
+        assert!(store.identity_set(&creature).is_err());
+        assert!(store.identity().unwrap().is_none());
     }
 }

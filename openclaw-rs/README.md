@@ -183,7 +183,8 @@ agree.
 The identity follows OpenClaw's persona files: an `IDENTITY.md` record and a
 `SOUL.md` voice. A character becomes the agent's own identity instead of a
 reference to it: no titles of works, authors, actors, plot summaries, citations
-or "based on" lines.
+or "based on" lines. Saving refuses any field that contains a work title in
+book-title marks (《》), from the model and from the CLI alike.
 
 ```text
 > 变成孙悟空
