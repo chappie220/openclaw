@@ -3,6 +3,7 @@
 mod access;
 mod agent;
 mod config;
+mod context;
 mod cron;
 mod gateway;
 mod identity;

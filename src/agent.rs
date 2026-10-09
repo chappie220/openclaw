@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 
 use crate::access::{self, Actor};
 use crate::config::AgentConfig;
+use crate::context;
 use crate::identity;
 use crate::llm::{ChatMessage, Client, Completion, ToolCall, ToolSpec};
 use crate::store::Store;
@@ -92,16 +93,22 @@ impl<M: Model, T: Tools> Agent<M, T> {
         let session_id = self.store.session_id(session)?;
         self.store.append(session_id, &ChatMessage::user(input))?;
         let specs = self.tools.specs();
+        let tool_json = serde_json::to_string(&specs)?;
         for _ in 0..self.config.max_steps {
             // Read per call so an identity saved mid-turn takes effect on the next call.
             let identity = self.store.identity()?;
             let can_set = access::current().is_some_and(|a| a.can(access::Capability::Identity));
-            let mut messages = vec![ChatMessage::system(identity::system_prompt(
-                &self.config.system_prompt,
-                identity.as_ref(),
-                can_set,
-            ))];
-            messages.extend(self.store.history(session_id, self.config.history_limit)?);
+            let system =
+                identity::system_prompt(&self.config.system_prompt, identity.as_ref(), can_set);
+            let overhead = context::estimate(&system) + context::estimate(&tool_json);
+            let (history, marks) = self.store.context(session_id)?;
+            let (window, fitted) =
+                context::fit(history, marks, overhead, self.config.context_tokens);
+            if fitted != marks {
+                self.store.set_marks(session_id, fitted)?;
+            }
+            let mut messages = vec![ChatMessage::system(system)];
+            messages.extend(window);
             let completion = self
                 .model
                 .complete(&messages, &specs, &mut |text| {

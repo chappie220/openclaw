@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
 
+use crate::context::Marks;
 use crate::llm::{ChatMessage, Role, ToolCall};
 
 /// One database file: its ordered schema steps (`PRAGMA user_version` records
@@ -92,7 +93,8 @@ CREATE TABLE identity_drafts (
 
 const CHATS: Schema = Schema {
     file: "chats.sqlite",
-    migrations: &[r#"
+    migrations: &[
+        r#"
 CREATE TABLE sessions (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -109,7 +111,13 @@ CREATE TABLE messages (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX messages_by_session ON messages(session_id, id);
-"#],
+"#,
+        r#"
+-- Where the window sent to the model starts; see context.rs.
+ALTER TABLE sessions ADD COLUMN context_start INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN context_pruned_before INTEGER NOT NULL DEFAULT 0;
+"#,
+    ],
     legacy: &[
         ("sessions", "id, name, created_at, updated_at"),
         (
@@ -698,33 +706,45 @@ impl Store {
     pub fn history(&self, session_id: i64, limit: usize) -> Result<Vec<ChatMessage>> {
         let conn = self.chats();
         let mut stmt = conn.prepare(
-            "SELECT role, content, tool_calls, tool_call_id FROM (
+            "SELECT id, role, content, tool_calls, tool_call_id FROM (
                SELECT id, role, content, tool_calls, tool_call_id FROM messages
                WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2
              ) ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        let mut messages = Vec::new();
-        for row in rows {
-            let (role, content, tool_calls, tool_call_id) = row?;
-            let tool_calls: Option<Vec<ToolCall>> = tool_calls
-                .map(|json| serde_json::from_str(&json))
-                .transpose()?;
-            messages.push(ChatMessage {
-                role: Role::parse(&role)?,
-                content,
-                tool_calls,
-                tool_call_id,
-            });
-        }
-        Ok(trim_orphan_tool_results(messages))
+        let messages = read_messages(&mut stmt, params![session_id, limit as i64])?;
+        Ok(trim_orphan_tool_results(
+            messages.into_iter().map(|(_, m)| m).collect(),
+        ))
+    }
+
+    /// The session's context marks and every message from the window start
+    /// on, with ids, for `context::fit`.
+    pub fn context(&self, session_id: i64) -> Result<(Vec<(i64, ChatMessage)>, Marks)> {
+        let conn = self.chats();
+        let marks = conn.query_row(
+            "SELECT context_start, context_pruned_before FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| {
+                Ok(Marks {
+                    start: row.get(0)?,
+                    pruned_before: row.get(1)?,
+                })
+            },
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, role, content, tool_calls, tool_call_id FROM messages
+             WHERE session_id = ?1 AND id >= ?2 ORDER BY id ASC",
+        )?;
+        let messages = read_messages(&mut stmt, params![session_id, marks.start])?;
+        Ok((messages, marks))
+    }
+
+    pub fn set_marks(&self, session_id: i64, marks: Marks) -> Result<()> {
+        self.chats().execute(
+            "UPDATE sessions SET context_start = ?2, context_pruned_before = ?3 WHERE id = ?1",
+            params![session_id, marks.start, marks.pruned_before],
+        )?;
+        Ok(())
     }
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>> {
@@ -748,6 +768,39 @@ impl Store {
         let conn = self.chats();
         Ok(conn.execute("DELETE FROM sessions WHERE name = ?1", [name])? > 0)
     }
+}
+
+/// Rows of `id, role, content, tool_calls, tool_call_id`.
+fn read_messages(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> Result<Vec<(i64, ChatMessage)>> {
+    let rows = stmt.query_map(params, |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (id, role, content, tool_calls, tool_call_id) = row?;
+        let tool_calls: Option<Vec<ToolCall>> = tool_calls
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        messages.push((
+            id,
+            ChatMessage {
+                role: Role::parse(&role)?,
+                content,
+                tool_calls,
+                tool_call_id,
+            },
+        ));
+    }
+    Ok(messages)
 }
 
 /// A history window can start between an assistant tool call and its results;
@@ -799,6 +852,27 @@ mod tests {
     }
 
     /// Builds a pre-split `state.sqlite` with the same tables in one file.
+    #[test]
+    fn context_starts_at_the_persisted_mark() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.session_id("main").unwrap();
+        for text in ["a", "b", "c"] {
+            store.append(id, &ChatMessage::user(text)).unwrap();
+        }
+        let (all, marks) = store.context(id).unwrap();
+        assert_eq!(marks, Marks::default());
+        assert_eq!(all.len(), 3);
+        let marks = Marks {
+            start: all[1].0,
+            pruned_before: all[2].0,
+        };
+        store.set_marks(id, marks).unwrap();
+        let (rest, again) = store.context(id).unwrap();
+        assert_eq!(again, marks);
+        assert_eq!(rest[0].1.content.as_deref(), Some("b"));
+        assert_eq!(rest.len(), 2);
+    }
+
     fn legacy_file(dir: &Path) {
         let conn = Connection::open(dir.join(LEGACY_FILE)).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();

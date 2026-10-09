@@ -366,7 +366,7 @@ request_timeout_secs = 300
 [agent]
 system_prompt = "You are a helpful personal assistant running on OpenClaw."
 max_steps = 25       # model calls per turn before giving up
-history_limit = 200  # recent messages sent to the model
+context_tokens = 64000  # token budget per model call; keep below the model's window
 
 [tools]
 # workspace = "/path"   # default: <state dir>/workspace
