@@ -14,6 +14,7 @@ mod qq;
 mod review;
 mod search;
 mod service;
+mod setup;
 mod store;
 mod tools;
 mod usage;
@@ -85,6 +86,8 @@ enum Command {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
+    Config,
     /// Tokens and cost of model calls, per session.
     Usage {
         /// How many days back to count.
@@ -222,6 +225,10 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let state = config::state_dir()?;
     let config_path = cli.config.unwrap_or_else(|| state.join("config.toml"));
+    // Before loading, so a file that does not load can still be repaired.
+    if let Command::Config = cli.command {
+        return setup::run(&config_path);
+    }
     let config = Config::load(&config_path)?;
     let store = Store::open(&state)?;
     match cli.command {
@@ -260,6 +267,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
+        Command::Config => unreachable!("handled before the config is loaded"),
         Command::Serve { bind } => {
             if store.identity()?.is_none() {
                 eprintln!("{FIRST_START_HINT}");

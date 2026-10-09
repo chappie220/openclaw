@@ -42,6 +42,18 @@ cargo build --release
 ./target/release/openclaw-rs memory search chinese
 ```
 
+## Configuration
+
+`openclaw-rs config` edits `<state dir>/config.toml` interactively, section by
+section (model and context, tools, gateway, QQ, email, web search, access).
+Each field shows the value in effect; Enter keeps it, `-` resets it to the
+default, `?` explains it. Secrets are typed without echo and the prompt says
+when an environment variable overrides them; `+` generates a Gateway token.
+Comments and keys the editor does not know are kept, every change is checked
+before it is accepted, and the file is saved with mode 0600. It also opens a
+file that currently fails to load, so it can be repaired. The full list of
+options is under [Memory](#memory) below.
+
 ## Gateway and Web UI
 
 ```sh
