@@ -21,19 +21,6 @@ pub trait Tools: Send + Sync {
     async fn call(&self, call: &ToolCall) -> String;
 }
 
-/// Phase-one host with no tools.
-pub struct NoTools;
-
-#[async_trait::async_trait]
-impl Tools for NoTools {
-    fn specs(&self) -> Vec<ToolSpec> {
-        Vec::new()
-    }
-    async fn call(&self, call: &ToolCall) -> String {
-        format!("error: unknown tool {}", call.function.name)
-    }
-}
-
 /// Abstracts the model so the loop can be tested without a network.
 #[async_trait::async_trait]
 pub trait Model: Send + Sync {

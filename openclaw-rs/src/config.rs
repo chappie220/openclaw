@@ -16,6 +16,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are OpenClaw, a helpful personal assist
 pub struct Config {
     pub model: ModelConfig,
     pub agent: AgentConfig,
+    pub tools: ToolsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,40 @@ pub struct AgentConfig {
     pub max_steps: usize,
     /// Most recent messages sent to the model; older history stays in SQLite.
     pub history_limit: usize,
+}
+
+/// What a tool category may do without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Working directory for relative paths and shell commands (default: <state dir>/workspace).
+    pub workspace: Option<PathBuf>,
+    pub shell: Permission,
+    /// Covers write_file and edit_file; reads are always allowed.
+    pub write: Permission,
+    pub shell_timeout_secs: u64,
+    /// Per-stream cap on tool output returned to the model.
+    pub max_output_bytes: usize,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            shell: Permission::Ask,
+            write: Permission::Ask,
+            shell_timeout_secs: 120,
+            max_output_bytes: 16 * 1024,
+        }
+    }
 }
 
 impl Default for ModelConfig {

@@ -4,17 +4,20 @@ mod agent;
 mod config;
 mod llm;
 mod store;
+mod tools;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::agent::{Agent, AgentEvent, NoTools};
+use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
 use crate::store::Store;
+use crate::tools::{BuiltinTools, TerminalApprover};
 
 #[derive(Parser)]
 #[command(name = "openclaw-rs", version, about = "Single-binary OpenClaw")]
@@ -72,11 +75,11 @@ async fn run(cli: Cli) -> Result<()> {
             if message.trim().is_empty() {
                 bail!("nothing to send");
             }
-            let agent = build_agent(&config, store)?;
+            let agent = build_agent(&config, &state, store)?;
             turn(&agent, &session, &message).await
         }
         Command::Chat { session } => {
-            let agent = build_agent(&config, store)?;
+            let agent = build_agent(&config, &state, store)?;
             eprintln!(
                 "session {session} · model {} · empty line or Ctrl-D to quit",
                 config.model.model
@@ -99,16 +102,23 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn build_agent(config: &Config, store: Store) -> Result<Agent<llm::Client, NoTools>> {
+type CliAgent = Agent<llm::Client, BuiltinTools>;
+
+fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
+    let workspace = config
+        .tools
+        .workspace
+        .clone()
+        .unwrap_or_else(|| state.join("workspace"));
     Ok(Agent {
         model: llm::Client::new(&config.model, config.api_key()?)?,
-        tools: NoTools,
+        tools: BuiltinTools::new(workspace, config.tools.clone(), Arc::new(TerminalApprover))?,
         store,
         config: config.agent.clone(),
     })
 }
 
-async fn turn(agent: &Agent<llm::Client, NoTools>, session: &str, input: &str) -> Result<()> {
+async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
     let mut stdout = std::io::stdout();
     agent
         .run_turn(session, input, &mut |event| match event {

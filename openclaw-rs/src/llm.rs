@@ -119,7 +119,6 @@ pub struct ToolFunctionSpec {
 }
 
 impl ToolSpec {
-    #[cfg_attr(not(test), allow(dead_code))] // Built-in tools arrive in phase 2.
     pub fn function(name: &str, description: &str, parameters: Value) -> Self {
         Self {
             kind: "function",
