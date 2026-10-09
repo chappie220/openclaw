@@ -13,6 +13,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::agent::Tools;
 use crate::config::{Permission, ToolsConfig};
+use crate::identity::Identity;
 use crate::llm::{ToolCall, ToolSpec};
 use crate::search::Searcher;
 use crate::store::Store;
@@ -130,9 +131,11 @@ struct CronRemoveArgs {
 #[derive(Deserialize)]
 struct IdentitySetArgs {
     name: String,
-    persona: String,
+    creature: String,
+    vibe: String,
     #[serde(default)]
-    source: Option<String>,
+    emoji: Option<String>,
+    soul: String,
 }
 
 #[derive(Deserialize)]
@@ -171,12 +174,25 @@ impl BuiltinTools {
         let current = self.store.identity().map_err(|e| format!("error: {e:#}"))?;
         // The first identity is the setup the agent was asked to do; changes need consent.
         if current.is_some() {
-            let summary = format!("become {:?}: {}", args.name.trim(), args.persona.trim());
+            let summary = format!(
+                "become {:?} ({}, {})\n{}",
+                args.name.trim(),
+                args.creature.trim(),
+                args.vibe.trim(),
+                args.soul.trim()
+            );
             self.permit(self.config.identity, "identity_set", &summary)
                 .await?;
         }
         self.store
-            .identity_set(&args.name, &args.persona, args.source.as_deref())
+            .identity_set(&Identity {
+                name: args.name.clone(),
+                creature: args.creature,
+                vibe: args.vibe,
+                emoji: args.emoji,
+                soul: args.soul,
+                ..Identity::default()
+            })
             .map_err(|e| format!("error: {e:#}"))?;
         Ok(format!(
             "identity saved: you are now {}; it applies to every conversation from your next reply",
@@ -547,12 +563,14 @@ impl Tools for BuiltinTools {
         ));
         specs.push(ToolSpec::function(
             "identity_set",
-            "Save your identity (name and persona) for every conversation. Use it to finish first-start setup, or when the user asks to change who you are; show them the draft first.",
+            "Save your identity (IDENTITY.md fields and SOUL.md) for every conversation. Use it to finish first-start setup, or when the user asks to change who you are; show them the draft first. Write it as who you are: never name a source work, author or actor, summarize plot, cite pages, or say you are based on or playing someone.",
             json!({"type": "object", "properties": {
-                "name": {"type": "string", "description": "What you are called"},
-                "persona": {"type": "string", "description": "Second person, under 4000 characters: personality, speaking style, catchphrases, background, and how to address the user"},
-                "source": {"type": "string", "description": "For a fictional character: the character and the work, e.g. 'Sun Wukong, Journey to the West'"}
-            }, "required": ["name", "persona"]}),
+                "name": {"type": "string", "description": "What the user calls you"},
+                "creature": {"type": "string", "description": "What you are, e.g. an AI, a robot, a stone monkey"},
+                "vibe": {"type": "string", "description": "One line on how you come across"},
+                "emoji": {"type": "string", "description": "One signature emoji"},
+                "soul": {"type": "string", "description": "SOUL.md, addressed to you as 'You ...', under 4000 characters: tone, speech patterns and catchphrases, opinions, how you address the user, boundaries. Behavior, not biography."}
+            }, "required": ["name", "creature", "vibe", "soul"]}),
         ));
         if self.search.is_some() {
             specs.push(ToolSpec::function(
@@ -781,7 +799,12 @@ mod tests {
         // No approver, as on QQ or email: first-start setup must still work there.
         let t = BuiltinTools::new(dir.path().to_owned(), ToolsConfig::default(), store.clone())
             .unwrap();
-        let set = |name: &str| call("identity_set", json!({"name": name, "persona": "Curious."}));
+        let set = |name: &str| {
+            call(
+                "identity_set",
+                json!({"name": name, "creature": "AI", "vibe": "curious", "soul": "You ask why."}),
+            )
+        };
         let out = t.call(&set("Ada")).await;
         assert!(out.starts_with("identity saved"), "{out}");
         let out = t.call(&set("Eve")).await;

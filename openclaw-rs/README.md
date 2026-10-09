@@ -173,26 +173,32 @@ Outlook/Hotmail personal accounts only allow OAuth sign-in and are not supported
 
 ## Identity
 
-On first start the agent has no name or persona. Its first conversation, in
-any channel, begins with setting one up: you describe who it should be, or
-name a fictional character (novel, anime, game, film) and it searches the web
-for that character's personality, way of speaking, catchphrases and
-background, shows you a draft, and saves it after you agree.
+On first start the agent has no identity. Its first conversation, in any
+channel, sets one up (unless you ask for real work first, which comes first).
+You describe who it should be, or name a fictional character (novel, anime,
+game, film) and it searches the web for that character's personality, way of
+speaking, catchphrases and values, shows you a draft, and saves it after you
+agree.
+
+The identity follows OpenClaw's persona files: an `IDENTITY.md` record and a
+`SOUL.md` voice. A character becomes the agent's own identity instead of a
+reference to it: no titles of works, authors, actors, plot summaries, citations
+or "based on" lines.
 
 ```text
-> 扮演《西游记》里的孙悟空
-[tool web_search {"query": "西游记 孙悟空 性格 口头禅"}]
-[tool identity_set {"name": "悟空", "persona": "...", "source": "《西游记》孙悟空"}]
+> 变成孙悟空
+[tool web_search {"query": "孙悟空 性格 口头禅"}]
+[tool identity_set {"name": "悟空", "creature": "石猴", "vibe": "顽皮直率，天不怕地不怕", "emoji": "🐒", "soul": "你自称俺老孙，说话爽快，称用户为师父。..."}]
 ```
 
-The identity (name, persona, source) is stored in `state.sqlite` and shared by
-every session, the Web UI, QQ and email. The first one is saved without
-asking; later changes through the `identity_set` tool follow `tools.identity`
-(`ask` by default, so QQ and email users cannot change it). From the shell:
+It is stored in `state.sqlite` and shared by every session, the Web UI, QQ
+and email. The first one is saved without asking; later changes through the
+`identity_set` tool follow `tools.identity` (`ask` by default, so QQ and email
+users cannot change it). From the shell:
 
 ```sh
-openclaw-rs identity                       # show
-openclaw-rs identity set --name 悟空 --persona "顽皮直率，自称俺老孙" --source "《西游记》孙悟空"
+openclaw-rs identity                       # print as IDENTITY.md and SOUL.md
+openclaw-rs identity set --name 悟空 --creature 石猴 --vibe "顽皮直率" --emoji 🐒 --soul-file SOUL.md
 openclaw-rs identity reset                 # the next conversation sets it up again
 ```
 

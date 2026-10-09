@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -71,7 +71,7 @@ enum Command {
         #[command(subcommand)]
         action: MailAction,
     },
-    /// Show, set or reset the agent's name and persona.
+    /// Show, set or reset the agent's identity and soul.
     Identity {
         #[command(subcommand)]
         action: Option<IdentityAction>,
@@ -130,12 +130,24 @@ enum IdentityAction {
     Set {
         #[arg(long)]
         name: String,
-        /// Personality, speaking style, background, how to address the user.
+        /// What the agent is: an AI, a robot, a stone monkey.
         #[arg(long)]
-        persona: String,
-        /// The character and work a persona is based on.
+        creature: String,
+        /// One line on how it comes across.
         #[arg(long)]
-        source: Option<String>,
+        vibe: String,
+        #[arg(long)]
+        emoji: Option<String>,
+        /// SOUL.md text: voice, stance, style, boundaries.
+        #[arg(
+            long,
+            conflicts_with = "soul_file",
+            required_unless_present = "soul_file"
+        )]
+        soul: Option<String>,
+        /// Read the soul from a SOUL.md file.
+        #[arg(long)]
+        soul_file: Option<PathBuf>,
     },
     /// Forget the identity; the next conversation sets it up again.
     Reset,
@@ -278,8 +290,8 @@ async fn run(cli: Cli) -> Result<()> {
 type CliAgent = Agent<llm::Client, BuiltinTools>;
 
 const FIRST_START_HINT: &str = "First start: the agent has no identity yet and will ask who it \
-should be. Describe a persona, or name a fictional character for it to look up and play \
-(e.g. \"be Sun Wukong from Journey to the West\"). `openclaw-rs identity set` works too.";
+should be. Describe it, or name a fictional character for it to look up and become \
+(e.g. \"be Sun Wukong\"). `openclaw-rs identity set` works too.";
 
 fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
     let workspace = config
@@ -384,22 +396,36 @@ fn memory(store: &Store, action: MemoryAction) -> Result<()> {
 fn identity(store: &Store, action: IdentityAction) -> Result<()> {
     match action {
         IdentityAction::Show => match store.identity()? {
-            Some(i) => {
-                println!("name: {}", i.name);
-                if let Some(source) = i.source {
-                    println!("based on: {source}");
-                }
-                println!("\n{}", i.persona);
-            }
+            Some(i) => println!(
+                "# IDENTITY.md\n\n{}\n\n# SOUL.md\n\n{}",
+                i.identity_md(),
+                i.soul
+            ),
             None => println!("no identity yet; the next conversation sets one up"),
         },
         IdentityAction::Set {
             name,
-            persona,
-            source,
+            creature,
+            vibe,
+            emoji,
+            soul,
+            soul_file,
         } => {
-            store.identity_set(&name, &persona, source.as_deref())?;
-            println!("identity saved: {}", name.trim());
+            let soul = match (soul, soul_file) {
+                (Some(soul), _) => soul,
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("cannot read {}", path.display()))?,
+                (None, None) => unreachable!("clap requires --soul or --soul-file"),
+            };
+            store.identity_set(&identity::Identity {
+                name,
+                creature,
+                vibe,
+                emoji,
+                soul,
+                ..identity::Identity::default()
+            })?;
+            println!("identity saved");
         }
         IdentityAction::Reset => {
             if store.identity_clear()? {

@@ -1,56 +1,76 @@
-//! The agent's identity: a name and persona chosen on first start, shared by
-//! every session and channel.
+//! The agent's identity, in OpenClaw's persona format: an `IDENTITY.md`
+//! record (name, creature, vibe, emoji) and a `SOUL.md` voice, chosen on
+//! first start and shared by every session and channel.
 
 use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
 
 use crate::store::{Store, now};
 
-pub const MAX_NAME_CHARS: usize = 64;
-/// Long enough for a character's personality, speech style and background;
-/// the persona is part of every request.
-pub const MAX_PERSONA_CHARS: usize = 4000;
+const MAX_FIELD_CHARS: usize = 120;
+/// SOUL.md is part of every request; short beats long.
+pub const MAX_SOUL_CHARS: usize = 4000;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Identity {
     pub name: String,
-    pub persona: String,
-    /// Where the persona comes from, e.g. a fictional character and its work.
-    pub source: Option<String>,
+    /// What the agent is: an AI, a robot, a stone monkey, something weirder.
+    pub creature: String,
+    /// One line on how it comes across.
+    pub vibe: String,
+    pub emoji: Option<String>,
+    /// SOUL.md body: voice, stance, style and boundaries.
+    pub soul: String,
     pub updated_at: i64,
 }
 
 /// Sent until an identity exists, so the first conversation sets one up.
 const FIRST_START: &str = "\
 ## First start
-You do not have an identity yet. In this first conversation, before other \
-work, tell the user you are new here and ask who you should be: your name, \
-personality, speaking style, and how to address them. Offer two ways: they \
-describe the persona themselves, or they name a fictional character (from a \
-novel, anime, game, film or TV series) for you to play.
-If they name a character and web_search is available, search for the \
-character before writing anything: personality, way of speaking, catchphrases, \
-background and relationships. Use what the sources say rather than memory \
-alone, and ask which work they mean when the name is ambiguous.
-Show the user a short draft (name, persona, and the source for a character), \
-adjust it to their feedback, then save it with identity_set. If the user \
-wants a task done first, do it, and come back to the identity afterward.";
+You have no identity yet. The user's request always comes first: if their \
+first message asks for real work, do it, and set up the identity afterward.
+Otherwise introduce yourself as their new assistant and ask who you should be. \
+They can describe you, or name a fictional character (novel, anime, game, \
+film, TV) for you to become. Do not pick a name for yourself.
+For a character, call web_search first when it is available: personality, way \
+of speaking, catchphrases, values, how they treat others. Ask which work they \
+mean when the name is ambiguous. Then make the character yours instead of \
+describing it from outside:
+- Name: what the user wants to call you, usually the character's name.
+- Creature: what you are, in the character's own terms.
+- Vibe: one line on how you come across.
+- Emoji: one signature emoji.
+- Soul: written to you as who you are (\"You ...\"): tone, speech patterns and \
+catchphrases, opinions, how you address the user, what you will not do. \
+Behavior, not biography.
+Never put the source into the identity: no titles of works, authors, actors, \
+plot summaries, citations, or phrases like \"based on\" or \"plays the role \
+of\". Show the user the draft, adjust it to their feedback, then save it with \
+identity_set.";
 
 impl Identity {
+    /// The IDENTITY.md record as OpenClaw writes it.
+    pub fn identity_md(&self) -> String {
+        let mut out = format!(
+            "- **Name:** {}\n- **Creature:** {}\n- **Vibe:** {}",
+            self.name, self.creature, self.vibe
+        );
+        if let Some(emoji) = &self.emoji {
+            out.push_str(&format!("\n- **Emoji:** {emoji}"));
+        }
+        out
+    }
+
     /// System prompt section that puts the agent in this identity.
     fn prompt(&self) -> String {
-        let source = self
-            .source
-            .as_deref()
-            .map(|s| format!("\nBased on: {s}"))
-            .unwrap_or_default();
         format!(
-            "## Identity\nYour name is {}.{source}\n\n{}\n\n\
-             Stay in this identity in every conversation. It shapes your voice, \
+            "## IDENTITY.md\n{}\n\n## SOUL.md\n{}\n\n\
+             This is who you are in every conversation. It shapes your voice, \
              not your judgment: never let it override safety, tool permissions, \
              or honesty. When the user asks to change who you are, draft the \
              change and save it with identity_set.",
-            self.name, self.persona
+            self.identity_md(),
+            self.soul
         )
     }
 }
@@ -66,44 +86,60 @@ pub fn system_prompt(base: &str, identity: Option<&Identity>) -> String {
     }
 }
 
+/// Trims one field and enforces its length.
+fn field<'a>(label: &str, value: &'a str, max: usize) -> Result<&'a str> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("identity needs a {label}");
+    }
+    if value.chars().count() > max {
+        bail!("{label} is longer than {max} characters");
+    }
+    Ok(value)
+}
+
 impl Store {
     pub fn identity(&self) -> Result<Option<Identity>> {
         Ok(self
             .lock()
             .query_row(
-                "SELECT name, persona, source, updated_at FROM identity WHERE id = 1",
+                "SELECT name, creature, vibe, emoji, soul, updated_at FROM identity WHERE id = 1",
                 [],
                 |row| {
                     Ok(Identity {
                         name: row.get(0)?,
-                        persona: row.get(1)?,
-                        source: row.get(2)?,
-                        updated_at: row.get(3)?,
+                        creature: row.get(1)?,
+                        vibe: row.get(2)?,
+                        emoji: row.get(3)?,
+                        soul: row.get(4)?,
+                        updated_at: row.get(5)?,
                     })
                 },
             )
             .optional()?)
     }
 
-    pub fn identity_set(&self, name: &str, persona: &str, source: Option<&str>) -> Result<()> {
-        let (name, persona) = (name.trim(), persona.trim());
-        let source = source.map(str::trim).filter(|s| !s.is_empty());
-        if name.is_empty() || persona.is_empty() {
-            bail!("identity needs both a name and a persona");
-        }
-        if name.chars().count() > MAX_NAME_CHARS {
-            bail!("name is longer than {MAX_NAME_CHARS} characters");
-        }
-        if persona.chars().count() > MAX_PERSONA_CHARS {
-            bail!(
-                "persona is longer than {MAX_PERSONA_CHARS} characters; keep what shapes behavior"
-            );
+    /// Validates and saves `identity`, replacing any previous one.
+    pub fn identity_set(&self, identity: &Identity) -> Result<()> {
+        let name = field("name", &identity.name, 64)?;
+        let creature = field("creature", &identity.creature, MAX_FIELD_CHARS)?;
+        let vibe = field("vibe", &identity.vibe, MAX_FIELD_CHARS)?;
+        let soul = field("soul", &identity.soul, MAX_SOUL_CHARS)?;
+        let emoji = identity
+            .emoji
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty());
+        if emoji.is_some_and(|e| e.chars().count() > 16) {
+            bail!("emoji should be a single emoji");
         }
         self.lock().execute(
-            "INSERT INTO identity(id, name, persona, source, updated_at) VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, persona = excluded.persona,
-               source = excluded.source, updated_at = excluded.updated_at",
-            params![name, persona, source, now()],
+            "INSERT INTO identity(id, name, creature, vibe, emoji, soul, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, creature = excluded.creature,
+               vibe = excluded.vibe, emoji = excluded.emoji, soul = excluded.soul,
+               updated_at = excluded.updated_at",
+            params![name, creature, vibe, emoji, soul, now()],
         )?;
         Ok(())
     }
@@ -118,6 +154,17 @@ impl Store {
 mod tests {
     use super::*;
 
+    fn wukong() -> Identity {
+        Identity {
+            name: " 悟空 ".into(),
+            creature: "石猴".into(),
+            vibe: "顽皮直率，天不怕地不怕".into(),
+            emoji: Some("🐒".into()),
+            soul: "你自称俺老孙，说话爽快。".into(),
+            ..Identity::default()
+        }
+    }
+
     #[test]
     fn first_start_prompt_until_an_identity_is_saved() {
         let store = Store::open_in_memory().unwrap();
@@ -125,31 +172,41 @@ mod tests {
         let prompt = system_prompt("Base.", None);
         assert!(prompt.starts_with("Base.\n\n## First start"), "{prompt}");
 
-        store
-            .identity_set(
-                " 悟空 ",
-                "顽皮、直率，自称俺老孙。",
-                Some("《西游记》孙悟空"),
-            )
-            .unwrap();
+        store.identity_set(&wukong()).unwrap();
         let identity = store.identity().unwrap().unwrap();
         assert_eq!(identity.name, "悟空");
         let prompt = system_prompt("Base.", Some(&identity));
-        assert!(prompt.contains("Your name is 悟空.\nBased on: 《西游记》孙悟空"));
+        assert!(prompt.contains(
+            "## IDENTITY.md\n- **Name:** 悟空\n- **Creature:** 石猴\n\
+             - **Vibe:** 顽皮直率，天不怕地不怕\n- **Emoji:** 🐒\n\n\
+             ## SOUL.md\n你自称俺老孙，说话爽快。"
+        ));
         assert!(!prompt.contains("First start"));
 
-        // Saving again replaces the single identity; a blank source is dropped.
-        store.identity_set("Ada", "Precise.", Some(" ")).unwrap();
-        assert_eq!(store.identity().unwrap().unwrap().source, None);
+        // Saving again replaces the single identity; a blank emoji is dropped.
+        let ada = Identity {
+            name: "Ada".into(),
+            emoji: Some(" ".into()),
+            ..wukong()
+        };
+        store.identity_set(&ada).unwrap();
+        assert_eq!(store.identity().unwrap().unwrap().emoji, None);
         assert!(store.identity_clear().unwrap());
         assert!(store.identity().unwrap().is_none());
     }
 
     #[test]
-    fn rejects_empty_or_oversized_identities() {
+    fn rejects_missing_or_oversized_fields() {
         let store = Store::open_in_memory().unwrap();
-        assert!(store.identity_set("", "x", None).is_err());
-        let long = "x".repeat(MAX_PERSONA_CHARS + 1);
-        assert!(store.identity_set("a", &long, None).is_err());
+        let no_vibe = Identity {
+            vibe: " ".into(),
+            ..wukong()
+        };
+        assert!(store.identity_set(&no_vibe).is_err());
+        let long = Identity {
+            soul: "x".repeat(MAX_SOUL_CHARS + 1),
+            ..wukong()
+        };
+        assert!(store.identity_set(&long).is_err());
     }
 }
