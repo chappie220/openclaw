@@ -64,6 +64,11 @@ enum Command {
         #[command(subcommand)]
         action: CronAction,
     },
+    /// Mail channel helpers.
+    Mail {
+        #[command(subcommand)]
+        action: MailAction,
+    },
     /// Manage long-term memory.
     Memory {
         #[command(subcommand)]
@@ -86,6 +91,12 @@ enum ServiceAction {
     },
     /// Stop and remove the service; state is kept.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum MailAction {
+    /// Log in to the configured IMAP and SMTP servers and report what works.
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -152,6 +163,25 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Memory { action } => memory(&store, action),
         Command::Cron { action } => cron_command(&store, action),
+        Command::Mail {
+            action: MailAction::Check,
+        } => {
+            let bot = mail::MailBot::connect_only(config.mail.clone())?;
+            let mut failed = false;
+            for (target, result) in bot.check().await {
+                match result {
+                    Ok(detail) => println!("✓ {target}: {detail}"),
+                    Err(err) => {
+                        failed = true;
+                        println!("✗ {target}: {err:#}");
+                    }
+                }
+            }
+            if failed {
+                bail!("mail check failed");
+            }
+            Ok(())
+        }
         Command::Service { .. } => unreachable!("handled before state is opened"),
         Command::Serve { bind } => {
             let agent = Arc::new(build_agent(&config, &state, store)?);

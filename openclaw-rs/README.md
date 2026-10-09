@@ -86,8 +86,8 @@ doas openclaw-rs service uninstall           # keeps state and logs
 ```
 
 The service runs as the given account with state in its `~/.openclaw-rs`,
-under `supervise-daemon` with automatic restart. The two variables above are
-copied into `/etc/conf.d/openclaw-rs` (mode 0600).
+under `supervise-daemon` with automatic restart. `OPENROUTER_API_KEY`, `OPENCLAW_RS_TOKEN`, `QQ_APP_SECRET` and `MAIL_PASSWORD`
+from the installing shell are copied into `/etc/conf.d/openclaw-rs` (mode 0600).
 
 ## QQ (official bot)
 
@@ -116,21 +116,44 @@ session is a QQ session send their result to that chat.
 
 ## Email
 
-The bot polls a mailbox over IMAP and replies over SMTP in the same thread.
-Each sender address is its own session (`mail:<address>`).
+The bot is a mail client of a third-party provider: it reads over IMAP (993)
+and sends over SMTP submission (465 or 587). It needs no mail server of its
+own and never uses port 25, which most hosts block. Each sender address is its
+own session (`mail:<address>`).
+
+For QQ Mail, 163/126/yeah.net, Gmail, iCloud and Aliyun the servers are filled
+in from the address, so this is enough:
 
 ```toml
 [mail]
 enabled = true
-imap_host = "imap.qq.com"     # 163: imap.163.com, Gmail: imap.gmail.com
-imap_port = 993
-smtp_host = "smtp.qq.com"
-smtp_port = 465               # implicit TLS; use 587 with smtp_security = "starttls"
-username = "bot@qq.com"
-# password = "..."            # prefer MAIL_PASSWORD; QQ Mail and 163 need an authorization code
+username = "mybot@qq.com"
+# password = "..."            # prefer MAIL_PASSWORD: the provider's app authorization code
 allow = ["me@example.com", "@family.cn"]   # required: addresses or @domains
 poll_secs = 60
 ```
+
+Enable IMAP/SMTP in the mailbox settings and create an authorization code
+(QQ Mail: 设置 → 账户 → POP3/IMAP/SMTP 服务; 163: 设置 → POP3/SMTP/IMAP; Gmail: an app
+password). Then verify before starting the service:
+
+```sh
+MAIL_PASSWORD=... openclaw-rs mail check
+# ✓ IMAP imap.qq.com:993: login ok, INBOX has 3 unread
+# ✓ SMTP smtp.qq.com:465: login ok
+```
+
+Other providers (company mailboxes) set the servers explicitly; any field
+you set overrides the preset:
+
+```toml
+imap_host = "imap.example.com"   # imap_port = 993
+smtp_host = "smtp.example.com"
+smtp_port = 587
+smtp_security = "starttls"       # "tls" for 465
+```
+
+Outlook/Hotmail personal accounts only allow OAuth sign-in and are not supported.
 
 - `allow` is required, because anyone could otherwise spend your model
   credits by email. Replies always go to `From`, never `Reply-To`.
@@ -142,8 +165,8 @@ poll_secs = 60
 - Quoted history (`>` lines, `On … wrote:`, `原始邮件`) is removed before the model
   sees the mail. GBK/GB18030 and other legacy charsets are decoded.
 - The client sends the IMAP `ID` command, which 163/126 require.
-- `imap_security`/`smtp_security` = `"none"` is accepted only for loopback
-  hosts, for local bridges such as Proton Bridge.
+- Security `"none"` is accepted only for loopback hosts, for local bridges such
+  as Proton Bridge.
 - Email has no way to approve tools, so `ask` tools are declined.
 - Scheduled jobs whose session is a mail session send their result as an email.
 

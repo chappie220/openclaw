@@ -11,7 +11,12 @@ const INIT_SCRIPT: &str = "/etc/init.d/openclaw-rs";
 const CONF_FILE: &str = "/etc/conf.d/openclaw-rs";
 const LOG_FILE: &str = "/var/log/openclaw-rs.log";
 /// Secrets copied from the installing shell into the owner-only conf.d file.
-const FORWARDED_ENV: &[&str] = &["OPENROUTER_API_KEY", "OPENCLAW_RS_TOKEN"];
+const FORWARDED_ENV: &[&str] = &[
+    "OPENROUTER_API_KEY",
+    "OPENCLAW_RS_TOKEN",
+    "QQ_APP_SECRET",
+    "MAIL_PASSWORD",
+];
 
 pub struct Account {
     pub name: String,

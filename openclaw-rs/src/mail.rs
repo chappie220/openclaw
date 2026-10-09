@@ -59,18 +59,123 @@ fn is_loopback(host: &str) -> bool {
     host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Third-party providers by address domain: (IMAP host, SMTP host, SMTP port, SMTP security).
+type Preset = (
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    u16,
+    MailSecurity,
+);
+const PRESETS: &[Preset] = &[
+    (
+        &["qq.com", "foxmail.com", "vip.qq.com"],
+        "imap.qq.com",
+        "smtp.qq.com",
+        465,
+        MailSecurity::Tls,
+    ),
+    (
+        &["163.com"],
+        "imap.163.com",
+        "smtp.163.com",
+        465,
+        MailSecurity::Tls,
+    ),
+    (
+        &["126.com"],
+        "imap.126.com",
+        "smtp.126.com",
+        465,
+        MailSecurity::Tls,
+    ),
+    (
+        &["yeah.net"],
+        "imap.yeah.net",
+        "smtp.yeah.net",
+        465,
+        MailSecurity::Tls,
+    ),
+    (
+        &["gmail.com", "googlemail.com"],
+        "imap.gmail.com",
+        "smtp.gmail.com",
+        465,
+        MailSecurity::Tls,
+    ),
+    (
+        &["icloud.com", "me.com", "mac.com"],
+        "imap.mail.me.com",
+        "smtp.mail.me.com",
+        587,
+        MailSecurity::Starttls,
+    ),
+    (
+        &["aliyun.com"],
+        "imap.aliyun.com",
+        "smtp.aliyun.com",
+        465,
+        MailSecurity::Tls,
+    ),
+];
+
+/// Fills in a known provider's servers for whichever host the operator left empty.
+fn apply_preset(config: &mut MailConfig) -> Result<()> {
+    if !config.imap_host.is_empty() && !config.smtp_host.is_empty() {
+        return Ok(());
+    }
+    let domain = config
+        .username
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        domain.as_str(),
+        "outlook.com" | "hotmail.com" | "live.com" | "msn.com"
+    ) {
+        bail!(
+            "Outlook/Hotmail accounts only allow OAuth sign-in, which is not supported; use another provider"
+        );
+    }
+    let preset = PRESETS
+        .iter()
+        .find(|(domains, ..)| domains.contains(&domain.as_str()));
+    let Some((_, imap, smtp, smtp_port, smtp_security)) = preset else {
+        return Ok(()); // Unknown domain (e.g. a company mailbox): hosts must be configured.
+    };
+    if config.imap_host.is_empty() {
+        config.imap_host = (*imap).into();
+        config.imap_port = 993;
+        config.imap_security = MailSecurity::Tls;
+    }
+    if config.smtp_host.is_empty() {
+        config.smtp_host = (*smtp).into();
+        config.smtp_port = *smtp_port;
+        config.smtp_security = *smtp_security;
+    }
+    Ok(())
+}
+
 pub fn session_for(address: &str) -> String {
     format!("{SESSION_PREFIX}{}", address.to_lowercase())
 }
 
 impl MailBot {
     pub fn new(config: MailConfig) -> Result<Arc<Self>> {
-        if config.imap_host.is_empty() || config.smtp_host.is_empty() || config.username.is_empty()
-        {
-            bail!("mail.imap_host, mail.smtp_host and mail.username are required");
-        }
         if config.allow.is_empty() {
             bail!("mail.allow is empty; list the addresses (or @domains) that may email the bot");
+        }
+        Self::connect_only(config)
+    }
+
+    /// Builds the client without the allow-list, for `mail check`.
+    pub fn connect_only(mut config: MailConfig) -> Result<Arc<Self>> {
+        apply_preset(&mut config)?;
+        if config.imap_host.is_empty() || config.smtp_host.is_empty() || config.username.is_empty()
+        {
+            bail!(
+                "mail.username is required, and mail.imap_host/smtp_host unless the address is from a known provider"
+            );
         }
         for (host, security) in [
             (&config.imap_host, config.imap_security),
@@ -234,20 +339,15 @@ impl MailBot {
             .await
     }
 
-    /// Fetches unseen mail, marking each message seen before it is handled.
-    async fn poll(&self) -> Result<Vec<Vec<u8>>> {
+    async fn imap_session(&self) -> Result<async_imap::Session<MailStream>> {
+        let target = format!("{}:{}", self.config.imap_host, self.config.imap_port);
         let tcp = tokio::time::timeout(
             Duration::from_secs(30),
             TcpStream::connect((self.config.imap_host.as_str(), self.config.imap_port)),
         )
         .await
-        .context("IMAP connect timed out")?
-        .with_context(|| {
-            format!(
-                "cannot connect to {}:{}",
-                self.config.imap_host, self.config.imap_port
-            )
-        })?;
+        .with_context(|| format!("IMAP connect to {target} timed out"))?
+        .with_context(|| format!("cannot connect to {target}"))?;
         let stream = match self.config.imap_security {
             MailSecurity::None => MailStream::Plain(tcp),
             _ => MailStream::Tls(Box::new(tls_connect(&self.config.imap_host, tcp).await?)),
@@ -257,10 +357,11 @@ impl MailBot {
             .read_response()
             .await?
             .context("IMAP server closed before greeting")?;
-        let mut session = client
-            .login(&self.config.username, &self.password)
-            .await
-            .map_err(|(err, _)| anyhow::anyhow!("IMAP login failed: {err}"))?;
+        let mut session = client.login(&self.config.username, &self.password).await.map_err(|(err, _)| {
+            anyhow::anyhow!(
+                "IMAP login failed: {err}. Use the provider's app authorization code and enable IMAP in the mailbox settings"
+            )
+        })?;
         // 163/126 reject mailbox access from clients that do not identify themselves.
         let _ = session
             .id([
@@ -268,6 +369,53 @@ impl MailBot {
                 ("version", Some(env!("CARGO_PKG_VERSION"))),
             ])
             .await;
+        Ok(session)
+    }
+
+    /// Logs in to both servers and reports what works, without reading or sending mail.
+    pub async fn check(&self) -> Vec<(String, Result<String>)> {
+        // Concurrent, so a blocked network reports both failures within one timeout.
+        let imap = async {
+            let mut session = self.imap_session().await?;
+            session
+                .select(&self.config.mailbox)
+                .await
+                .with_context(|| format!("cannot open {}", self.config.mailbox))?;
+            let unseen = session.uid_search("UNSEEN").await?.len();
+            let _ = session.logout().await;
+            Ok(format!(
+                "login ok, {} has {unseen} unread",
+                self.config.mailbox
+            ))
+        };
+        let smtp = async {
+            match tokio::time::timeout(Duration::from_secs(30), self.smtp.test_connection()).await {
+                Err(_) => Err(anyhow::anyhow!(
+                    "connect timed out; is the port blocked by the network?"
+                )),
+                Ok(Ok(true)) => Ok("login ok".to_owned()),
+                Ok(Ok(false)) => Err(anyhow::anyhow!("server did not accept the connection")),
+                Ok(Err(err)) => Err(anyhow::anyhow!(
+                    "{err}. Check the port (465 tls / 587 starttls) and the authorization code"
+                )),
+            }
+        };
+        let (imap_result, smtp_result) = tokio::join!(imap, smtp);
+        vec![
+            (
+                format!("IMAP {}:{}", self.config.imap_host, self.config.imap_port),
+                imap_result,
+            ),
+            (
+                format!("SMTP {}:{}", self.config.smtp_host, self.config.smtp_port),
+                smtp_result,
+            ),
+        ]
+    }
+
+    /// Fetches unseen mail, marking each message seen before it is handled.
+    async fn poll(&self) -> Result<Vec<Vec<u8>>> {
+        let mut session = self.imap_session().await?;
         session
             .select(&self.config.mailbox)
             .await
@@ -552,6 +700,59 @@ Message-ID: <a1@example.org>\r\nReferences: <r0@example.org>\r\nContent-Type: te
         );
         let own = b"From: bot@example.org\r\nSubject: x\r\n\r\nloop\r\n";
         assert_eq!(bot.classify(own), Err(Skip::FromSelf));
+    }
+
+    #[test]
+    fn fills_provider_servers_from_the_address() {
+        let mut qq = MailConfig {
+            username: "Bot@QQ.com".into(),
+            ..MailConfig::default()
+        };
+        apply_preset(&mut qq).unwrap();
+        assert_eq!(
+            (qq.imap_host.as_str(), qq.smtp_host.as_str(), qq.smtp_port),
+            ("imap.qq.com", "smtp.qq.com", 465)
+        );
+        let mut icloud = MailConfig {
+            username: "a@icloud.com".into(),
+            ..MailConfig::default()
+        };
+        apply_preset(&mut icloud).unwrap();
+        assert_eq!(
+            (icloud.smtp_port, icloud.smtp_security),
+            (587, MailSecurity::Starttls)
+        );
+        let mut custom = MailConfig {
+            username: "a@qq.com".into(),
+            smtp_host: "smtp.example.com".into(),
+            smtp_port: 2525,
+            ..MailConfig::default()
+        };
+        apply_preset(&mut custom).unwrap();
+        assert_eq!(
+            (
+                custom.imap_host.as_str(),
+                custom.smtp_host.as_str(),
+                custom.smtp_port
+            ),
+            ("imap.qq.com", "smtp.example.com", 2525)
+        );
+        let mut outlook = MailConfig {
+            username: "a@outlook.com".into(),
+            ..MailConfig::default()
+        };
+        assert!(
+            apply_preset(&mut outlook)
+                .unwrap_err()
+                .to_string()
+                .contains("OAuth")
+        );
+        let mut company = MailConfig {
+            username: "a@corp.cn".into(),
+            ..MailConfig::default()
+        };
+        apply_preset(&mut company).unwrap();
+        assert!(company.imap_host.is_empty());
     }
 
     #[test]
