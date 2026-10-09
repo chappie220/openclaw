@@ -1,5 +1,9 @@
 //! Fits a session's history into a token budget instead of a message count.
 //!
+//! Tool calls and their output (shell, files, search, …) only live for the
+//! turn that made them: once the user writes again, earlier turns are sent
+//! as just the user's messages and the assistant's replies.
+//!
 //! Two marks per session only move forward, and only when the window
 //! overflows; it then shrinks to half the budget. Between those jumps the
 //! messages sent to the model keep the same prefix, so prompt caching keeps
@@ -18,7 +22,8 @@ use crate::llm::{ChatMessage, Role};
 pub struct Marks {
     /// Id of the first message sent; older ones are left out.
     pub start: i64,
-    /// Tool results with a smaller id are sent as a short stub.
+    /// Tool results of the current turn with a smaller id are sent as a
+    /// short stub, when that turn alone is over budget.
     pub pruned_before: i64,
 }
 
@@ -50,43 +55,91 @@ fn stub(message: &ChatMessage) -> ChatMessage {
     }
 }
 
+/// A message from an earlier turn without its tool calls and results; `None`
+/// when nothing is left.
+fn without_tools(message: &ChatMessage) -> Option<ChatMessage> {
+    match message.role {
+        Role::Tool => None,
+        Role::Assistant if message.tool_calls.is_some() => message
+            .content
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(ChatMessage::assistant),
+        _ => Some(message.clone()),
+    }
+}
+
 struct Entry {
     id: i64,
     message: ChatMessage,
     full: usize,
     pruned: usize,
+    earlier: usize,
 }
 
 impl Entry {
+    fn new(id: i64, message: ChatMessage) -> Self {
+        Self {
+            id,
+            full: message_tokens(&message),
+            pruned: message_tokens(&stub(&message)),
+            earlier: without_tools(&message).as_ref().map_or(0, message_tokens),
+            message,
+        }
+    }
+
     fn prunable(&self) -> bool {
         self.message.role == Role::Tool
     }
+
+    fn cost(&self, marks: Marks, current: i64) -> usize {
+        if self.id < current {
+            self.earlier
+        } else if self.prunable() && self.id < marks.pruned_before {
+            self.pruned
+        } else {
+            self.full
+        }
+    }
+
+    fn shown(self, marks: Marks, current: i64) -> Option<ChatMessage> {
+        if self.id < current {
+            without_tools(&self.message)
+        } else if self.prunable() && self.id < marks.pruned_before {
+            Some(stub(&self.message))
+        } else {
+            Some(self.message)
+        }
+    }
 }
 
-fn total(entries: &[Entry], marks: Marks, overhead: usize) -> usize {
+/// Id of the user message that started the turn now running.
+fn current_turn(entries: &[Entry]) -> i64 {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.message.role == Role::User)
+        .map_or(i64::MIN, |e| e.id)
+}
+
+fn total(entries: &[Entry], marks: Marks, current: i64, overhead: usize) -> usize {
     overhead
         + entries
             .iter()
             .filter(|e| e.id >= marks.start)
-            .map(|e| {
-                if e.prunable() && e.id < marks.pruned_before {
-                    e.pruned
-                } else {
-                    e.full
-                }
-            })
+            .map(|e| e.cost(marks, current))
             .sum::<usize>()
 }
 
 /// Picks what to send from `history` (every message from `marks.start` on,
 /// oldest first, with ids) so it fits in `budget` tokens together with
-/// `overhead` (system prompt and tool specs). Returns the messages and the
-/// marks to persist.
+/// `overhead` (system prompt, tool specs and summary).
 ///
-/// On overflow, in order until the window is at most half the budget:
-/// stub tool output from earlier turns, then drop the oldest turns. The
-/// current turn is never dropped; if it alone is over budget, its older tool
-/// output is stubbed too, keeping the latest results the model asked for.
+/// Earlier turns are always sent without their tool calls and output. On
+/// overflow the oldest turns are dropped until the window is at most half
+/// the budget. The current turn is never dropped; if it alone is over
+/// budget, its older tool output is stubbed, keeping the latest results the
+/// model asked for.
 pub fn fit(
     history: Vec<(i64, ChatMessage)>,
     marks: Marks,
@@ -95,30 +148,19 @@ pub fn fit(
 ) -> Fitted {
     let entries: Vec<Entry> = history
         .into_iter()
-        .map(|(id, message)| Entry {
-            id,
-            full: message_tokens(&message),
-            pruned: message_tokens(&stub(&message)),
-            message,
-        })
+        .map(|(id, message)| Entry::new(id, message))
         .collect();
+    let current = current_turn(&entries);
     let mut marks = marks;
-    if total(&entries, marks, overhead) > budget {
-        marks = compact(&entries, marks, overhead, budget);
+    if total(&entries, marks, current, overhead) > budget {
+        marks = compact(&entries, marks, current, overhead, budget);
     }
     let (kept, dropped): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| e.id >= marks.start);
-    let messages = kept
-        .into_iter()
-        .map(|e| {
-            if e.prunable() && e.id < marks.pruned_before {
-                stub(&e.message)
-            } else {
-                e.message
-            }
-        })
-        .collect();
     Fitted {
-        messages,
+        messages: kept
+            .into_iter()
+            .filter_map(|e| e.shown(marks, current))
+            .collect(),
         marks,
         dropped: dropped.into_iter().map(|e| e.message).collect(),
     }
@@ -225,23 +267,28 @@ pub async fn summarize<M: Model>(
     Ok(summary)
 }
 
-fn compact(entries: &[Entry], mut marks: Marks, overhead: usize, budget: usize) -> Marks {
+fn compact(
+    entries: &[Entry],
+    mut marks: Marks,
+    current: i64,
+    overhead: usize,
+    budget: usize,
+) -> Marks {
     let target = budget / 2;
     let users: Vec<i64> = entries
         .iter()
         .filter(|e| e.message.role == Role::User && e.id >= marks.start)
         .map(|e| e.id)
         .collect();
-    let Some(&current) = users.last() else {
+    if users.is_empty() {
         return marks;
-    };
-    marks.pruned_before = marks.pruned_before.max(current);
+    }
     // Windows start at a user message so no tool result loses its call.
-    if total(entries, marks, overhead) > target {
+    if total(entries, marks, current, overhead) > target {
         marks.start = users
             .iter()
             .copied()
-            .find(|&start| total(entries, Marks { start, ..marks }, overhead) <= target)
+            .find(|&start| total(entries, Marks { start, ..marks }, current, overhead) <= target)
             .unwrap_or(current)
             .max(marks.start);
     }
@@ -255,7 +302,7 @@ fn compact(entries: &[Entry], mut marks: Marks, overhead: usize, budget: usize) 
         .iter()
         .filter(|e| e.id >= current && e.id < latest_call)
     {
-        if total(entries, marks, overhead) <= budget {
+        if total(entries, marks, current, overhead) <= budget {
             break;
         }
         if entry.prunable() {
@@ -355,8 +402,8 @@ mod tests {
     }
 
     #[test]
-    fn under_budget_sends_everything_unchanged() {
-        let history = turns(3);
+    fn under_budget_sends_the_current_turn_unchanged() {
+        let history = turns(1);
         let Fitted {
             messages, marks, ..
         } = fit(history.clone(), Marks::default(), 100, 100_000);
@@ -368,30 +415,35 @@ mod tests {
     }
 
     #[test]
-    fn stubs_old_tool_output_before_dropping_turns() {
-        // Five turns are ~2100 tokens; stubbing four old results is enough.
-        let mut history = turns(5);
-        history.push((21, ChatMessage::user("now")));
+    fn earlier_turns_are_sent_without_tool_calls_or_output() {
+        let mut history = turns(3);
+        history.push((
+            13,
+            ChatMessage::assistant_tool_calls(Some("checking".into()), vec![]),
+        ));
+        history.push((14, ChatMessage::user("now")));
+        history.push((15, call("c9")));
+        history.push((16, ChatMessage::tool_result("c9", "fresh")));
         let Fitted {
             messages, marks, ..
-        } = fit(history, Marks::default(), 0, 2000);
+        } = fit(history, Marks::default(), 0, 100_000);
+        assert_eq!(marks, Marks::default());
         assert_eq!(
-            marks,
-            Marks {
-                start: 0,
-                pruned_before: 21
-            }
+            contents(&messages),
+            [
+                "q0", "a0", "q1", "a1", "q2", "a2", "checking", "now", "", "fresh"
+            ]
         );
-        assert_eq!(messages.len(), 21);
-        assert!(contents(&messages)[2].starts_with("[earlier tool output (1600 bytes)"));
-        assert!(contents(&messages).iter().all(|c| c.len() < 200));
+        assert!(messages[..7].iter().all(|m| m.tool_calls.is_none()));
+        assert!(messages[8].tool_calls.is_some());
     }
 
     #[test]
     fn drops_oldest_turns_to_half_the_budget_and_stays_put() {
         let mut history = turns(20);
         history.push((81, ChatMessage::user("now")));
-        let budget = 1000;
+        // Without tool output each earlier turn is about 10 tokens.
+        let budget = 200;
         let Fitted {
             messages, marks, ..
         } = fit(history.clone(), Marks::default(), 50, budget);

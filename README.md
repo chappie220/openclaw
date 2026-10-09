@@ -377,9 +377,11 @@ shell_timeout_secs = 120
 max_output_bytes = 16384  # per stream; also the most shell output held in memory
 ```
 
-When a conversation outgrows `context_tokens`, it is cut back to half the
-budget: old tool output becomes a one-line stub, and the oldest turns are
-folded by the model into a running summary sent at the start of the window.
+Tool calls and their output (shell, files, search) are only sent during the
+turn that made them; later turns see just the user's messages and the
+assistant's replies. When a conversation outgrows `context_tokens`, it is cut
+back to half the budget: the oldest turns are folded by the model into a
+running summary sent at the start of the window.
 The full history stays in `chats.sqlite`. If the summary call fails, nothing
 is moved and the next call tries again.
 
