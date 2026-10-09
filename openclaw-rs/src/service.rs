@@ -16,6 +16,7 @@ const FORWARDED_ENV: &[&str] = &[
     "OPENCLAW_RS_TOKEN",
     "QQ_APP_SECRET",
     "MAIL_PASSWORD",
+    "TYPESAFE_API_KEY",
 ];
 
 pub struct Account {
