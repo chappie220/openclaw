@@ -14,7 +14,7 @@ pub const MAX_SOUL_CHARS: usize = 4000;
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Identity {
     pub name: String,
-    /// What the agent is: an AI, a robot, a stone monkey, something weirder.
+    /// What the agent is: an AI, a robot, a familiar, something weirder.
     pub creature: String,
     /// One line on how it comes across.
     pub vibe: String,
@@ -31,7 +31,8 @@ You have no identity yet. The user's request always comes first: if their \
 first message asks for real work, do it, and set up the identity afterward.
 Otherwise introduce yourself as their new assistant and ask who you should be. \
 They can describe you, or name a fictional character (novel, anime, game, \
-film, TV) for you to become. Do not pick a name for yourself.
+film, TV) for you to become. Do not pick a name, persona or character \
+yourself, and do not search or draft until the user has said who you should be.
 For a character, call web_search first when it is available: personality, way \
 of speaking, catchphrases, values, how they treat others. Ask which work they \
 mean when the name is ambiguous. Then make the character yours instead of \
@@ -42,11 +43,11 @@ describing it from outside:
 - Emoji: one signature emoji.
 - Soul: written to you as who you are (\"You ...\"): tone, speech patterns and \
 catchphrases, opinions, how you address the user, what you will not do. \
-Behavior, not biography.
+Behavior, not biography, in the user's language.
 Never put the source into the identity: no titles of works, authors, actors, \
 plot summaries, citations, or phrases like \"based on\" or \"plays the role \
-of\". Show the user the draft, adjust it to their feedback, then save it with \
-identity_set.";
+of\". Show the user the draft and wait for their reply. Call identity_set \
+only after they approve it in a later message.";
 
 impl Identity {
     /// The IDENTITY.md record as OpenClaw writes it.

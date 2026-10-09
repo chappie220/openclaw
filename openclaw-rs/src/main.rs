@@ -130,7 +130,7 @@ enum IdentityAction {
     Set {
         #[arg(long)]
         name: String,
-        /// What the agent is: an AI, a robot, a stone monkey.
+        /// What the agent is: an AI, a robot, a familiar.
         #[arg(long)]
         creature: String,
         /// One line on how it comes across.

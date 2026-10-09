@@ -563,10 +563,10 @@ impl Tools for BuiltinTools {
         ));
         specs.push(ToolSpec::function(
             "identity_set",
-            "Save your identity (IDENTITY.md fields and SOUL.md) for every conversation. Use it to finish first-start setup, or when the user asks to change who you are; show them the draft first. Write it as who you are: never name a source work, author or actor, summarize plot, cite pages, or say you are based on or playing someone.",
+            "Save your identity (IDENTITY.md fields and SOUL.md) for every conversation. Call it only after the user approved the exact draft you showed them; never save an identity they did not describe or approve. Write it as who you are: never name a source work, author or actor, summarize plot, cite pages, or say you are based on or playing someone.",
             json!({"type": "object", "properties": {
                 "name": {"type": "string", "description": "What the user calls you"},
-                "creature": {"type": "string", "description": "What you are, e.g. an AI, a robot, a stone monkey"},
+                "creature": {"type": "string", "description": "What you are, e.g. an AI, a robot, a familiar"},
                 "vibe": {"type": "string", "description": "One line on how you come across"},
                 "emoji": {"type": "string", "description": "One signature emoji"},
                 "soul": {"type": "string", "description": "SOUL.md, addressed to you as 'You ...', under 4000 characters: tone, speech patterns and catchphrases, opinions, how you address the user, boundaries. Behavior, not biography."}
