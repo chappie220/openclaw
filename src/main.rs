@@ -105,6 +105,11 @@ enum ServiceAction {
 enum MailAction {
     /// Log in to the configured IMAP and SMTP servers and report what works.
     Check,
+    /// Show inbound mail by state, and every message not yet answered.
+    Queue,
+    /// Queue a failed or uncertain message again; a stored reply is resent
+    /// under the same Message-ID, otherwise the turn runs again.
+    Retry { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -202,6 +207,18 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Memory { action } => memory(&store, action),
         Command::Identity { action } => identity(&store, action.unwrap_or(IdentityAction::Show)),
         Command::Cron { action } => cron_command(&store, action),
+        Command::Mail {
+            action: MailAction::Queue,
+        } => mail_queue(&store),
+        Command::Mail {
+            action: MailAction::Retry { id },
+        } => {
+            if !store.mail_requeue(id)? {
+                bail!("no failed or uncertain message #{id}; see `openclaw-rs mail queue`");
+            }
+            println!("queued #{id} again; the running Gateway picks it up on its next poll");
+            Ok(())
+        }
         Command::Mail {
             action: MailAction::Check,
         } => {
@@ -333,6 +350,37 @@ async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
     let run = agent.run_turn(session, input, &mut on_event);
     with_approver(Arc::new(TerminalApprover), run).await?;
     println!();
+    Ok(())
+}
+
+fn mail_queue(store: &Store) -> Result<()> {
+    let (counts, entries) = store.mail_inbox()?;
+    if counts.is_empty() {
+        println!("no mail received yet");
+        return Ok(());
+    }
+    let counts: Vec<String> = counts.iter().map(|(s, n)| format!("{s} {n}")).collect();
+    println!("{}", counts.join(", "));
+    for e in entries {
+        let when = {
+            use chrono::TimeZone;
+            chrono::Local
+                .timestamp_opt(e.updated_at, 0)
+                .single()
+                .map_or_else(String::new, |t| t.format("%Y-%m-%d %H:%M").to_string())
+        };
+        println!(
+            "#{} {} {} from {} attempts={} updated {when}",
+            e.id,
+            e.state,
+            e.key,
+            e.sender.as_deref().unwrap_or("?"),
+            e.attempts
+        );
+        if let Some(error) = e.last_error {
+            println!("    {error}");
+        }
+    }
     Ok(())
 }
 

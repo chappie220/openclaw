@@ -92,7 +92,8 @@ CREATE INDEX messages_by_session ON messages(session_id, id);
 
 const RUNTIME: Schema = Schema {
     file: "runtime.sqlite",
-    migrations: &[r#"
+    migrations: &[
+        r#"
 CREATE TABLE jobs (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -109,7 +110,35 @@ CREATE TABLE mail_seen (
   message_id TEXT PRIMARY KEY,
   seen_at INTEGER NOT NULL
 );
-"#],
+"#,
+        r#"
+-- Every inbound email and how far it got, so a crash or failure at any stage
+-- resumes instead of losing the request or answering twice. `mail_seen`
+-- keeps the Message-IDs handled before this table existed.
+CREATE TABLE mail_inbox (
+  id INTEGER PRIMARY KEY,
+  -- Message-ID, or mailbox/UIDVALIDITY/UID when the message has none.
+  key TEXT NOT NULL UNIQUE,
+  mailbox TEXT NOT NULL,
+  uid_validity INTEGER,
+  uid INTEGER,
+  sender TEXT,
+  raw BLOB,
+  -- pending, processing, reply_ready, sending, sent, failed, uncertain, skipped
+  state TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  -- Set when a turn was cut short; the retry warns the model about side effects.
+  interrupted INTEGER NOT NULL DEFAULT 0,
+  next_attempt INTEGER NOT NULL,
+  reply TEXT,
+  reply_message_id TEXT,
+  last_error TEXT,
+  received_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX mail_inbox_due ON mail_inbox(state, next_attempt);
+"#,
+    ],
     legacy: &[
         (
             "jobs",
@@ -771,7 +800,7 @@ mod tests {
         assert_eq!(store.memory_search("乌龙茶", 5).unwrap()[0].id, 3);
         assert_eq!(store.identity().unwrap().unwrap().name, "悟空");
         assert_eq!(store.job_list().unwrap()[0].name, "beat");
-        assert!(!store.mail_first_sight("<a@b>").unwrap());
+        assert!(store.mail_handled("<a@b>").unwrap());
         assert!(!dir.path().join(LEGACY_FILE).exists());
         assert!(dir.path().join(LEGACY_BACKUP).exists());
         for schema in SCHEMAS {
@@ -803,7 +832,7 @@ mod tests {
         assert_eq!(store.memory_search("乌龙茶", 5).unwrap().len(), 1);
         assert_eq!(store.identity().unwrap().unwrap().name, "悟空");
         assert_eq!(store.job_list().unwrap().len(), 1);
-        assert!(!store.mail_first_sight("<a@b>").unwrap());
+        assert!(store.mail_handled("<a@b>").unwrap());
     }
 
     fn leftovers(dir: &Path) -> Vec<String> {

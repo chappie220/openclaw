@@ -161,8 +161,26 @@ Outlook/Hotmail personal accounts only allow OAuth sign-in and are not supported
 - Auto-replies, mailing lists (`Auto-Submitted`, `Precedence`, `List-Id`) and
   mail from the bot's own address are skipped, and replies carry
   `Auto-Submitted: auto-replied`, so two robots cannot loop.
-- Each poll marks fetched mail as read and handles at most 20 messages;
-  Message-IDs are remembered, so a re-delivered copy is answered once.
+- Each poll fetches at most 20 unread messages without marking them, records
+  each one in `runtime.sqlite`, and only then marks it read. Message-IDs (or
+  mailbox/UIDVALIDITY/UID without one) are remembered, so a re-delivered copy
+  is answered once.
+- Every message then moves through `pending → processing → sending → sent`,
+  each step recorded, so a crash or failure never silently drops a request:
+  - a failed turn (e.g. the model API is down) is retried with backoff from
+    one minute up to an hour; after 3 attempts the error itself is sent as the
+    reply;
+  - a turn cut short by a restart runs again, and the model is told the earlier
+    attempt may already have run tools so it checks before repeating them;
+  - the reply and its Message-ID are stored before SMTP is tried, so a
+    deferred or failed send is retried (up to 6 times) with the same text and
+    Message-ID instead of a new answer, and a 5xx refusal marks it `failed`;
+  - a restart during SMTP marks the message `uncertain`, because the server may
+    already have accepted it; it is never resent on its own.
+
+  `openclaw-rs mail queue` shows the counts by state and every message not yet
+  answered with its last error; `openclaw-rs mail retry <id>` queues a `failed`
+  or `uncertain` one again.
 - Quoted history (`>` lines, `On … wrote:`, `原始邮件`) is removed before the model
   sees the mail. GBK/GB18030 and other legacy charsets are decoded.
 - The client sends the IMAP `ID` command, which 163/126 require.
@@ -231,8 +249,9 @@ State lives in `~/.openclaw-rs` (override with `OPENCLAW_RS_HOME`):
 - `config.toml`: optional settings
 - `soul.sqlite`: identity and long-term memories
 - `chats.sqlite`: sessions and their full message history
-- `runtime.sqlite`: scheduled jobs and mail already handled (deleting it makes
-  the email channel answer old mail again)
+- `runtime.sqlite`: scheduled jobs and the inbound mail queue (deleting it
+  forgets which mail was handled, so mail still unread on the server is
+  answered again)
 
 Each file can be backed up, moved or deleted on its own: copy `soul.sqlite`
 to another host to bring the same agent there without its chats, or delete
