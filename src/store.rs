@@ -121,6 +121,11 @@ ALTER TABLE sessions ADD COLUMN context_pruned_before INTEGER NOT NULL DEFAULT 0
 -- Running summary of the messages before context_start.
 ALTER TABLE sessions ADD COLUMN context_summary TEXT;
 "#,
+        r#"
+-- On a user message: notes on the tool output of the turn it started, sent
+-- in later turns instead of that output. Empty when nothing was worth keeping.
+ALTER TABLE messages ADD COLUMN turn_note TEXT;
+"#,
     ],
     legacy: &[
         ("sessions", "id, name, created_at, updated_at"),
@@ -219,6 +224,8 @@ pub struct SessionSummary {
 #[derive(Debug)]
 pub struct SessionContext {
     pub messages: Vec<(i64, ChatMessage)>,
+    /// Tool notes by the id of the user message that started their turn.
+    pub notes: std::collections::HashMap<i64, String>,
     pub marks: Marks,
     pub summary: Option<String>,
 }
@@ -752,11 +759,30 @@ impl Store {
              WHERE session_id = ?1 AND id >= ?2 ORDER BY id ASC",
         )?;
         let messages = read_messages(&mut stmt, params![session_id, marks.start])?;
+        let mut stmt = conn.prepare(
+            "SELECT id, turn_note FROM messages
+             WHERE session_id = ?1 AND id >= ?2 AND turn_note IS NOT NULL",
+        )?;
+        let notes = stmt
+            .query_map(params![session_id, marks.start], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(SessionContext {
             messages,
+            notes,
             marks,
             summary,
         })
+    }
+
+    /// Saves the tool note of the turn that user message `message_id` started.
+    pub fn set_turn_note(&self, message_id: i64, note: &str) -> Result<()> {
+        self.chats().execute(
+            "UPDATE messages SET turn_note = ?2 WHERE id = ?1",
+            params![message_id, note],
+        )?;
+        Ok(())
     }
 
     pub fn set_context(&self, session_id: i64, marks: Marks, summary: Option<&str>) -> Result<()> {

@@ -380,13 +380,14 @@ max_output_bytes = 16384  # per stream; also the most shell output held in memor
 
 Tool calls and their output (shell, files, search) are only sent during the
 turn that made them; later turns see just the user's messages and the
-assistant's replies. When a conversation outgrows `context_tokens`, it is cut
+assistant's replies, plus short notes the summary model writes once from that
+turn's tool output. When a conversation outgrows `context_tokens`, it is cut
 back to half the budget: the oldest turns are folded by the model into a
 running summary sent at the start of the window.
 The full history stays in `chats.sqlite`. If the summary call fails, nothing
-is moved and the next call tries again. Send `/compact` in any chat (CLI, Web
-UI, QQ, email) to fold the whole conversation into the summary now; the
-command itself never reaches the model.
+is moved and the next call tries again. The owner can send `/compact` in any
+chat (CLI, Web UI, QQ, email) to fold the whole conversation into the summary
+now; the command itself never reaches the model.
 
 Tools: `read_file`, `list_dir`, `write_file`, `edit_file` (one exact, unique
 replacement) and `shell` (`sh -c` in the workspace; the whole process group is
