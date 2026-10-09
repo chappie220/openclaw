@@ -1248,6 +1248,8 @@ export const en = {
       quickstartBunRuntime: "QuickStart uses Bun for the Gateway service.",
       reinstall: "Reinstall",
       rerunInstallDaemon: "Or rerun with: {command}",
+      openrcRootRequired:
+        "OpenRC detected. The Gateway runs as an OpenRC system service, which needs root; skipping service install. Install it from a root shell with `openclaw gateway install`.",
       restart: "Restart",
       containerRuntimeTitle: "Container runtime",
       containerSystemdUnavailable:

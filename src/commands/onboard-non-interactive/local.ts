@@ -307,7 +307,9 @@ export async function runNonInteractiveLocalSetup(params: {
         message:
           daemonInstall.skippedReason === "systemd-user-unavailable"
             ? "Gateway service install is unavailable because systemd user services are not reachable in this Linux session."
-            : "Gateway service install did not complete successfully.",
+            : daemonInstall.skippedReason === "openrc-root-required"
+              ? "Gateway service install needs root because OpenRC services are system-wide."
+              : "Gateway service install did not complete successfully.",
         installDaemon: true,
         daemonInstall: daemonInstallStatus,
         daemonRuntime: daemonRuntimeRaw,
@@ -317,7 +319,11 @@ export async function runNonInteractiveLocalSetup(params: {
                 "Fix: rerun without `--install-daemon` for one-shot setup, or enable a working user-systemd session and retry.",
                 "If your auth profile uses env-backed refs, keep those env vars set in the shell that runs `openclaw gateway run` or `openclaw agent --local`.",
               ]
-            : [`Run \`${formatCliCommand("openclaw gateway status --deep")}\` for more detail.`],
+            : daemonInstall.skippedReason === "openrc-root-required"
+              ? [
+                  "Fix: rerun onboarding from a root shell (`su -` or `doas -s`), or rerun without `--install-daemon`.",
+                ]
+              : [`Run \`${formatCliCommand("openclaw gateway status --deep")}\` for more detail.`],
       });
       runtime.exit(1);
       return;

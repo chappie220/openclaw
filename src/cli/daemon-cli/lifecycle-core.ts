@@ -1,6 +1,7 @@
 // Gateway service lifecycle command core: install, uninstall, start, stop, restart.
 import { readBestEffortConfig } from "../../config/config.js";
 import { resolveIsNixMode } from "../../config/paths.js";
+import { isOpenRcServiceHost } from "../../daemon/openrc.js";
 import { checkTokenDrift } from "../../daemon/service-audit.js";
 import { readGatewayServiceLoadState } from "../../daemon/service-load-state.js";
 import {
@@ -86,7 +87,11 @@ async function failServiceNotLoaded(
   fail: ReturnType<typeof createDaemonActionContext>["fail"],
 ) {
   let hints = params.renderStartHints();
-  if (process.platform === "linux" && !(await isSystemdUserServiceAvailable().catch(() => false))) {
+  if (
+    process.platform === "linux" &&
+    !isOpenRcServiceHost() &&
+    !(await isSystemdUserServiceAvailable().catch(() => false))
+  ) {
     hints = [
       ...hints,
       ...renderSystemdUnavailableHints({ wsl: await isWSL(), kind: "generic_unavailable" }),

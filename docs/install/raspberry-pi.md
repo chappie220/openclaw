@@ -191,6 +191,38 @@ Since the Pi only runs the gateway, use cloud-hosted API models -- do not run lo
 
 Most OpenClaw features work on ARM64 without changes (Node.js, Telegram, WhatsApp/Baileys, Chromium). The binaries that occasionally lack ARM builds are typically optional Go/Rust CLI tools shipped by skills. Verify architecture with `uname -m` (should show `aarch64`), then check a missing binary's release page for `linux-arm64` / `aarch64` artifacts before falling back to building from source.
 
+## Alpine Linux (OpenRC)
+
+Alpine Linux for Raspberry Pi (`aarch64`) works on Pi 4 and Pi 5. Alpine boots
+OpenRC instead of systemd, and OpenClaw installs the Gateway as an OpenRC system
+service there.
+
+1. Install Node.js and build tools as root. The OpenClaw installer checks that
+   Alpine's Node.js meets the runtime and SQLite requirements. If the `nodejs`
+   package does not, it tries `nodejs-current`.
+
+   ```bash
+   apk add bash curl git nodejs-current npm build-base python3
+   ```
+
+2. Install OpenClaw and run onboarding from a root shell (`su -` or `doas -s`):
+
+   ```bash
+   curl -fsSL https://openclaw.ai/install.sh | bash
+   openclaw onboard
+   ```
+
+3. If you skipped the service during onboarding, install it now:
+
+   ```bash
+   openclaw gateway install
+   rc-service openclaw-gateway status
+   ```
+
+Logs go to `/var/log/openclaw-gateway.log`. See
+[Gateway service (OpenRC)](/platforms/linux#gateway-service-openrc) for the
+files OpenClaw writes and how updates restart the service.
+
 ## Persistence and backups
 
 OpenClaw state lives under:
@@ -219,7 +251,7 @@ for the rollback warnings and activation sequence.
 
 **Slow performance** -- Use a USB SSD instead of an SD card. Check for CPU throttling with `vcgencmd get_throttled` (should return `0x0`).
 
-**Service will not start** -- Check logs with `journalctl --user -u openclaw-gateway.service --no-pager -n 100` and run `openclaw doctor --non-interactive`. If this is a headless Pi, also verify lingering is enabled: `sudo loginctl enable-linger "$(whoami)"`.
+**Service will not start** -- Check logs with `journalctl --user -u openclaw-gateway.service --no-pager -n 100` and run `openclaw doctor --non-interactive`. If this is a headless Pi, also verify lingering is enabled: `sudo loginctl enable-linger "$(whoami)"`. On Alpine (OpenRC), check `rc-service openclaw-gateway status` and `/var/log/openclaw-gateway.log` instead.
 
 **ARM binary issues** -- If a skill fails with "exec format error", check whether the binary has an ARM64 build. Verify architecture with `uname -m` (should show `aarch64`).
 

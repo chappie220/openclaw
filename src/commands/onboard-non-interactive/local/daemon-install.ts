@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import { isOpenRcServiceHost } from "../../../daemon/openrc.js";
 import { resolveGatewayService } from "../../../daemon/service.js";
 import { isSystemdUserServiceAvailable } from "../../../daemon/systemd.js";
 import { formatErrorMessage } from "../../../infra/errors.js";
@@ -22,12 +23,19 @@ export async function installGatewayDaemonNonInteractive(params: {
     }
   | {
       installed: false;
-      skippedReason?: "systemd-user-unavailable";
+      skippedReason?: "systemd-user-unavailable" | "openrc-root-required";
     }
 > {
   const { opts, runtime, port } = params;
+  const openRc = isOpenRcServiceHost();
+  if (openRc && process.geteuid?.() !== 0) {
+    runtime.log(
+      "OpenRC system services need root; skipping service install. Rerun from a root shell, or run `openclaw gateway install` as root later.",
+    );
+    return { installed: false, skippedReason: "openrc-root-required" };
+  }
   const systemdAvailable =
-    process.platform === "linux" ? await isSystemdUserServiceAvailable() : true;
+    process.platform === "linux" && !openRc ? await isSystemdUserServiceAvailable() : true;
   if (process.platform === "linux" && !systemdAvailable) {
     // Container and CI sessions often lack a user systemd manager; onboarding
     // owns the failure outcome for an explicitly requested installation.

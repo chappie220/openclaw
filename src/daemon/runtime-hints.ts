@@ -1,6 +1,7 @@
 import { formatCliCommand } from "../cli/command-format.js";
 import { quoteCliArg } from "../cli/quote-cli-arg.js";
 import { resolveGatewaySystemdServiceName, resolveGatewayWindowsTaskName } from "./constants.js";
+import { isOpenRcServiceHost } from "./openrc.js";
 import { resolveGatewayRestartLogPath, resolveGatewaySupervisorLogPaths } from "./restart-logs.js";
 import type { GatewayServiceRuntime } from "./service-runtime.js";
 
@@ -18,6 +19,12 @@ export function buildPlatformRuntimeLogHints(params: {
     // Preserve the writer's path bytes; backslashes can be literal POSIX filename characters.
     return [
       `Launchd stdout and stderr (if installed): ${logs.stdoutPath}`,
+      `Restart attempts: ${resolveGatewayRestartLogPath(env)}`,
+    ];
+  }
+  if (platform === "linux" && isOpenRcServiceHost()) {
+    return [
+      `Logs: /var/log/${params.systemdServiceName}.log`,
       `Restart attempts: ${resolveGatewayRestartLogPath(env)}`,
     ];
   }
@@ -96,7 +103,12 @@ export function buildPlatformServiceStartHints(params: {
     case "darwin":
       return [...base, `launchctl bootstrap gui/$UID ${params.launchAgentPlistPath}`];
     case "linux":
-      return [...base, `systemctl --user start ${params.systemdServiceName}.service`];
+      return [
+        ...base,
+        isOpenRcServiceHost()
+          ? `rc-service ${params.systemdServiceName} start`
+          : `systemctl --user start ${params.systemdServiceName}.service`,
+      ];
     case "win32":
       return [...base, `schtasks /Run /TN "${params.windowsTaskName}"`];
     default:

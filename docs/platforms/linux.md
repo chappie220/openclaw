@@ -566,6 +566,43 @@ Enable it:
 systemctl --user enable --now openclaw-gateway[-<profile>].service
 ```
 
+## Gateway service (OpenRC)
+
+On Alpine Linux and other hosts that boot OpenRC instead of systemd, OpenClaw
+manages the Gateway as an OpenRC system service. OpenClaw selects OpenRC when
+`/sbin/openrc-run` exists and `/run/systemd/system` does not.
+
+OpenRC services are system-wide, so run onboarding and the install from a root
+shell (`su -` or `doas -s`). The service runs as root with root's
+`~/.openclaw` state:
+
+```bash
+openclaw gateway install
+```
+
+This writes:
+
+- `/etc/init.d/openclaw-gateway[-<profile>]`: the init script, supervised by `supervise-daemon` with automatic respawn
+- `/etc/conf.d/openclaw-gateway[-<profile>]`: owner-only (`0600`) service environment, including secret values
+- `/var/log/openclaw-gateway[-<profile>].log`: Gateway stdout and stderr
+
+The install adds the service to the `default` runlevel and starts it.
+`openclaw gateway start|stop|restart|status|uninstall` call `rc-service` and
+`rc-update`. You can also use them directly:
+
+```bash
+rc-service openclaw-gateway status
+rc-service openclaw-gateway restart
+tail -n 200 /var/log/openclaw-gateway.log
+```
+
+Install refuses to replace an init script with the same name that OpenClaw did
+not write. It also rejects a Node or OpenClaw path with spaces or shell
+metacharacters, because `openrc-run` re-splits `command` and `directory`.
+
+`openclaw update` updates the package but does not restart an OpenRC service.
+After an update, run `rc-service openclaw-gateway restart`.
+
 ## Memory pressure and OOM kills
 
 On Linux, the kernel picks an OOM victim when a host, VM, or container cgroup

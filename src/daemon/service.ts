@@ -14,6 +14,19 @@ import {
   uninstallLaunchAgent,
 } from "./launchd.js";
 import {
+  hasOpenRcServiceDefinition,
+  installOpenRcService,
+  isOpenRcServiceEnabled,
+  isOpenRcServiceHost,
+  readOpenRcServiceCommand,
+  readOpenRcServiceRuntime,
+  restartOpenRcService,
+  stageOpenRcService,
+  startOpenRcService,
+  stopOpenRcService,
+  uninstallOpenRcService,
+} from "./openrc.js";
+import {
   assertDaemonRuntimePinCurrent,
   assertDaemonRuntimePinDefinition,
   assertDaemonRuntimePinPlan,
@@ -287,6 +300,25 @@ const GATEWAY_SERVICE_REGISTRY: Record<SupportedGatewayServicePlatform, GatewayS
   },
 };
 
+// Alpine and other non-systemd Linux hosts supervise the Gateway as an OpenRC system service.
+const OPENRC_GATEWAY_SERVICE: GatewayService = {
+  label: "OpenRC",
+  loadedText: "enabled",
+  notLoadedText: "disabled",
+  stage: stageOpenRcService,
+  install: installOpenRcService,
+  uninstall: uninstallOpenRcService,
+  start: startOpenRcService,
+  stop: stopOpenRcService,
+  restart: restartOpenRcService,
+  isLoaded: isOpenRcServiceEnabled,
+  isEnabled: isOpenRcServiceEnabled,
+  hasInstalledDefinition: hasOpenRcServiceDefinition,
+  isAbsent: async (args) => !(await hasOpenRcServiceDefinition(args)),
+  readCommand: readOpenRcServiceCommand,
+  readRuntime: readOpenRcServiceRuntime,
+};
+
 function guardGatewayServiceMutation<
   TArgs extends {
     env?: GatewayServiceEnv;
@@ -443,6 +475,9 @@ function isSupportedGatewayServicePlatform(
 }
 
 export function resolveGatewayService(kind: ServiceKind = "gateway"): GatewayService {
+  if (isOpenRcServiceHost()) {
+    return withGatewayServiceMutationGuards(OPENRC_GATEWAY_SERVICE, kind);
+  }
   if (isSupportedGatewayServicePlatform(process.platform)) {
     return withGatewayServiceMutationGuards(GATEWAY_SERVICE_REGISTRY[process.platform], kind);
   }
