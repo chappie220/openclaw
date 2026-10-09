@@ -136,6 +136,10 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         locks.entry(session.to_owned()).or_default().clone()
     }
 
+    pub fn store(&self) -> &crate::store::Store {
+        &self.agent.store
+    }
+
     pub fn add_notifier(&self, notifier: Arc<dyn Notifier>) {
         self.notifiers
             .lock()

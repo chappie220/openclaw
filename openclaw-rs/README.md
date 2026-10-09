@@ -14,6 +14,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Gateway HTTP/WebSocket + Web UI | phase 4 ✅ |
 | Scheduled tasks / heartbeat, OpenRC service | phase 5 ✅ |
 | QQ channel (official QQ Bot API) | phase 6 ✅ |
+| Email channel (IMAP in, SMTP out) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -112,6 +113,39 @@ until `allow` is set. Replies go out as passive replies (up to 4 messages per
 private message, 5 per group message, about 1500 characters each) and fall
 back to active messages once QQ's reply window has passed. Scheduled jobs whose
 session is a QQ session send their result to that chat.
+
+## Email
+
+The bot polls a mailbox over IMAP and replies over SMTP in the same thread.
+Each sender address is its own session (`mail:<address>`).
+
+```toml
+[mail]
+enabled = true
+imap_host = "imap.qq.com"     # 163: imap.163.com, Gmail: imap.gmail.com
+imap_port = 993
+smtp_host = "smtp.qq.com"
+smtp_port = 465               # implicit TLS; use 587 with smtp_security = "starttls"
+username = "bot@qq.com"
+# password = "..."            # prefer MAIL_PASSWORD; QQ Mail and 163 need an authorization code
+allow = ["me@example.com", "@family.cn"]   # required: addresses or @domains
+poll_secs = 60
+```
+
+- `allow` is required, because anyone could otherwise spend your model
+  credits by email. Replies always go to `From`, never `Reply-To`.
+- Auto-replies, mailing lists (`Auto-Submitted`, `Precedence`, `List-Id`) and
+  mail from the bot's own address are skipped, and replies carry
+  `Auto-Submitted: auto-replied`, so two robots cannot loop.
+- Each poll marks fetched mail as read and handles at most 20 messages;
+  Message-IDs are remembered, so a re-delivered copy is answered once.
+- Quoted history (`>` lines, `On … wrote:`, `原始邮件`) is removed before the model
+  sees the mail. GBK/GB18030 and other legacy charsets are decoded.
+- The client sends the IMAP `ID` command, which 163/126 require.
+- `imap_security`/`smtp_security` = `"none"` is accepted only for loopback
+  hosts, for local bridges such as Proton Bridge.
+- Email has no way to approve tools, so `ask` tools are declined.
+- Scheduled jobs whose session is a mail session send their result as an email.
 
 Long-term memory is a SQLite FTS5 index with the trigram tokenizer, so Chinese
 text matches by substring without word segmentation. Space-separated terms

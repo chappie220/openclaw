@@ -12,18 +12,23 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["ws"] }
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 croner = "4.0.1"
 futures-util = "0.3.34"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "rustls-native-certs", "hostname", "aws-lc-rs"] }
 libc = "0.2.190"
+mail-parser = { version = "0.11.9", features = ["full_encoding"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls", "http2"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustls-native-certs = "0.8.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "time", "sync", "process", "fs", "net"] }
+tokio-rustls = "0.26.6"
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots", "connect"] }
 toml = "1.1.8"
 

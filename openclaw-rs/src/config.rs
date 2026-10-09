@@ -19,6 +19,69 @@ pub struct Config {
     pub tools: ToolsConfig,
     pub gateway: GatewayConfig,
     pub qq: QqConfig,
+    pub mail: MailConfig,
+}
+
+/// Transport security for a mail connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailSecurity {
+    /// Implicit TLS (IMAP 993, SMTP 465).
+    Tls,
+    /// SMTP STARTTLS (587); IMAP always uses implicit TLS.
+    Starttls,
+    /// Plain text; only accepted for loopback hosts such as local mail bridges.
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MailConfig {
+    pub enabled: bool,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_security: MailSecurity,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_security: MailSecurity,
+    pub username: String,
+    /// Prefer `MAIL_PASSWORD`. Many providers (QQ Mail, 163) need an app authorization code.
+    pub password: Option<String>,
+    /// Sender address for replies (default: username).
+    pub from: Option<String>,
+    /// Required: addresses (or `@domain`) allowed to talk to the bot.
+    pub allow: Vec<String>,
+    pub mailbox: String,
+    pub poll_secs: u64,
+}
+
+impl Default for MailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            imap_host: String::new(),
+            imap_port: 993,
+            imap_security: MailSecurity::Tls,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            smtp_security: MailSecurity::Tls,
+            username: String::new(),
+            password: None,
+            from: None,
+            allow: Vec::new(),
+            mailbox: "INBOX".into(),
+            poll_secs: 60,
+        }
+    }
+}
+
+impl MailConfig {
+    pub fn password(&self) -> Option<String> {
+        std::env::var("MAIL_PASSWORD")
+            .ok()
+            .or_else(|| self.password.clone())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

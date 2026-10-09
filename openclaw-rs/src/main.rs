@@ -5,6 +5,7 @@ mod config;
 mod cron;
 mod gateway;
 mod llm;
+mod mail;
 mod memory;
 mod qq;
 mod service;
@@ -168,6 +169,11 @@ async fn run(cli: Cli) -> Result<()> {
                 let bot = qq::QqBot::new(config.qq.clone())?;
                 gateway.add_notifier(bot.clone());
                 tokio::spawn(qq::run(bot, gateway.clone()));
+            }
+            if config.mail.enabled {
+                let bot = mail::MailBot::new(config.mail.clone())?;
+                gateway.add_notifier(bot.clone());
+                tokio::spawn(mail::run(bot, gateway.clone()));
             }
             tokio::spawn(gateway.clone().run_scheduler());
             gateway::serve(gateway, &bind).await

@@ -59,6 +59,12 @@ CREATE TABLE jobs (
 );
 CREATE INDEX jobs_by_next_run ON jobs(next_run);
 "#,
+    r#"
+CREATE TABLE mail_seen (
+  message_id TEXT PRIMARY KEY,
+  seen_at INTEGER NOT NULL
+);
+"#,
 ];
 
 #[derive(Clone)]
