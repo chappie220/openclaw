@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::agent::Tools;
 use crate::config::{Permission, ToolsConfig};
@@ -377,44 +377,48 @@ impl BuiltinTools {
             .kill_on_drop(true)
             .spawn()
             .map_err(|err| format!("error: cannot start shell: {err}"))?;
-        let pid = child.id();
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        // Kills the whole group if this future is dropped or times out mid-run.
+        let group = child.id().map(GroupKill);
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let cap = self.config.max_output_bytes;
         let run = async {
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let (read_out, read_err, status) = tokio::join!(
-                stdout.read_to_end(&mut out),
-                stderr.read_to_end(&mut err),
+            // Both pipes drain concurrently into fixed-size buffers, so neither a
+            // blocked writer nor endless output can grow memory past the cap.
+            let (out, err, status) = tokio::join!(
+                Capture::drain(stdout, cap),
+                Capture::drain(stderr, cap),
                 child.wait()
             );
-            read_out.and(read_err).map_err(|e| e.to_string())?;
-            Ok::<_, String>((status.map_err(|e| e.to_string())?, out, err))
+            Ok::<_, String>((
+                status.map_err(|e| e.to_string())?,
+                out.map_err(|e| e.to_string())?,
+                err.map_err(|e| e.to_string())?,
+            ))
         };
         let timeout = Duration::from_secs(self.config.shell_timeout_secs);
         let (status, out, err) = match tokio::time::timeout(timeout, run).await {
             Ok(result) => result.map_err(|e| format!("error: {e}"))?,
             Err(_) => {
-                if let Some(pid) = pid {
-                    // SAFETY: signalling a process group we created; failure is harmless.
-                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                }
+                drop(group);
                 return Err(format!(
                     "error: command timed out after {}s and was killed",
                     timeout.as_secs()
                 ));
             }
         };
-        let cap = self.config.max_output_bytes;
+        // Finished normally: leave deliberately detached descendants alone.
+        std::mem::forget(group);
         let code = status
             .code()
             .map_or_else(|| "killed by signal".into(), |c| c.to_string());
         let mut text = reviewed.map(|note| format!("{note}\n")).unwrap_or_default();
         text.push_str(&format!("exit code: {code}\n"));
-        if !out.is_empty() {
-            text.push_str(&format!("stdout:\n{}\n", truncate(&out, cap)));
+        if out.total > 0 {
+            text.push_str(&format!("stdout:\n{}\n", out.render()));
         }
-        if !err.is_empty() {
-            text.push_str(&format!("stderr:\n{}\n", truncate(&err, cap)));
+        if err.total > 0 {
+            text.push_str(&format!("stderr:\n{}\n", err.render()));
         }
         Ok(text)
     }
@@ -533,6 +537,90 @@ fn format_time(unix: i64) -> String {
 fn parse<T: DeserializeOwned>(call: &ToolCall) -> Result<T, String> {
     serde_json::from_str(&call.function.arguments)
         .map_err(|err| format!("error: invalid arguments for {}: {err}", call.function.name))
+}
+
+/// SIGKILLs a process group when dropped.
+struct GroupKill(u32);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        // SAFETY: signalling a process group we created; failure is harmless.
+        unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+    }
+}
+
+/// The head and tail of a stream, at most `cap` bytes however much is read.
+struct Capture {
+    head: Vec<u8>,
+    head_cap: usize,
+    /// Ring buffer of the latest bytes past the head; `tail_start` is the oldest.
+    tail: Vec<u8>,
+    tail_cap: usize,
+    tail_start: usize,
+    total: u64,
+}
+
+impl Capture {
+    fn new(cap: usize) -> Self {
+        let head_cap = cap / 2;
+        Self {
+            head: Vec::new(),
+            head_cap,
+            tail: Vec::new(),
+            tail_cap: cap - head_cap,
+            tail_start: 0,
+            total: 0,
+        }
+    }
+
+    async fn drain(mut reader: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<Self> {
+        let mut capture = Self::new(cap);
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf).await? {
+                0 => return Ok(capture),
+                n => capture.push(&buf[..n]),
+            }
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        let take = (self.head_cap - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..take]);
+        let rest = &bytes[take..];
+        if rest.len() >= self.tail_cap {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&rest[rest.len() - self.tail_cap..]);
+            self.tail_start = 0;
+            return;
+        }
+        for &b in rest {
+            if self.tail.len() < self.tail_cap {
+                self.tail.push(b);
+            } else {
+                self.tail[self.tail_start] = b;
+                self.tail_start = (self.tail_start + 1) % self.tail_cap;
+            }
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut tail = self.tail[self.tail_start..].to_vec();
+        tail.extend_from_slice(&self.tail[..self.tail_start]);
+        let omitted = self.total - (self.head.len() + tail.len()) as u64;
+        if omitted == 0 {
+            let mut all = self.head.clone();
+            all.extend_from_slice(&tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        format!(
+            "{}\n[... {omitted} bytes omitted ...]\n{}",
+            String::from_utf8_lossy(&self.head),
+            String::from_utf8_lossy(&tail)
+        )
+    }
 }
 
 /// Keeps the head and tail of long output, where errors usually are.
@@ -935,6 +1023,71 @@ mod tests {
         let out = run(reviewed(None, None), "touch nobody").await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("nobody").exists());
+    }
+
+    #[test]
+    fn capture_keeps_head_and_tail_within_its_cap() {
+        let mut c = Capture::new(4);
+        for chunk in [&b"abc"[..], b"defg", b"hij"] {
+            c.push(chunk);
+        }
+        assert_eq!(c.render(), "ab\n[... 6 bytes omitted ...]\nij");
+        assert!(c.head.len() + c.tail.len() <= 4);
+        let mut short = Capture::new(16);
+        short.push(b"hello\n");
+        assert_eq!(short.render(), "hello\n");
+    }
+
+    #[tokio::test]
+    async fn shell_output_memory_is_bounded_and_both_pipes_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            shell_timeout_secs: 60,
+            max_output_bytes: 1024,
+            ..ToolsConfig::default()
+        };
+        let t = tools(dir.path(), config, false);
+        // 128 MiB on each stream at once, with invalid UTF-8 in the mix.
+        let cmd = "head -c 134217728 /dev/zero | tr '\\0' '\\377' & \
+                   head -c 134217728 /dev/zero >&2; wait; echo done";
+        let out = t.call(&call("shell", json!({"command": cmd}))).await;
+        assert!(out.starts_with("exit code: 0"), "{out}");
+        // stdout also carries "done\n"; each stream keeps 1 KiB.
+        assert!(out.contains("[... 134216709 bytes omitted ...]"), "{out}");
+        assert!(out.contains("done\n\nstderr:"), "{out}");
+        assert!(out.contains("[... 134216704 bytes omitted ...]"), "{out}");
+        assert!(out.len() < 8 * 1024, "{}", out.len());
+    }
+
+    #[tokio::test]
+    async fn endless_output_is_killed_at_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            shell_timeout_secs: 1,
+            ..ToolsConfig::default()
+        };
+        let t = tools(dir.path(), config, false);
+        let out = t
+            .call(&call("shell", json!({"command": "yes; yes >&2"})))
+            .await;
+        assert!(out.contains("timed out"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_running_shell_kills_its_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            ..ToolsConfig::default()
+        };
+        let t = tools(dir.path(), config, false);
+        let cmd = "(sleep 2; touch leaked) & sleep 30";
+        let c = call("shell", json!({"command": cmd}));
+        let _ = tokio::time::timeout(Duration::from_millis(300), t.call(&c)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!dir.path().join("leaked").exists());
     }
 
     #[test]

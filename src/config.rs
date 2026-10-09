@@ -220,7 +220,8 @@ pub struct ToolsConfig {
     /// Changing the agent's identity; the first one is always saved without asking.
     pub identity: Permission,
     pub shell_timeout_secs: u64,
-    /// Per-stream cap on tool output returned to the model.
+    /// Per-stream cap on tool output returned to the model, and on shell output
+    /// buffered while a command runs.
     pub max_output_bytes: usize,
     /// Model review of `shell` commands before anyone is asked.
     pub review: ReviewConfig,

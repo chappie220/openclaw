@@ -258,12 +258,15 @@ shell = "ask"           # allow | ask | deny
 write = "ask"           # write_file and edit_file; reads are always allowed
 identity = "ask"        # identity_set after the first identity exists
 shell_timeout_secs = 120
-max_output_bytes = 16384
+max_output_bytes = 16384  # per stream; also the most shell output held in memory
 ```
 
 Tools: `read_file`, `list_dir`, `write_file`, `edit_file` (one exact, unique
 replacement) and `shell` (`sh -c` in the workspace; the whole process group is
-killed on timeout). `ask` prompts on the controlling terminal; with no terminal
+killed on timeout or when the turn is cancelled). Shell stdout and stderr are
+drained while the command runs and only their first and last
+`max_output_bytes / 2` bytes are kept, so endless output cannot exhaust memory;
+the result says how many bytes were omitted. `ask` prompts on the controlling terminal; with no terminal
 the action is declined and the model is told so. Tools set to `deny` are not
 offered to the model at all.
 
