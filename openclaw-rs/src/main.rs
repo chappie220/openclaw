@@ -6,6 +6,7 @@ mod cron;
 mod gateway;
 mod llm;
 mod memory;
+mod qq;
 mod service;
 mod store;
 mod tools;
@@ -155,6 +156,19 @@ async fn run(cli: Cli) -> Result<()> {
             let agent = Arc::new(build_agent(&config, &state, store)?);
             let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
             let gateway = gateway::Gateway::new(agent, config.gateway.token());
+            if config.qq.enabled {
+                let unattended_allow = config.tools.shell == config::Permission::Allow
+                    || config.tools.write == config::Permission::Allow;
+                if unattended_allow && config.qq.allow.is_empty() {
+                    bail!(
+                        "tools.shell or tools.write is \"allow\", so any QQ user could run them; \
+                         list trusted openids in qq.allow (the log shows each sender's openid) or use \"ask\""
+                    );
+                }
+                let bot = qq::QqBot::new(config.qq.clone())?;
+                gateway.add_notifier(bot.clone());
+                tokio::spawn(qq::run(bot, gateway.clone()));
+            }
             tokio::spawn(gateway.clone().run_scheduler());
             gateway::serve(gateway, &bind).await
         }

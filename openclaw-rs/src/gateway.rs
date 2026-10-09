@@ -94,7 +94,15 @@ struct SessionItem {
     updated_at: i64,
 }
 
+/// Delivers unattended results (scheduled jobs) to a channel that owns the session.
+#[async_trait]
+pub trait Notifier: Send + Sync {
+    fn handles(&self, session: &str) -> bool;
+    async fn notify(&self, session: &str, text: &str) -> Result<()>;
+}
+
 pub struct Gateway<M: Model, T: Tools> {
+    notifiers: Mutex<Vec<Arc<dyn Notifier>>>,
     agent: Arc<Agent<M, T>>,
     token: Option<String>,
     updates: broadcast::Sender<ServerMsg>,
@@ -110,6 +118,7 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
             agent,
             token,
             updates: broadcast::channel(64).0,
+            notifiers: Mutex::new(Vec::new()),
             session_locks: Mutex::new(HashMap::new()),
         })
     }
@@ -125,6 +134,26 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
     fn session_lock(&self, session: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.session_locks.lock().unwrap_or_else(|p| p.into_inner());
         locks.entry(session.to_owned()).or_default().clone()
+    }
+
+    pub fn add_notifier(&self, notifier: Arc<dyn Notifier>) {
+        self.notifiers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(notifier);
+    }
+
+    async fn notify(&self, session: &str, text: &str) {
+        let notifiers: Vec<_> = self
+            .notifiers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for notifier in notifiers.iter().filter(|n| n.handles(session)) {
+            if let Err(err) = notifier.notify(session, text).await {
+                eprintln!("cannot deliver to {session}: {err:#}");
+            }
+        }
     }
 
     /// Runs a turn with nobody to approve tools, queued behind other turns of the session.
@@ -155,7 +184,10 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
                 tokio::spawn(async move {
                     let prompt = format!("[scheduled job {:?}] {}", job.name, job.prompt);
                     let status = match gateway.run_unattended(&job.session, &prompt).await {
-                        Ok(_) => "ok".to_owned(),
+                        Ok(text) => {
+                            gateway.notify(&job.session, &text).await;
+                            "ok".to_owned()
+                        }
                         Err(err) => format!("error: {err:#}"),
                     };
                     eprintln!(

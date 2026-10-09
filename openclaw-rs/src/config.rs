@@ -18,6 +18,42 @@ pub struct Config {
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
     pub gateway: GatewayConfig,
+    pub qq: QqConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QqConfig {
+    pub enabled: bool,
+    pub app_id: String,
+    /// Prefer `QQ_APP_SECRET`; a secret here is stored in plain text.
+    pub app_secret: Option<String>,
+    /// User or group openids that may talk to the bot; empty allows everyone.
+    pub allow: Vec<String>,
+    pub api_base: String,
+    pub token_url: String,
+}
+
+impl Default for QqConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            app_id: String::new(),
+            app_secret: None,
+            allow: Vec::new(),
+            api_base: "https://api.bot.qq.com".into(),
+            token_url: "https://api.bot.qq.com/app/getAppAccessToken".into(),
+        }
+    }
+}
+
+impl QqConfig {
+    pub fn app_secret(&self) -> Option<String> {
+        std::env::var("QQ_APP_SECRET")
+            .ok()
+            .or_else(|| self.app_secret.clone())
+            .filter(|s| !s.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

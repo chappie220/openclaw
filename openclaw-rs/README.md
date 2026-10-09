@@ -13,7 +13,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Long-term memory search (SQLite FTS5) | phase 3 ✅ |
 | Gateway HTTP/WebSocket + Web UI | phase 4 ✅ |
 | Scheduled tasks / heartbeat, OpenRC service | phase 5 ✅ |
-| QQ channel (official QQ Bot API) | phase 6 |
+| QQ channel (official QQ Bot API) | phase 6 ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -87,6 +87,31 @@ doas openclaw-rs service uninstall           # keeps state and logs
 The service runs as the given account with state in its `~/.openclaw-rs`,
 under `supervise-daemon` with automatic restart. The two variables above are
 copied into `/etc/conf.d/openclaw-rs` (mode 0600).
+
+## QQ (official bot)
+
+1. Create a bot on the [QQ Open Platform](https://q.qq.com), note the AppID and
+   AppSecret, and request the group and private-chat message permission.
+2. Under 事件订阅与回调地址 (event subscription and callback URL), choose **WebSocket**. It needs no public address,
+   which suits a Pi at home.
+3. Configure and restart `serve`:
+
+```toml
+[qq]
+enabled = true
+app_id = "102xxxxxx"
+# app_secret = "..."      # prefer QQ_APP_SECRET
+allow = []                # user/group openids allowed to talk to the bot
+```
+
+Each private chat and each group is its own session (`qq:c2c:<openid>`,
+`qq:group:<openid>`). The log prints every sender's openid, so you can fill in
+`allow`. QQ users cannot approve tools, so `ask` tools are declined there; if
+`tools.shell` or `tools.write` is `allow`, the Gateway refuses to start QQ
+until `allow` is set. Replies go out as passive replies (up to 4 messages per
+private message, 5 per group message, about 1500 characters each) and fall
+back to active messages once QQ's reply window has passed. Scheduled jobs whose
+session is a QQ session send their result to that chat.
 
 Long-term memory is a SQLite FTS5 index with the trigram tokenizer, so Chinese
 text matches by substring without word segmentation. Space-separated terms
