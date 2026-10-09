@@ -158,6 +158,18 @@ enum IdentityAction {
     },
     /// Forget the identity; the next conversation sets it up again.
     Reset,
+    /// Show the identity draft waiting for approval, from any channel.
+    Drafts,
+    /// Save identity draft <id> exactly as shown by `identity drafts`.
+    Approve {
+        id: i64,
+        /// The draft's code, to be sure it is the version you read.
+        code: Option<String>,
+    },
+    /// Discard identity draft <id>.
+    Reject {
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -348,6 +360,10 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
 }
 
 async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
+    if input.trim_start().starts_with("/identity") {
+        owner_command(&agent.store, input);
+        return Ok(());
+    }
     let mut stdout = std::io::stdout();
     let mut on_event = |event| match event {
         AgentEvent::Text(text) => {
@@ -466,6 +482,14 @@ fn memory(store: &Store, action: MemoryAction) -> Result<()> {
     Ok(())
 }
 
+/// Runs an `/identity` command as the terminal's owner.
+fn owner_command(store: &Store, command: &str) {
+    let owner = access::Actor::owner(access::CLI);
+    if let Some(reply) = identity::command(store, &owner, command) {
+        println!("{reply}");
+    }
+}
+
 fn identity(store: &Store, action: IdentityAction) -> Result<()> {
     match action {
         IdentityAction::Show => match store.identity()? {
@@ -500,6 +524,12 @@ fn identity(store: &Store, action: IdentityAction) -> Result<()> {
             })?;
             println!("identity saved");
         }
+        IdentityAction::Drafts => owner_command(store, "/identity show"),
+        IdentityAction::Approve { id, code } => owner_command(
+            store,
+            &format!("/identity approve {id} {}", code.unwrap_or_default()),
+        ),
+        IdentityAction::Reject { id } => owner_command(store, &format!("/identity reject {id}")),
         IdentityAction::Reset => {
             if store.identity_clear()? {
                 println!("identity removed; the next conversation sets it up again");

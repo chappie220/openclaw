@@ -95,9 +95,11 @@ impl<M: Model, T: Tools> Agent<M, T> {
         for _ in 0..self.config.max_steps {
             // Read per call so an identity saved mid-turn takes effect on the next call.
             let identity = self.store.identity()?;
+            let can_set = access::current().is_some_and(|a| a.can(access::Capability::Identity));
             let mut messages = vec![ChatMessage::system(identity::system_prompt(
                 &self.config.system_prompt,
                 identity.as_ref(),
+                can_set,
             ))];
             messages.extend(self.store.history(session_id, self.config.history_limit)?);
             let completion = self

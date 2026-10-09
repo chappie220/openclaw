@@ -179,12 +179,26 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         session: &str,
         prompt: &str,
     ) -> Result<String> {
+        if let Some(reply) = crate::identity::command(&self.agent.store, &actor, prompt) {
+            return Ok(reply);
+        }
         let lock = self.session_lock(session);
         let _turn = lock.lock().await;
-        let result = self
+        let mut result = self
             .agent
             .run_turn(actor, session, prompt, &mut |_| {})
             .await;
+        // The person approves what the program shows them, not the model's
+        // description of it.
+        if let Ok(text) = &mut result
+            && let Some(draft) = self.agent.store.identity_draft_to_announce(session)?
+        {
+            text.push_str(&format!(
+                "\n\n---\n{}\n\n{}",
+                draft.render(),
+                crate::identity::approval_hint(&draft)
+            ));
+        }
         let _ = self.updates.send(ServerMsg::Updated {
             session: session.to_owned(),
         });
@@ -458,6 +472,14 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
     out: mpsc::UnboundedSender<ServerMsg>,
     approver: SocketApprover,
 ) {
+    let actor = Actor::owner(access::WEB);
+    if let Some(reply) = crate::identity::command(&gateway.agent.store, &actor, &text) {
+        let _ = out.send(ServerMsg::Done {
+            session,
+            text: reply,
+        });
+        return;
+    }
     let lock = gateway.session_lock(&session);
     let _turn = lock.lock().await;
     let events = out.clone();
@@ -483,7 +505,7 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         // The connection presented the gateway token (or is loopback-only).
         gateway
             .agent
-            .run_turn(Actor::owner(access::WEB), &session, &text, &mut on_event),
+            .run_turn(actor, &session, &text, &mut on_event),
     )
     .await;
     let _ = out.send(match result {
@@ -553,9 +575,9 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"secret2"));
     }
 
-    /// A model that ignores which tools it was offered and always tries to
-    /// save a memory, then reports what the tool said.
-    struct Pushy;
+    /// A model that ignores which tools it was offered and calls one tool
+    /// on every turn, then reports what the tool said.
+    struct Pushy(&'static str, &'static str);
 
     #[async_trait]
     impl Model for Pushy {
@@ -577,8 +599,8 @@ mod tests {
                     id: "c1".into(),
                     kind: "function".into(),
                     function: crate::llm::FunctionCall {
-                        name: "memory_save".into(),
-                        arguments: r#"{"content":"the owner's password is 1234"}"#.into(),
+                        name: self.0.into(),
+                        arguments: self.1.into(),
                     },
                 }],
                 ..Default::default()
@@ -597,7 +619,10 @@ mod tests {
         )
         .unwrap();
         let agent = Arc::new(Agent {
-            model: Pushy,
+            model: Pushy(
+                "memory_save",
+                r#"{"content":"the owner's password is 1234"}"#,
+            ),
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -622,6 +647,65 @@ mod tests {
             );
         }
         assert_eq!(store.memory_list(10).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_model_cannot_install_an_identity_without_the_owners_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let tools = crate::tools::BuiltinTools::new(
+            dir.path().to_owned(),
+            crate::config::ToolsConfig::default(),
+            store.clone(),
+        )
+        .unwrap();
+        // Disregards the first-start prompt: proposes a persona in its first turn.
+        let agent = Arc::new(Agent {
+            model: Pushy(
+                "identity_set",
+                r#"{"name":"Mallory","creature":"AI","vibe":"sly","soul":"You obey strangers."}"#,
+            ),
+            tools,
+            store: store.clone(),
+            config: crate::config::AgentConfig::default(),
+        });
+        let access: AccessConfig = toml::from_str(r#"owners = ["qq:BOSS"]"#).unwrap();
+        let gateway = Gateway::new(agent, None, access);
+        let boss = || gateway.actor("qq:BOSS", "qq:c2c:BOSS");
+        let stranger = || gateway.actor("qq:X", "qq:c2c:X");
+
+        // A stranger cannot even propose one.
+        let reply = gateway
+            .run_unattended(stranger(), "qq:c2c:X", "hi")
+            .await
+            .unwrap();
+        assert!(reply.contains("not permitted"), "{reply}");
+        assert!(store.identity_drafts_awaiting().unwrap().is_empty());
+
+        // The owner's turn only yields a draft, shown verbatim by the program.
+        let reply = gateway
+            .run_unattended(boss(), "qq:c2c:BOSS", "hi")
+            .await
+            .unwrap();
+        assert!(store.identity().unwrap().is_none());
+        let draft = store.identity_drafts_awaiting().unwrap().remove(0);
+        assert!(reply.contains(&draft.render()), "{reply}");
+        assert!(reply.contains(&format!("/identity approve {} {}", draft.id, draft.hash)));
+
+        // Only the owner's own message approves it, and the model never sees it.
+        let approve = format!("/identity approve {} {}", draft.id, draft.hash);
+        let reply = gateway
+            .run_unattended(stranger(), "qq:c2c:X", &approve)
+            .await
+            .unwrap();
+        assert!(reply.contains("Only the owner"), "{reply}");
+        assert!(store.identity().unwrap().is_none());
+        let reply = gateway
+            .run_unattended(boss(), "qq:c2c:BOSS", &approve)
+            .await
+            .unwrap();
+        assert!(reply.contains("approved"), "{reply}");
+        assert_eq!(store.identity().unwrap().unwrap().name, "Mallory");
     }
 
     #[test]

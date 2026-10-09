@@ -57,6 +57,29 @@ CREATE TABLE identity (
 -- The actor that saved each memory; NULL for the owner's older ones.
 ALTER TABLE memories ADD COLUMN created_by TEXT;
 "#,
+        r#"
+-- Proposed identities. A draft is never edited: a revision is a new draft
+-- that supersedes the old one, so an approval names exactly what was shown.
+CREATE TABLE identity_drafts (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  creature TEXT NOT NULL,
+  vibe TEXT NOT NULL,
+  emoji TEXT,
+  soul TEXT NOT NULL,
+  -- FNV-1a of the fields, shown to the user and checked again on commit.
+  hash TEXT NOT NULL,
+  proposed_by TEXT NOT NULL,
+  session TEXT NOT NULL,
+  -- awaiting, committed, rejected, superseded
+  state TEXT NOT NULL,
+  -- Whether the channel has shown this draft to the user yet.
+  announced INTEGER NOT NULL DEFAULT 0,
+  decided_by TEXT,
+  created_at INTEGER NOT NULL,
+  decided_at INTEGER
+);
+"#,
     ],
     legacy: &[
         ("memories", "id, content, created_at"),

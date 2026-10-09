@@ -217,34 +217,52 @@ impl BuiltinTools {
         }
     }
 
-    async fn identity_set(&self, args: IdentitySetArgs) -> Result<String, String> {
-        let current = self.store.identity().map_err(|e| format!("error: {e:#}"))?;
-        // The first identity is the setup the agent was asked to do; changes need consent.
-        if current.is_some() {
-            let summary = format!(
-                "become {:?} ({}, {})\n{}",
-                args.name.trim(),
-                args.creature.trim(),
-                args.vibe.trim(),
-                args.soul.trim()
-            );
-            self.permit(self.config.identity, "identity_set", &summary)
-                .await?;
+    /// Proposes an identity. Nothing is saved until a person approves this
+    /// exact draft: here when the turn has someone to ask, otherwise later
+    /// with `/identity approve`, which the program handles, not the model.
+    async fn identity_set(&self, actor: &Actor, args: IdentitySetArgs) -> Result<String, String> {
+        if self.config.identity == Permission::Deny {
+            return Err("error: identity_set is disabled by configuration".into());
         }
-        self.store
-            .identity_set(&Identity {
-                name: args.name.clone(),
-                creature: args.creature,
-                vibe: args.vibe,
-                emoji: args.emoji,
-                soul: args.soul,
-                ..Identity::default()
-            })
+        let session = crate::agent::current_session()
+            .ok_or("error: identity_set can only be used in a conversation")?;
+        let proposed = Identity {
+            name: args.name,
+            creature: args.creature,
+            vibe: args.vibe,
+            emoji: args.emoji,
+            soul: args.soul,
+            ..Identity::default()
+        };
+        let draft = self
+            .store
+            .identity_propose(&proposed, &actor.id, &session)
             .map_err(|e| format!("error: {e:#}"))?;
-        Ok(format!(
-            "identity saved: you are now {}; it applies to every conversation from your next reply",
-            args.name.trim()
-        ))
+        let Ok(approver) = TURN_APPROVER.try_with(Arc::clone) else {
+            return Ok(format!(
+                "identity draft #{} is NOT saved yet. After your reply the user is shown the exact \
+                 draft and how to approve or reject it; tell them briefly that it needs their \
+                 approval, and do not act as the new identity until it is approved.",
+                draft.id
+            ));
+        };
+        let approved = approver.approve("identity_set", &draft.render()).await;
+        let decided = self
+            .store
+            .identity_decide(draft.id, approved, Some(&draft.hash), &actor.id)
+            .map_err(|e| format!("error: {e:#}"))?;
+        if approved {
+            Ok(format!(
+                "identity saved: you are now {}; it applies to every conversation from your next reply",
+                decided.identity.name
+            ))
+        } else {
+            Err(format!(
+                "error: the user rejected identity draft #{}; nothing was saved. Ask what to \
+                 change, then propose a revised draft.",
+                draft.id
+            ))
+        }
     }
 
     async fn web_search(&self, args: WebSearchArgs) -> Result<String, String> {
@@ -736,9 +754,10 @@ impl BuiltinTools {
             "Remove a scheduled job by name.",
             json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
         ));
-        specs.push(ToolSpec::function(
+        if self.config.identity != Permission::Deny {
+            specs.push(ToolSpec::function(
             "identity_set",
-            "Save your identity (IDENTITY.md fields and SOUL.md) for every conversation. Call it only after the user approved the exact draft you showed them; never save an identity they did not describe or approve. Write it as who you are: never name a source work, author or actor, summarize plot, cite pages, or say you are based on or playing someone.",
+            "Propose your identity (IDENTITY.md fields and SOUL.md) for every conversation. It is saved only after the user approves this exact draft, which the program shows them; never propose an identity they did not ask for or describe. Write it as who you are: never name a source work, author or actor, summarize plot, cite pages, or say you are based on or playing someone.",
             json!({"type": "object", "properties": {
                 "name": {"type": "string", "description": "What the user calls you"},
                 "creature": {"type": "string", "description": "What you are, e.g. an AI, a robot, a familiar"},
@@ -747,6 +766,7 @@ impl BuiltinTools {
                 "soul": {"type": "string", "description": "SOUL.md, addressed to you as 'You ...', under 4000 characters: tone, speech patterns and catchphrases, opinions, how you address the user, boundaries. Behavior, not biography."}
             }, "required": ["name", "creature", "vibe", "soul"]}),
         ));
+        }
         if self.search.is_some() {
             specs.push(ToolSpec::function(
                 "web_search",
@@ -809,7 +829,7 @@ impl BuiltinTools {
             "memory_search" => parse(call).and_then(|args| self.memory_search(actor, args)),
             "memory_delete" => parse(call).and_then(|args| self.memory_delete(actor, args)),
             "identity_set" => match parse(call) {
-                Ok(args) => self.identity_set(args).await,
+                Ok(args) => self.identity_set(actor, args).await,
                 Err(e) => Err(e),
             },
             "web_search" => match parse(call) {
@@ -969,40 +989,113 @@ mod tests {
         assert!(!dir.path().join("ran").exists());
     }
 
+    fn set_identity(name: &str) -> ToolCall {
+        call(
+            "identity_set",
+            json!({"name": name, "creature": "AI", "vibe": "curious", "soul": "You ask why."}),
+        )
+    }
+
+    /// Calls `c` as the owner in session `main`, with `approver` if any.
+    async fn as_owner_in_main(
+        t: &BuiltinTools,
+        approver: Option<Arc<dyn Approver>>,
+        c: &ToolCall,
+    ) -> String {
+        let turn = crate::agent::with_session("main".into(), async {
+            match approver {
+                Some(a) => with_approver(a, t.call(c)).await,
+                None => t.call(c).await,
+            }
+        });
+        owner(turn).await
+    }
+
     #[tokio::test]
-    async fn first_identity_saves_freely_but_changes_need_approval() {
+    async fn identity_set_never_saves_without_an_approval_of_that_exact_draft() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
-        // No approver, as on QQ or email: first-start setup must still work there.
-        let t = BuiltinTools::new(dir.path().to_owned(), ToolsConfig::default(), store.clone())
-            .unwrap();
-        let set = |name: &str| {
-            call(
-                "identity_set",
-                json!({"name": name, "creature": "AI", "vibe": "curious", "soul": "You ask why."}),
-            )
+        // Even "allow" does not let the model save an identity on its own.
+        let config = ToolsConfig {
+            identity: Permission::Allow,
+            ..ToolsConfig::default()
         };
-        let out = owner(t.call(&set("Ada"))).await;
-        assert!(out.starts_with("identity saved"), "{out}");
-        let out = owner(t.call(&set("Eve"))).await;
-        assert!(out.contains("nobody can answer"), "{out}");
-        assert_eq!(store.identity().unwrap().unwrap().name, "Ada");
+        let t = BuiltinTools::new(dir.path().to_owned(), config, store.clone()).unwrap();
+        let owner_actor = Actor::owner(access::CLI);
 
-        let approved = Scoped(t, Arc::new(Answer(true)));
-        assert!(
-            approved
-                .call(&set("Eve"))
-                .await
-                .starts_with("identity saved")
+        // No approver, as on QQ or email: the first identity is only a draft.
+        let out = as_owner_in_main(&t, None, &set_identity("Ada")).await;
+        assert!(out.contains("NOT saved"), "{out}");
+        assert!(store.identity().unwrap().is_none());
+        let ada = store.identity_drafts_awaiting().unwrap().remove(0);
+
+        // A revision supersedes it, so approving the old draft is refused.
+        as_owner_in_main(&t, None, &set_identity("Eve")).await;
+        let eve = store.identity_drafts_awaiting().unwrap().remove(0);
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {}", ada.id),
         );
+        assert!(out.unwrap().contains("replaced by a newer draft"));
+        // A code from another version is refused too.
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {} {}", eve.id, ada.hash),
+        );
+        assert!(out.unwrap().contains("has code"));
+        // A guest cannot approve.
+        let guest = crate::access::AccessConfig::default().resolve("qq:X", "qq:c2c:X");
+        let out =
+            crate::identity::command(&store, &guest, &format!("/identity approve {}", eve.id));
+        assert!(out.unwrap().contains("Only the owner"));
+        assert!(store.identity().unwrap().is_none());
+
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {} {}", eve.id, eve.hash),
+        )
+        .unwrap();
+        assert!(out.contains("approved"), "{out}");
         assert_eq!(store.identity().unwrap().unwrap().name, "Eve");
+        // Replaying the approval does nothing more.
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {}", eve.id),
+        );
+        assert!(out.unwrap().contains("already committed"));
+
+        // With someone to ask, the exact draft is put to them.
+        let out = as_owner_in_main(&t, Some(Arc::new(Answer(false))), &set_identity("Zed")).await;
+        assert!(out.contains("rejected"), "{out}");
+        assert_eq!(store.identity().unwrap().unwrap().name, "Eve");
+        let out = as_owner_in_main(&t, Some(Arc::new(Answer(true))), &set_identity("Zed")).await;
+        assert!(out.starts_with("identity saved"), "{out}");
+        assert_eq!(store.identity().unwrap().unwrap().name, "Zed");
         // web_search is only offered when a provider is configured.
         assert!(
-            !approved
-                .specs()
+            !owner(async { t.specs() })
+                .await
                 .iter()
                 .any(|s| s.function.name == "web_search")
         );
+    }
+
+    #[tokio::test]
+    async fn identity_set_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            identity: Permission::Deny,
+            ..ToolsConfig::default()
+        };
+        let store = Store::open_in_memory().unwrap();
+        let t = BuiltinTools::new(dir.path().to_owned(), config, store.clone()).unwrap();
+        let out = as_owner_in_main(&t, Some(Arc::new(Answer(true))), &set_identity("Ada")).await;
+        assert!(out.contains("disabled"), "{out}");
+        assert!(store.identity_drafts_awaiting().unwrap().is_empty());
     }
 
     #[tokio::test]

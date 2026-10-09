@@ -242,8 +242,8 @@ On first start the agent has no identity. Its first conversation, in any
 channel, sets one up (unless you ask for real work first, which comes first).
 You describe who it should be, or name a fictional character (novel, anime,
 game, film) and it searches the web for that character's personality, way of
-speaking, catchphrases and values, shows you a draft, and saves it after you
-agree.
+speaking, catchphrases and values, and proposes a draft. Nothing is saved
+until you approve that exact draft (see below).
 
 The identity follows OpenClaw's persona files: an `IDENTITY.md` record and a
 `SOUL.md` voice. A character becomes the agent's own identity instead of a
@@ -258,15 +258,42 @@ book-title marks (《》), from the model and from the CLI alike.
 ```
 
 It is stored in `soul.sqlite` and shared by every session, the Web UI, QQ
-and email. The first one is saved without asking; later changes through the
-`identity_set` tool follow `tools.identity` (`ask` by default, so QQ and email
-users cannot change it). From the shell:
+and email.
+
+Approval is enforced by the program, not by the model's instructions. The
+`identity_set` tool only records an immutable draft (`Uninitialized → Draft →
+Awaiting approval → Active`), for the first identity and for every later
+change alike:
+
+- In the terminal and the Web UI, the exact stored draft is put to you at
+  once as an approval prompt; yes saves it, no rejects it.
+- On QQ and email, the reply ends with the exact draft as stored, its number
+  and a short code, appended by the Gateway rather than written by the model.
+  Reply `/identity approve <n> <code>` to save it or `/identity reject <n>`.
+  These commands are handled before any model sees the message, and are only
+  accepted from senders with the `identity` capability (the owner, see
+  [Access](#access)); guests cannot propose or approve identities at all.
+- A newer draft supersedes older open ones, and each draft can be decided only
+  once, so an approval always refers to exactly one version: approving a
+  superseded, rejected or already applied draft, or giving the code of a
+  different version, is refused. Drafts survive restarts.
+- `tools.identity = "deny"` removes the tool; `"ask"` and `"allow"` both
+  require approval.
+- Senders who cannot set an identity are not asked to choose one; until one
+  exists they get a plain assistant.
+
+From the shell (as the owner):
 
 ```sh
 openclaw-rs identity                       # print as IDENTITY.md and SOUL.md
+openclaw-rs identity drafts                # the draft waiting for approval, from any channel
+openclaw-rs identity approve 3 a1b2c3      # or: identity reject 3
 openclaw-rs identity set --name 悟空 --creature 石猴 --vibe "顽皮直率" --emoji 🐒 --soul-file SOUL.md
 openclaw-rs identity reset                 # the next conversation sets it up again
 ```
+
+`/identity`, `/identity approve …` and `/identity reject …` also work typed
+into `chat` and the Web UI.
 
 ## Web search
 
@@ -345,7 +372,7 @@ history_limit = 200  # recent messages sent to the model
 # workspace = "/path"   # default: <state dir>/workspace
 shell = "ask"           # allow | ask | deny
 write = "ask"           # write_file and edit_file; reads are always allowed
-identity = "ask"        # identity_set after the first identity exists
+identity = "ask"        # identity_set: deny removes it; drafts always need approval
 shell_timeout_secs = 120
 max_output_bytes = 16384  # per stream; also the most shell output held in memory
 ```

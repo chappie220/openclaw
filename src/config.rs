@@ -218,7 +218,8 @@ pub struct ToolsConfig {
     pub shell: Permission,
     /// Covers write_file and edit_file; reads are always allowed.
     pub write: Permission,
-    /// Changing the agent's identity; the first one is always saved without asking.
+    /// `deny` removes `identity_set`; otherwise every draft, including the
+    /// first, is saved only after a person approves it.
     pub identity: Permission,
     pub shell_timeout_secs: u64,
     /// Per-stream cap on tool output returned to the model, and on shell output
