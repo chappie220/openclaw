@@ -16,6 +16,7 @@ mod search;
 mod service;
 mod store;
 mod tools;
+mod usage;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,12 @@ enum Command {
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
+    },
+    /// Tokens and cost of model calls, per session.
+    Usage {
+        /// How many days back to count.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
     },
     /// List or delete sessions.
     Sessions {
@@ -298,6 +305,11 @@ async fn run(cli: Cli) -> Result<()> {
             gateway::serve(gateway, &bind).await
         }
         Command::Sessions { action } => sessions(&store, action.unwrap_or(SessionsAction::List)),
+        Command::Usage { days } => {
+            let since = store::now() - i64::from(days) * 86_400;
+            print!("{}", usage::report(&store.usage_since(since)?));
+            Ok(())
+        }
         Command::Ask { session, message } => {
             let message = message.join(" ");
             if message.trim().is_empty() {

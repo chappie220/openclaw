@@ -189,6 +189,25 @@ pub struct ModelConfig {
     /// Prefer `OPENROUTER_API_KEY`; a key here is stored in plain text.
     pub api_key: Option<String>,
     pub request_timeout_secs: u64,
+    /// Models OpenRouter tries, in order, when `model` fails (OpenRouter's
+    /// `models` parameter; other servers ignore it).
+    pub fallbacks: Vec<String>,
+    /// Retries of a failed request (connection errors, HTTP 408/429/5xx, a
+    /// stream that fails before any text), with exponential backoff.
+    pub max_retries: u32,
+    pub prompt_cache: PromptCache,
+}
+
+/// Whether to mark `cache_control` breakpoints for prompt caching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCache {
+    /// For `anthropic/` and `google/` models, which cache only at breakpoints;
+    /// others (OpenAI, DeepSeek, …) cache on their own.
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +330,9 @@ impl Default for ModelConfig {
             model: DEFAULT_MODEL.into(),
             api_key: None,
             request_timeout_secs: 300,
+            fallbacks: Vec::new(),
+            max_retries: 3,
+            prompt_cache: PromptCache::Auto,
         }
     }
 }

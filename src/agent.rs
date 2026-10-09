@@ -8,6 +8,7 @@ use crate::context;
 use crate::identity;
 use crate::llm::{ChatMessage, Client, Completion, ToolCall, ToolSpec};
 use crate::store::Store;
+use crate::usage::{MAX_RATIO, MIN_RATIO};
 
 tokio::task_local! {
     static CURRENT_SESSION: String;
@@ -97,7 +98,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
             if !access::current().is_some_and(|a| a.owner) {
                 return Ok("Only the owner can compact this conversation.".into());
             }
-            return self.compact(session_id).await;
+            return self.compact(session, session_id).await;
         }
         self.store.append(session_id, &ChatMessage::user(input))?;
         let specs = self.tools.specs();
@@ -109,13 +110,25 @@ impl<M: Model, T: Tools> Agent<M, T> {
             let system =
                 identity::system_prompt(&self.config.system_prompt, identity.as_ref(), can_set);
             let mut messages = vec![ChatMessage::system(&system)];
-            messages.extend(self.window(session_id, &system, &tool_json).await?);
+            messages.extend(
+                self.window(session, session_id, &system, &tool_json)
+                    .await?,
+            );
+            let estimated = context::estimate_messages(&messages) + context::estimate(&tool_json);
             let completion = self
                 .model
                 .complete(&messages, &specs, &mut |text| {
                     on_event(AgentEvent::Text(text.to_owned()))
                 })
                 .await?;
+            self.record(session, "turn", &completion);
+            if let Some(usage) = completion.usage
+                && let Err(err) =
+                    self.store
+                        .update_token_ratio(session_id, estimated, usage.prompt_tokens)
+            {
+                eprintln!("usage: cannot update the token estimate: {err:#}");
+            }
             if completion.tool_calls.is_empty() {
                 self.store
                     .append(session_id, &ChatMessage::assistant(&completion.text))?;
@@ -146,13 +159,26 @@ impl<M: Model, T: Tools> Agent<M, T> {
         )
     }
 
+    /// Saves what a call cost; accounting never fails a turn.
+    fn record(&self, session: &str, kind: &str, completion: &Completion) {
+        let Some(usage) = &completion.usage else {
+            return;
+        };
+        if let Err(err) = self
+            .store
+            .record_usage(session, kind, completion.model.as_deref(), usage)
+        {
+            eprintln!("usage: cannot record a model call: {err:#}");
+        }
+    }
+
     fn summarizer(&self) -> &M {
         self.summarizer.as_ref().unwrap_or(&self.model)
     }
 
     /// Folds every message still in the window into the summary, so the
     /// next turn starts with just the summary. Answers `/compact`.
-    async fn compact(&self, session_id: i64) -> Result<String> {
+    async fn compact(&self, session: &str, session_id: i64) -> Result<String> {
         let ctx = self.store.context(session_id)?;
         let Some(&(last, _)) = ctx.messages.last() else {
             return Ok("Nothing to compact yet.".into());
@@ -166,6 +192,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
             &messages,
             budget,
             budget / 16,
+            &mut |c| self.record(session, "summary", c),
         )
         .await?;
         let marks = context::Marks {
@@ -183,14 +210,18 @@ impl<M: Model, T: Tools> Agent<M, T> {
     /// Turns that no longer fit are folded into the session's summary first;
     /// if that fails they are left out of this call only and the next call
     /// tries again, so nothing is dropped without a summary.
+    /// The budget is scaled by how far our estimates have been from the
+    /// provider's counts for this session.
     async fn window(
         &self,
+        session: &str,
         session_id: i64,
         system: &str,
         tool_json: &str,
     ) -> Result<Vec<ChatMessage>> {
-        let budget = self.config.context_tokens;
         let ctx = self.store.context(session_id)?;
+        let ratio = ctx.token_ratio.unwrap_or(1.0).clamp(MIN_RATIO, MAX_RATIO);
+        let budget = (self.config.context_tokens as f64 / ratio) as usize;
         let summary_limit = budget / 16;
         let summary_tokens = ctx.summary.as_deref().map_or(0, context::estimate);
         let overhead = context::estimate(system)
@@ -206,6 +237,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
                 &fitted.dropped,
                 budget,
                 summary_limit,
+                &mut |c| self.record(session, "summary", c),
             )
             .await
             {
@@ -480,6 +512,43 @@ mod tests {
         let ctx = agent.store.context(id).unwrap();
         assert_eq!(ctx.summary, None);
         assert_eq!(ctx.marks, context::Marks::default());
+    }
+
+    #[tokio::test]
+    async fn records_usage_and_calibrates_the_estimate() {
+        let usage = crate::llm::Usage {
+            prompt_tokens: 5000,
+            cached_tokens: 4000,
+            completion_tokens: 20,
+            cost: 0.003,
+            ..Default::default()
+        };
+        let agent = Agent {
+            model: Scripted(Mutex::new(vec![Completion {
+                text: "done".into(),
+                usage: Some(usage),
+                model: Some("x/served".into()),
+                ..Default::default()
+            }])),
+            summarizer: None,
+            tools: Echo,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig::default(),
+        };
+        agent
+            .run_turn(Actor::owner(access::CLI), "s", "go", &mut |_| {})
+            .await
+            .unwrap();
+        let rows = agent.store.usage_since(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session, "s");
+        assert_eq!(rows[0].usage, usage);
+        let id = agent.store.session_id("s").unwrap();
+        let ratio = agent.store.context(id).unwrap().token_ratio.unwrap();
+        assert!(
+            ratio > 1.0,
+            "the provider counted more than we estimated: {ratio}"
+        );
     }
 
     #[tokio::test]

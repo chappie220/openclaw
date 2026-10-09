@@ -121,6 +121,11 @@ ALTER TABLE sessions ADD COLUMN context_pruned_before INTEGER NOT NULL DEFAULT 0
 -- Running summary of the messages before context_start.
 ALTER TABLE sessions ADD COLUMN context_summary TEXT;
 "#,
+        r#"
+-- Provider-reported prompt tokens over our estimate for the same request,
+-- smoothed; scales the context budget. NULL until a call reports usage.
+ALTER TABLE sessions ADD COLUMN token_ratio REAL;
+"#,
     ],
     legacy: &[
         ("sessions", "id, name, created_at, updated_at"),
@@ -183,6 +188,23 @@ CREATE INDEX mail_inbox_due ON mail_inbox(state, next_attempt);
 -- The actor that scheduled each job; a job runs with their permissions.
 ALTER TABLE jobs ADD COLUMN created_by TEXT;
 "#,
+        r#"
+-- Every model call's provider-reported usage; kept when a session is deleted.
+CREATE TABLE usage (
+  id INTEGER PRIMARY KEY,
+  session TEXT NOT NULL,
+  -- turn or summary
+  kind TEXT NOT NULL,
+  model TEXT,
+  prompt_tokens INTEGER NOT NULL,
+  cached_tokens INTEGER NOT NULL,
+  cache_write_tokens INTEGER NOT NULL,
+  completion_tokens INTEGER NOT NULL,
+  cost REAL NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX usage_by_time ON usage(created_at);
+"#,
     ],
     legacy: &[
         (
@@ -221,6 +243,8 @@ pub struct SessionContext {
     pub messages: Vec<(i64, ChatMessage)>,
     pub marks: Marks,
     pub summary: Option<String>,
+    /// See `Store::set_token_ratio`.
+    pub token_ratio: Option<f64>,
 }
 
 pub(crate) fn now() -> i64 {
@@ -733,9 +757,9 @@ impl Store {
     /// and every message from the window start on, with ids.
     pub fn context(&self, session_id: i64) -> Result<SessionContext> {
         let conn = self.chats();
-        let (marks, summary) = conn.query_row(
-            "SELECT context_start, context_pruned_before, context_summary FROM sessions
-             WHERE id = ?1",
+        let (marks, summary, token_ratio) = conn.query_row(
+            "SELECT context_start, context_pruned_before, context_summary, token_ratio
+             FROM sessions WHERE id = ?1",
             [session_id],
             |row| {
                 Ok((
@@ -744,6 +768,7 @@ impl Store {
                         pruned_before: row.get(1)?,
                     },
                     row.get(2)?,
+                    row.get(3)?,
                 ))
             },
         )?;
@@ -756,6 +781,7 @@ impl Store {
             messages,
             marks,
             summary,
+            token_ratio,
         })
     }
 

@@ -362,6 +362,9 @@ and nothing is touched.
 model = "openrouter/auto"            # any OpenRouter model id
 base_url = "https://openrouter.ai/api/v1"
 request_timeout_secs = 300
+# fallbacks = ["openai/gpt-x"]       # OpenRouter tries these when `model` fails
+max_retries = 3                      # connection errors, HTTP 408/429/5xx, early stream errors
+prompt_cache = "auto"                # auto | on | off: cache_control breakpoints
 
 [agent]
 system_prompt = "You are a helpful personal assistant running on OpenClaw."
@@ -383,7 +386,9 @@ turn that made them; later turns see just the user's messages and the
 assistant's replies. When a conversation outgrows `context_tokens`, it is cut
 back to half the budget: the oldest turns, tool output included, are folded
 by the model into a running summary sent at the start of the window.
-The full history stays in `chats.sqlite`. If the summary call fails, nothing
+The full history stays in `chats.sqlite`.
+The budget is corrected per session by how far the token estimate has been
+from the provider's own counts. If the summary call fails, nothing
 is moved and the next call tries again. The owner can send `/compact` in any
 chat (CLI, Web UI, QQ, email) to fold the whole conversation into the summary
 now; the command itself never reaches the model.
@@ -396,6 +401,25 @@ drained while the command runs and only their first and last
 the result says how many bytes were omitted. `ask` prompts on the controlling terminal; with no terminal
 the action is declined and the model is told so. Tools set to `deny` are not
 offered to the model at all.
+
+## Reliability, caching and cost
+
+A failed model request is retried with exponential backoff (honouring
+`Retry-After`, at most 30 s apart) on connection errors, HTTP 408, 429 and
+5xx, and on a stream that fails before any text reached the user; a stream
+that fails after text was shown is not repeated. `fallbacks` is sent as
+OpenRouter's `models` list, so OpenRouter switches models itself.
+
+OpenAI and DeepSeek models cache repeated prompt prefixes on their own;
+Anthropic and Google models only cache at `cache_control` breakpoints, which
+`prompt_cache = "auto"` adds for `anthropic/` and `google/` models (use `on`
+for `openrouter/auto` if it routes to them). Every call's provider-reported
+tokens, cached tokens and cost are kept in `runtime.sqlite`:
+
+```sh
+openclaw-rs usage            # last 30 days, per session
+openclaw-rs usage --days 1
+```
 
 ## Command auto-review
 
