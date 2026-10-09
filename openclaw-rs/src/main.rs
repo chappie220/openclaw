@@ -3,6 +3,7 @@
 mod agent;
 mod config;
 mod llm;
+mod memory;
 mod store;
 mod tools;
 
@@ -42,11 +43,35 @@ enum Command {
         session: String,
         message: Vec<String>,
     },
+    /// Manage long-term memory.
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
     /// List or delete sessions.
     Sessions {
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
+}
+
+#[derive(Subcommand)]
+enum MemoryAction {
+    /// Save a fact.
+    Add { content: Vec<String> },
+    /// Search saved facts.
+    Search {
+        query: Vec<String>,
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Show the newest facts.
+    List {
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Delete a fact by id.
+    Delete { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -69,6 +94,7 @@ async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(&config_path)?;
     let store = Store::open(&state.join("state.sqlite"))?;
     match cli.command {
+        Command::Memory { action } => memory(&store, action),
         Command::Sessions { action } => sessions(&store, action.unwrap_or(SessionsAction::List)),
         Command::Ask { session, message } => {
             let message = message.join(" ");
@@ -112,7 +138,12 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         .unwrap_or_else(|| state.join("workspace"));
     Ok(Agent {
         model: llm::Client::new(&config.model, config.api_key()?)?,
-        tools: BuiltinTools::new(workspace, config.tools.clone(), Arc::new(TerminalApprover))?,
+        tools: BuiltinTools::new(
+            workspace,
+            config.tools.clone(),
+            Arc::new(TerminalApprover),
+            store.clone(),
+        )?,
         store,
         config: config.agent.clone(),
     })
@@ -133,6 +164,30 @@ async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
         })
         .await?;
     println!();
+    Ok(())
+}
+
+fn memory(store: &Store, action: MemoryAction) -> Result<()> {
+    let print = |memories: Vec<memory::Memory>| {
+        for m in memories {
+            println!("#{}\t{}", m.id, m.content);
+        }
+    };
+    match action {
+        MemoryAction::Add { content } => {
+            println!("saved #{}", store.memory_save(&content.join(" "))?)
+        }
+        MemoryAction::Search { query, limit } => {
+            print(store.memory_search(&query.join(" "), limit)?)
+        }
+        MemoryAction::List { limit } => print(store.memory_list(limit)?),
+        MemoryAction::Delete { id } => {
+            if !store.memory_delete(id)? {
+                bail!("no memory #{id}");
+            }
+            println!("deleted #{id}");
+        }
+    }
     Ok(())
 }
 

@@ -10,7 +10,8 @@ use rusqlite::{Connection, params};
 use crate::llm::{ChatMessage, Role, ToolCall};
 
 /// Ordered schema steps; `PRAGMA user_version` records how many have run.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE sessions (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -27,7 +28,25 @@ CREATE TABLE messages (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX messages_by_session ON messages(session_id, id);
-"#];
+"#,
+    r#"
+CREATE TABLE memories (
+  id INTEGER PRIMARY KEY,
+  content TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- Trigram tokens let CJK text, which has no word separators, match by substring.
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+  content, content='memories', content_rowid='id', tokenize='trigram'
+);
+CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, content) VALUES ('delete', old.id, old.content);
+END;
+"#,
+];
 
 #[derive(Clone)]
 pub struct Store {
@@ -41,7 +60,7 @@ pub struct SessionSummary {
     pub updated_at: i64,
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -87,7 +106,7 @@ impl Store {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A panic while holding the lock leaves SQLite itself consistent; keep serving.
         self.conn
             .lock()

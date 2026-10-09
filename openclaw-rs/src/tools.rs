@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 use crate::agent::Tools;
 use crate::config::{Permission, ToolsConfig};
 use crate::llm::{ToolCall, ToolSpec};
+use crate::store::Store;
 
 /// Asks a person whether a gated action may run. Front ends supply their own.
 #[async_trait]
@@ -58,6 +59,7 @@ pub struct BuiltinTools {
     workspace: PathBuf,
     config: ToolsConfig,
     approver: Arc<dyn Approver>,
+    store: Store,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +90,23 @@ struct EditArgs {
 }
 
 #[derive(Deserialize)]
+struct MemorySaveArgs {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct MemorySearchArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct MemoryDeleteArgs {
+    id: i64,
+}
+
+#[derive(Deserialize)]
 struct ListArgs {
     #[serde(default)]
     path: Option<String>,
@@ -98,13 +117,47 @@ impl BuiltinTools {
         workspace: PathBuf,
         config: ToolsConfig,
         approver: Arc<dyn Approver>,
+        store: Store,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&workspace)?;
         Ok(Self {
             workspace,
             config,
             approver,
+            store,
         })
+    }
+
+    fn memory_save(&self, args: MemorySaveArgs) -> Result<String, String> {
+        let id = self
+            .store
+            .memory_save(&args.content)
+            .map_err(|e| format!("error: {e:#}"))?;
+        Ok(format!("saved memory #{id}"))
+    }
+
+    fn memory_search(&self, args: MemorySearchArgs) -> Result<String, String> {
+        let limit = args.limit.unwrap_or(10).clamp(1, 50);
+        let hits = self
+            .store
+            .memory_search(&args.query, limit)
+            .map_err(|e| format!("error: {e:#}"))?;
+        if hits.is_empty() {
+            return Ok("no matching memories".into());
+        }
+        Ok(hits
+            .iter()
+            .map(|m| format!("#{} {}", m.id, m.content))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn memory_delete(&self, args: MemoryDeleteArgs) -> Result<String, String> {
+        match self.store.memory_delete(args.id) {
+            Ok(true) => Ok(format!("deleted memory #{}", args.id)),
+            Ok(false) => Err(format!("error: no memory #{}", args.id)),
+            Err(e) => Err(format!("error: {e:#}")),
+        }
     }
 
     fn resolve(&self, path: &str) -> PathBuf {
@@ -330,6 +383,23 @@ impl Tools for BuiltinTools {
                 json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             ),
         ];
+        specs.push(ToolSpec::function(
+            "memory_save",
+            "Save a durable fact for future conversations (preferences, names, decisions). One fact per call, under 2000 characters.",
+            json!({"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}),
+        ));
+        specs.push(ToolSpec::function(
+            "memory_search",
+            "Search saved memories. Space-separated terms match any; terms of 3+ characters are matched as substrings, including Chinese.",
+            json!({"type": "object", "properties": {
+                "query": {"type": "string"}, "limit": {"type": "integer", "description": "Default 10, max 50"}
+            }, "required": ["query"]}),
+        ));
+        specs.push(ToolSpec::function(
+            "memory_delete",
+            "Delete a saved memory by its #id when it is wrong or outdated.",
+            json!({"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}),
+        ));
         if self.config.write != Permission::Deny {
             specs.push(ToolSpec::function(
                 "write_file",
@@ -381,6 +451,9 @@ impl Tools for BuiltinTools {
                 Ok(args) => self.list_dir(args).await,
                 Err(e) => Err(e),
             },
+            "memory_save" => parse(call).and_then(|args| self.memory_save(args)),
+            "memory_search" => parse(call).and_then(|args| self.memory_search(args)),
+            "memory_delete" => parse(call).and_then(|args| self.memory_delete(args)),
             other => Err(format!("error: unknown tool {other}")),
         };
         result.unwrap_or_else(|err| err)
@@ -413,7 +486,13 @@ mod tests {
     }
 
     fn tools(dir: &Path, config: ToolsConfig, approve: bool) -> BuiltinTools {
-        BuiltinTools::new(dir.to_owned(), config, Arc::new(Answer(approve))).unwrap()
+        BuiltinTools::new(
+            dir.to_owned(),
+            config,
+            Arc::new(Answer(approve)),
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -497,6 +576,29 @@ mod tests {
             .call(&call("shell", json!({"command": "sleep 30 & sleep 30"})))
             .await;
         assert!(out.contains("timed out"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn memory_tools_save_search_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = tools(dir.path(), ToolsConfig::default(), false);
+        let saved = t
+            .call(&call("memory_save", json!({"content": "生日是三月五日"})))
+            .await;
+        assert_eq!(saved, "saved memory #1");
+        let found = t
+            .call(&call("memory_search", json!({"query": "三月五日"})))
+            .await;
+        assert_eq!(found, "#1 生日是三月五日");
+        assert_eq!(
+            t.call(&call("memory_delete", json!({"id": 1}))).await,
+            "deleted memory #1"
+        );
+        assert!(
+            t.call(&call("memory_delete", json!({"id": 1})))
+                .await
+                .contains("no memory")
+        );
     }
 
     #[test]

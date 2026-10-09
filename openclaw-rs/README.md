@@ -10,10 +10,10 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Sessions + history in SQLite | phase 1 ✅ |
 | CLI (`chat`, `ask`, `sessions`) | phase 1 ✅ |
 | Tools: shell and files, with approval | phase 2 ✅ |
-| Long-term memory search (SQLite FTS5) | phase 3 |
+| Long-term memory search (SQLite FTS5) | phase 3 ✅ |
 | Gateway HTTP/WebSocket + Web UI | phase 4 |
 | Scheduled tasks / heartbeat, OpenRC service | phase 5 |
-| QQ channel | phase 6 |
+| QQ channel (official QQ Bot API) | phase 6 |
 
 ## Usage
 
@@ -23,12 +23,19 @@ cargo build --release
 ./target/release/openclaw-rs ask "hello"
 ./target/release/openclaw-rs chat --session work
 ./target/release/openclaw-rs sessions
+./target/release/openclaw-rs memory add "Prefers answers in Chinese"
+./target/release/openclaw-rs memory search chinese
 ```
+
+Long-term memory is a SQLite FTS5 index with the trigram tokenizer, so Chinese
+text matches by substring without word segmentation. Space-separated terms
+match any; terms shorter than three characters fall back to `LIKE`. The model
+gets `memory_save`, `memory_search` and `memory_delete` tools.
 
 State lives in `~/.openclaw-rs` (override with `OPENCLAW_RS_HOME`):
 
 - `config.toml`: optional settings
-- `state.sqlite`: sessions and messages
+- `state.sqlite`: sessions, messages and memories
 
 ```toml
 [model]
