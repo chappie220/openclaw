@@ -303,7 +303,8 @@ impl MailBot {
         subject: &str,
         text: &str,
         thread: Option<&Incoming>,
-    ) -> Result<()> {
+        message_id: Option<&str>,
+    ) -> Result<(), SendError> {
         let mut builder = Email::builder()
             .from(
                 self.from
@@ -315,18 +316,37 @@ impl MailBot {
                 .with_context(|| format!("invalid recipient {to:?}"))?)
             .subject(subject)
             .header(ContentType::TEXT_PLAIN)
-            .header(AutoSubmitted);
+            .header(AutoSubmitted)
+            .message_id(message_id.map(str::to_owned));
         if let Some(thread) = thread.filter(|t| !t.message_id.is_empty()) {
             builder = builder
                 .in_reply_to(thread.message_id.clone())
                 .references(thread.references.join(" "));
         }
-        let email = builder.body(text.to_owned())?;
-        self.smtp.send(email).await.context("SMTP send failed")?;
+        let email = builder
+            .body(text.to_owned())
+            .map_err(|e| SendError::Permanent(e.into()))?;
+        self.smtp.send(email).await.map_err(|err| {
+            // A 5xx means the server refused it for good; anything else may pass later.
+            let permanent = err.is_permanent();
+            let err = anyhow::Error::from(err).context("SMTP send failed");
+            if permanent {
+                SendError::Permanent(err)
+            } else {
+                SendError::Retry(err)
+            }
+        })?;
         Ok(())
     }
 
-    pub async fn reply(&self, incoming: &Incoming, text: &str) -> Result<()> {
+    /// Sends the reply under the stable `message_id` recorded before the attempt,
+    /// so a resend after a failure is recognizably the same email.
+    pub async fn reply(
+        &self,
+        incoming: &Incoming,
+        text: &str,
+        message_id: &str,
+    ) -> Result<(), SendError> {
         let subject = if incoming.subject.is_empty() {
             "Re: OpenClaw".to_owned()
         } else if incoming.subject.to_lowercase().starts_with("re:") {
@@ -335,8 +355,14 @@ impl MailBot {
             format!("Re: {}", incoming.subject)
         };
         // Replies go to From, never Reply-To: the allow-list checked From.
-        self.send(&incoming.sender, &subject, text, Some(incoming))
-            .await
+        self.send(
+            &incoming.sender,
+            &subject,
+            text,
+            Some(incoming),
+            Some(message_id),
+        )
+        .await
     }
 
     async fn imap_session(&self) -> Result<async_imap::Session<MailStream>> {
@@ -413,35 +439,116 @@ impl MailBot {
         ]
     }
 
-    /// Fetches unseen mail, marking each message seen before it is handled.
-    async fn poll(&self) -> Result<Vec<Vec<u8>>> {
+    /// Records unseen mail in the inbox, then marks it seen. `\\Seen` only
+    /// means "safely queued": a crash before the flag is set refetches the
+    /// message, and its key makes the second copy a no-op.
+    async fn poll(&self, store: &Store) -> Result<usize> {
         let mut session = self.imap_session().await?;
-        session
+        let mailbox = session
             .select(&self.config.mailbox)
             .await
             .with_context(|| format!("cannot open {}", self.config.mailbox))?;
         let mut uids: Vec<u32> = session.uid_search("UNSEEN").await?.into_iter().collect();
         uids.sort_unstable();
         uids.truncate(MAX_PER_POLL);
-        let mut raw = Vec::new();
+        let mut queued = 0;
         for uid in uids {
             let fetched: Vec<_> = session
                 .uid_fetch(uid.to_string(), "BODY.PEEK[]")
                 .await?
                 .try_collect()
                 .await?;
+            let Some(raw) = fetched.first().and_then(|f| f.body()) else {
+                continue;
+            };
+            let source = Source {
+                mailbox: &self.config.mailbox,
+                uid_validity: mailbox.uid_validity,
+                uid,
+            };
+            if self.ingest(store, &source, raw)? {
+                queued += 1;
+            }
             let _: Vec<_> = session
                 .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
                 .await?
                 .try_collect()
                 .await?;
-            if let Some(body) = fetched.first().and_then(|f| f.body()) {
-                raw.push(body.to_vec());
-            }
         }
         let _ = session.logout().await;
-        Ok(raw)
+        Ok(queued)
     }
+
+    /// Queues one fetched message; false when it is skipped or already known.
+    fn ingest(&self, store: &Store, source: &Source<'_>, raw: &[u8]) -> Result<bool> {
+        let key = message_key(raw).unwrap_or_else(|| {
+            format!(
+                "uid:{}:{}:{}",
+                source.mailbox,
+                source.uid_validity.unwrap_or(0),
+                source.uid
+            )
+        });
+        if store.mail_handled(&key)? {
+            return Ok(false);
+        }
+        let (sender, raw, state) = match self.classify(raw) {
+            Ok(incoming) => (Some(incoming.sender), Some(raw), "pending"),
+            Err(Skip::NotAllowed(sender)) => {
+                eprintln!("mail: ignored message from {sender} (not in mail.allow)");
+                (Some(sender), None, "skipped")
+            }
+            Err(reason) => {
+                eprintln!("mail: skipped message ({reason:?})");
+                (None, None, "skipped")
+            }
+        };
+        let queued = store.mail_queue(&key, source, sender.as_deref(), raw, state)?;
+        if queued && state == "pending" {
+            eprintln!("mail: queued {key} from {}", sender.unwrap_or_default());
+        }
+        Ok(queued && state == "pending")
+    }
+}
+
+/// Why an SMTP attempt failed, which decides whether it is retried.
+#[derive(Debug)]
+pub enum SendError {
+    /// The server refused the message for good, or it could not be built.
+    Permanent(anyhow::Error),
+    /// The server deferred it or the connection failed; the same email may be resent.
+    Retry(anyhow::Error),
+}
+
+/// A message that cannot be built will never send.
+impl From<anyhow::Error> for SendError {
+    fn from(err: anyhow::Error) -> Self {
+        SendError::Permanent(err)
+    }
+}
+
+impl SendError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            SendError::Permanent(err) | SendError::Retry(err) => err,
+        }
+    }
+}
+
+/// Where a message was fetched from.
+pub struct Source<'a> {
+    pub mailbox: &'a str,
+    pub uid_validity: Option<u32>,
+    pub uid: u32,
+}
+
+/// The Message-ID, which identifies duplicate deliveries across mailboxes and UIDs.
+fn message_key(raw: &[u8]) -> Option<String> {
+    MessageParser::default()
+        .parse(raw)?
+        .message_id()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| format!("<{id}>"))
 }
 
 /// Removes quoted history so the model sees only what the sender wrote.
@@ -466,16 +573,216 @@ pub fn strip_quoted(body: &str) -> String {
     kept.join("\n").trim().to_owned()
 }
 
+/// A queued email claimed for its next step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboxItem {
+    pub id: i64,
+    pub key: String,
+    /// `processing` to run the turn, `sending` to deliver the stored reply.
+    pub state: String,
+    pub attempts: i64,
+    pub interrupted: bool,
+    pub raw: Option<Vec<u8>>,
+    pub reply: Option<String>,
+    pub reply_message_id: Option<String>,
+}
+
+/// `(state, messages)` for each state in use.
+pub type StateCounts = Vec<(String, i64)>;
+
+/// One row of `mail queue`.
+#[derive(Debug, Clone)]
+pub struct InboxEntry {
+    pub id: i64,
+    pub key: String,
+    pub sender: Option<String>,
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub updated_at: i64,
+}
+
+/// Turns tried before the error itself is sent as the reply.
+const MAX_TURN_ATTEMPTS: i64 = 3;
+/// SMTP attempts before a reply is given up on.
+const MAX_SEND_ATTEMPTS: i64 = 6;
+
+/// Exponential backoff from one minute, capped at an hour.
+fn backoff(attempts: i64) -> i64 {
+    60 * (1i64 << attempts.clamp(0, 6)).min(60)
+}
+
 impl Store {
-    /// Records a Message-ID; false when it was already handled (duplicate delivery).
-    pub fn mail_first_sight(&self, message_id: &str) -> Result<bool> {
-        if message_id.is_empty() {
-            return Ok(true);
-        }
+    /// Whether this message was queued or handled before, including mail
+    /// handled before the inbox existed.
+    pub fn mail_handled(&self, key: &str) -> Result<bool> {
+        Ok(self.runtime().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_inbox WHERE key = ?1)
+                 OR EXISTS(SELECT 1 FROM mail_seen WHERE message_id = ?1)",
+            [key],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Records a fetched message; false when its key is already known.
+    pub fn mail_queue(
+        &self,
+        key: &str,
+        source: &Source<'_>,
+        sender: Option<&str>,
+        raw: Option<&[u8]>,
+        state: &str,
+    ) -> Result<bool> {
+        let ts = now();
         Ok(self.runtime().execute(
-            "INSERT INTO mail_seen(message_id, seen_at) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
-            params![message_id, now()],
+            "INSERT INTO mail_inbox(key, mailbox, uid_validity, uid, sender, raw, state,
+                                    next_attempt, received_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8) ON CONFLICT(key) DO NOTHING",
+            params![
+                key,
+                source.mailbox,
+                source.uid_validity,
+                source.uid,
+                sender,
+                raw,
+                state,
+                ts
+            ],
         )? > 0)
+    }
+
+    /// Run at startup, when nothing is in flight: an interrupted turn runs
+    /// again with a warning, and an interrupted send is left for the operator
+    /// because the server may already have accepted it.
+    pub fn mail_recover(&self) -> Result<(usize, usize)> {
+        let conn = self.runtime();
+        let ts = now();
+        let turns = conn.execute(
+            "UPDATE mail_inbox SET state = 'pending', interrupted = 1, next_attempt = ?1,
+                    updated_at = ?1, last_error = 'interrupted while the turn was running'
+             WHERE state = 'processing'",
+            [ts],
+        )?;
+        let sends = conn.execute(
+            "UPDATE mail_inbox SET state = 'uncertain', updated_at = ?1,
+                    last_error = 'interrupted during SMTP; the reply may or may not have been delivered'
+             WHERE state = 'sending'",
+            [ts],
+        )?;
+        Ok((turns, sends))
+    }
+
+    /// Claims due work: pending turns become `processing`, prepared replies `sending`.
+    pub fn mail_claim(&self, now: i64, limit: usize) -> Result<Vec<InboxItem>> {
+        let conn = self.runtime();
+        let mut stmt = conn.prepare(
+            "UPDATE mail_inbox
+             SET state = CASE state WHEN 'pending' THEN 'processing' ELSE 'sending' END,
+                 attempts = attempts + 1, updated_at = ?1
+             WHERE id IN (SELECT id FROM mail_inbox
+                          WHERE state IN ('pending', 'reply_ready') AND next_attempt <= ?1
+                          ORDER BY id LIMIT ?2)
+             RETURNING id, key, state, attempts, interrupted, raw, reply, reply_message_id",
+        )?;
+        let rows = stmt.query_map(params![now, limit as i64], |row| {
+            Ok(InboxItem {
+                id: row.get(0)?,
+                key: row.get(1)?,
+                state: row.get(2)?,
+                attempts: row.get(3)?,
+                interrupted: row.get(4)?,
+                raw: row.get(5)?,
+                reply: row.get(6)?,
+                reply_message_id: row.get(7)?,
+            })
+        })?;
+        let mut items: Vec<InboxItem> = rows.collect::<rusqlite::Result<_>>()?;
+        items.sort_by_key(|item| item.id);
+        Ok(items)
+    }
+
+    /// Stores the reply and its Message-ID before any SMTP attempt, then
+    /// claims it for sending.
+    pub fn mail_reply_ready(&self, id: i64, reply: &str, message_id: &str) -> Result<()> {
+        self.runtime().execute(
+            "UPDATE mail_inbox SET state = 'sending', reply = ?2, reply_message_id = ?3,
+                    attempts = 1, last_error = NULL, updated_at = ?4
+             WHERE id = ?1 AND state = 'processing'",
+            params![id, reply, message_id, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn mail_sent(&self, id: i64) -> Result<()> {
+        self.mail_set(id, "sent", None, 0)
+    }
+
+    /// Puts a claimed item back to `pending` or `reply_ready` after `error`,
+    /// or marks it failed once its attempts run out.
+    pub fn mail_retry(&self, item: &InboxItem, error: &str) -> Result<&'static str> {
+        let (back, max) = if item.state == "processing" {
+            ("pending", MAX_TURN_ATTEMPTS)
+        } else {
+            ("reply_ready", MAX_SEND_ATTEMPTS)
+        };
+        let state = if item.attempts >= max { "failed" } else { back };
+        self.mail_set(item.id, state, Some(error), backoff(item.attempts))?;
+        Ok(state)
+    }
+
+    pub fn mail_fail(&self, id: i64, error: &str) -> Result<()> {
+        self.mail_set(id, "failed", Some(error), 0)
+    }
+
+    fn mail_set(&self, id: i64, state: &str, error: Option<&str>, delay: i64) -> Result<()> {
+        let ts = now();
+        self.runtime().execute(
+            "UPDATE mail_inbox SET state = ?2, last_error = COALESCE(?3, last_error),
+                    next_attempt = ?4, updated_at = ?5
+             WHERE id = ?1",
+            params![id, state, error, ts + delay, ts],
+        )?;
+        Ok(())
+    }
+
+    /// Queues a failed or uncertain item again: a stored reply is resent
+    /// under the same Message-ID, otherwise the turn runs again.
+    pub fn mail_requeue(&self, id: i64) -> Result<bool> {
+        Ok(self.runtime().execute(
+            "UPDATE mail_inbox
+             SET state = CASE WHEN reply IS NULL THEN 'pending' ELSE 'reply_ready' END,
+                 attempts = 0, next_attempt = ?2, updated_at = ?2
+             WHERE id = ?1 AND state IN ('failed', 'uncertain')",
+            params![id, now()],
+        )? > 0)
+    }
+
+    /// Counts by state, and the entries that need attention or are in flight.
+    pub fn mail_inbox(&self) -> Result<(StateCounts, Vec<InboxEntry>)> {
+        let conn = self.runtime();
+        let mut stmt =
+            conn.prepare("SELECT state, COUNT(*) FROM mail_inbox GROUP BY state ORDER BY state")?;
+        let counts = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, key, sender, state, attempts, last_error, updated_at FROM mail_inbox
+             WHERE state NOT IN ('sent', 'skipped') ORDER BY id",
+        )?;
+        let entries = stmt
+            .query_map([], |row| {
+                Ok(InboxEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    sender: row.get(2)?,
+                    state: row.get(3)?,
+                    attempts: row.get(4)?,
+                    last_error: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((counts, entries))
     }
 }
 
@@ -504,60 +811,142 @@ impl Notifier for MailBot {
         let to = session
             .strip_prefix(SESSION_PREFIX)
             .context("not a mail session")?;
-        self.send(to, "[OpenClaw] 定时消息", text, None).await
+        self.send(to, "[OpenClaw] 定时消息", text, None, None)
+            .await
+            .map_err(SendError::into_inner)
     }
 }
 
-/// Polls for the life of the process; each email becomes a turn in its sender's session.
+/// Polls for the life of the process; each email becomes a turn in its
+/// sender's session, driven through the inbox so every stage survives a restart.
 pub async fn run<M: Model + 'static, T: Tools + 'static>(
     bot: Arc<MailBot>,
     gateway: Arc<Gateway<M, T>>,
 ) {
+    match gateway.store().mail_recover() {
+        Ok((0, 0)) => {}
+        Ok((turns, sends)) => eprintln!(
+            "mail: resuming after a restart: {turns} interrupted turn(s) will run again, \
+             {sends} reply(s) may or may not have been sent (see `openclaw-rs mail queue`)"
+        ),
+        Err(err) => eprintln!("mail: cannot recover the inbox: {err:#}"),
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(bot.config.poll_secs.max(10)));
     loop {
         tick.tick().await;
-        let raw = match bot.poll().await {
-            Ok(raw) => raw,
+        if let Err(err) = bot.poll(gateway.store()).await {
+            eprintln!("mail: poll failed: {err:#}");
+        }
+        let items = match gateway.store().mail_claim(now(), MAX_PER_POLL) {
+            Ok(items) => items,
             Err(err) => {
-                eprintln!("mail: poll failed: {err:#}");
+                eprintln!("mail: cannot read the inbox: {err:#}");
                 continue;
             }
         };
-        for raw in raw {
-            let incoming = match bot.classify(&raw) {
-                Ok(incoming) => incoming,
-                Err(Skip::NotAllowed(sender)) => {
-                    eprintln!("mail: ignored message from {sender} (not in mail.allow)");
-                    continue;
-                }
-                Err(reason) => {
-                    eprintln!("mail: skipped message ({reason:?})");
-                    continue;
-                }
-            };
-            match gateway.store().mail_first_sight(&incoming.message_id) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(err) => {
-                    eprintln!("mail: cannot record {}: {err:#}", incoming.message_id);
-                    continue;
-                }
-            }
-            eprintln!("mail: message from {}", incoming.sender);
+        for item in items {
             let bot = bot.clone();
             let gateway = gateway.clone();
             tokio::spawn(async move {
-                let session = session_for(&incoming.sender);
-                let reply = match gateway.run_unattended(&session, &incoming.text).await {
-                    Ok(text) => text,
-                    Err(err) => format!("出错了：{err:#}"),
-                };
-                if let Err(err) = bot.reply(&incoming, &reply).await {
-                    eprintln!("mail: cannot reply to {}: {err:#}", incoming.sender);
+                if let Err(err) = advance(&bot, &gateway, item).await {
+                    eprintln!("mail: cannot update the inbox: {err:#}");
                 }
             });
         }
     }
+}
+
+/// Takes one claimed item through its next steps, recording each outcome.
+async fn advance<M: Model + 'static, T: Tools + 'static>(
+    bot: &MailBot,
+    gateway: &Gateway<M, T>,
+    mut item: InboxItem,
+) -> Result<()> {
+    let store = gateway.store();
+    let Some(incoming) = item.raw.as_deref().map(|raw| bot.classify(raw)) else {
+        store.mail_fail(item.id, "the message body was not kept")?;
+        return Ok(());
+    };
+    let incoming = match incoming {
+        Ok(incoming) => incoming,
+        Err(reason) => {
+            // mail.allow may have changed since the message was queued.
+            eprintln!("mail: {} is no longer answered ({reason:?})", item.key);
+            store.mail_set(item.id, "skipped", Some(&format!("{reason:?}")), 0)?;
+            return Ok(());
+        }
+    };
+    if item.state == "processing" {
+        let session = session_for(&incoming.sender);
+        let prompt = if item.interrupted {
+            format!(
+                "[An earlier attempt to answer this email was interrupted before a reply was \
+                 sent. Tool calls from that attempt may already have taken effect; check the \
+                 conversation above before repeating anything with side effects.]\n\n{}",
+                incoming.text
+            )
+        } else {
+            incoming.text.clone()
+        };
+        // `classify` checked the From address against mail.allow.
+        let actor = gateway.actor(&session, &session);
+        let reply = match gateway.run_unattended(actor, &session, &prompt).await {
+            Ok(text) => text,
+            Err(err) if item.attempts < MAX_TURN_ATTEMPTS => {
+                let state = store.mail_retry(&item, &format!("{err:#}"))?;
+                eprintln!(
+                    "mail: turn for {} failed (attempt {}), {state}: {err:#}",
+                    item.key, item.attempts
+                );
+                return Ok(());
+            }
+            // Out of attempts: tell the sender rather than leaving them waiting.
+            Err(err) => format!("出错了：{err:#}"),
+        };
+        let message_id = outgoing_message_id(&bot.from, item.id);
+        store.mail_reply_ready(item.id, &reply, &message_id)?;
+        item = InboxItem {
+            state: "sending".into(),
+            attempts: 1,
+            reply: Some(reply),
+            reply_message_id: Some(message_id),
+            ..item
+        };
+    }
+    let (Some(reply), Some(message_id)) = (&item.reply, &item.reply_message_id) else {
+        store.mail_fail(item.id, "no reply was stored")?;
+        return Ok(());
+    };
+    match bot.reply(&incoming, reply, message_id).await {
+        Ok(()) => {
+            store.mail_sent(item.id)?;
+            eprintln!("mail: replied to {} ({message_id})", incoming.sender);
+        }
+        Err(SendError::Permanent(err)) => {
+            store.mail_fail(item.id, &format!("{err:#}"))?;
+            eprintln!("mail: reply to {} refused: {err:#}", incoming.sender);
+        }
+        Err(SendError::Retry(err)) => {
+            let state = store.mail_retry(&item, &format!("{err:#}"))?;
+            eprintln!(
+                "mail: cannot reply to {} (attempt {}), {state}: {err:#}",
+                incoming.sender, item.attempts
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A Message-ID that stays the same for every attempt to send one reply.
+fn outgoing_message_id(from: &str, inbox_id: i64) -> String {
+    let domain = from
+        .rsplit_once('@')
+        .map_or("openclaw.local", |(_, d)| d.trim_end_matches('>'));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("<openclaw.{inbox_id}.{nanos:x}@{domain}>")
 }
 
 async fn tls_connect(
@@ -764,10 +1153,129 @@ Message-ID: <a1@example.org>\r\nReferences: <r0@example.org>\r\nContent-Type: te
         assert_eq!(strip_quoted("ok\n> quoted\nmore"), "ok\nmore");
     }
 
+    const SOURCE: Source<'static> = Source {
+        mailbox: "INBOX",
+        uid_validity: Some(7),
+        uid: 1,
+    };
+
+    fn raw(id: &str) -> Vec<u8> {
+        format!("From: me@example.org\r\nSubject: hi\r\nMessage-ID: {id}\r\n\r\nping\r\n")
+            .into_bytes()
+    }
+
     #[test]
-    fn remembers_handled_message_ids() {
+    fn duplicate_deliveries_queue_once() {
+        let bot = bot();
         let store = Store::open_in_memory().unwrap();
-        assert!(store.mail_first_sight("<a@b>").unwrap());
-        assert!(!store.mail_first_sight("<a@b>").unwrap());
+        assert!(bot.ingest(&store, &SOURCE, &raw("<a@b>")).unwrap());
+        // The same Message-ID under another UID, as a refetch after a crash.
+        let again = Source { uid: 2, ..SOURCE };
+        assert!(!bot.ingest(&store, &again, &raw("<a@b>")).unwrap());
+        // Mail handled before the inbox existed is not answered again.
+        store
+            .runtime()
+            .execute("INSERT INTO mail_seen VALUES ('<old@b>', 1)", [])
+            .unwrap();
+        assert!(!bot.ingest(&store, &SOURCE, &raw("<old@b>")).unwrap());
+        // Strangers are recorded as skipped, not queued.
+        let stranger = b"From: x@evil.com\r\nMessage-ID: <s@b>\r\n\r\nhi\r\n";
+        assert!(!bot.ingest(&store, &SOURCE, stranger).unwrap());
+        let (counts, _) = store.mail_inbox().unwrap();
+        assert_eq!(counts, vec![("pending".into(), 1), ("skipped".into(), 1)]);
+        // Only one claimer gets the item.
+        assert_eq!(store.mail_claim(now(), 10).unwrap().len(), 1);
+        assert!(store.mail_claim(now(), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_stage_survives_a_restart() {
+        let bot = bot();
+        let store = Store::open_in_memory().unwrap();
+        let state = |id: i64| -> String {
+            store
+                .runtime()
+                .query_row("SELECT state FROM mail_inbox WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        bot.ingest(&store, &SOURCE, &raw("<a@b>")).unwrap();
+        bot.ingest(&store, &Source { uid: 2, ..SOURCE }, &raw("<c@d>"))
+            .unwrap();
+
+        // Crash during the turn: it runs again, flagged as interrupted.
+        let claimed = store.mail_claim(now(), 1).unwrap();
+        assert_eq!(claimed[0].state, "processing");
+        assert_eq!(store.mail_recover().unwrap(), (1, 0));
+        let retried = store.mail_claim(now(), 1).unwrap();
+        assert_eq!(
+            (retried[0].id, retried[0].interrupted),
+            (claimed[0].id, true)
+        );
+
+        // Reply generated, crash during SMTP: never resent on its own.
+        store
+            .mail_reply_ready(retried[0].id, "pong", "<r1@x>")
+            .unwrap();
+        assert_eq!(store.mail_recover().unwrap(), (0, 1));
+        assert_eq!(state(retried[0].id), "uncertain");
+        assert!(
+            store
+                .mail_claim(now() + 3600, 10)
+                .unwrap()
+                .iter()
+                .all(|i| i.id != retried[0].id)
+        );
+        // The operator re-queues it: the same reply and Message-ID go out.
+        assert!(store.mail_requeue(retried[0].id).unwrap());
+        let resend = store.mail_claim(now(), 10).unwrap();
+        let resend = resend.iter().find(|i| i.id == retried[0].id).unwrap();
+        assert_eq!(resend.state, "sending");
+        assert_eq!(resend.reply.as_deref(), Some("pong"));
+        assert_eq!(resend.reply_message_id.as_deref(), Some("<r1@x>"));
+
+        // A transient SMTP failure keeps the reply and waits before retrying.
+        assert_eq!(
+            store.mail_retry(resend, "451 later").unwrap(),
+            "reply_ready"
+        );
+        assert!(
+            store
+                .mail_claim(now(), 10)
+                .unwrap()
+                .iter()
+                .all(|i| i.id != resend.id)
+        );
+        let later = store.mail_claim(now() + 3600, 10).unwrap();
+        let later = later.iter().find(|i| i.id == resend.id).unwrap();
+        assert_eq!(later.reply.as_deref(), Some("pong"));
+        store.mail_sent(later.id).unwrap();
+        assert_eq!(state(later.id), "sent");
+    }
+
+    #[test]
+    fn retries_run_out_into_failed() {
+        let bot = bot();
+        let store = Store::open_in_memory().unwrap();
+        bot.ingest(&store, &SOURCE, &raw("<a@b>")).unwrap();
+        let mut t = now();
+        let mut last = "";
+        for _ in 0..MAX_TURN_ATTEMPTS {
+            t += 3600;
+            let item = store.mail_claim(t, 1).unwrap().remove(0);
+            last = store.mail_retry(&item, "model down").unwrap();
+        }
+        assert_eq!(last, "failed");
+        let (_, entries) = store.mail_inbox().unwrap();
+        assert_eq!(entries[0].state, "failed");
+        assert_eq!(entries[0].last_error.as_deref(), Some("model down"));
+    }
+
+    #[test]
+    fn reply_message_ids_are_stable_per_reply() {
+        let id = outgoing_message_id("Bot <bot@example.org>", 5);
+        assert!(id.starts_with("<openclaw.5."), "{id}");
+        assert!(id.ends_with("@example.org>"), "{id}");
     }
 }

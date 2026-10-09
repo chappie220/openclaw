@@ -19,6 +19,8 @@ pub struct Job {
     pub next_run: i64,
     pub last_run: Option<i64>,
     pub last_status: Option<String>,
+    /// The actor that scheduled it; `None` for jobs from before this was recorded.
+    pub created_by: Option<String>,
 }
 
 /// The first run strictly after `after` (unix seconds), in local time.
@@ -45,22 +47,31 @@ fn job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         next_run: row.get(5)?,
         last_run: row.get(6)?,
         last_status: row.get(7)?,
+        created_by: row.get(8)?,
     })
 }
 
-const COLUMNS: &str = "id, name, schedule, session, prompt, next_run, last_run, last_status";
+const COLUMNS: &str =
+    "id, name, schedule, session, prompt, next_run, last_run, last_status, created_by";
 
 impl Store {
-    pub fn job_add(&self, name: &str, schedule: &str, session: &str, prompt: &str) -> Result<Job> {
+    pub fn job_add(
+        &self,
+        name: &str,
+        schedule: &str,
+        session: &str,
+        prompt: &str,
+        created_by: &str,
+    ) -> Result<Job> {
         if name.trim().is_empty() || prompt.trim().is_empty() || session.trim().is_empty() {
             bail!("job name, session and prompt must not be empty");
         }
         let next = next_run(schedule, now())?;
         let conn = self.runtime();
         let inserted = conn.execute(
-            "INSERT INTO jobs(name, schedule, session, prompt, next_run) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(name) DO NOTHING",
-            params![name, schedule, session, prompt, next],
+            "INSERT INTO jobs(name, schedule, session, prompt, next_run, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(name) DO NOTHING",
+            params![name, schedule, session, prompt, next, created_by],
         )?;
         if inserted == 0 {
             bail!("a job named {name:?} already exists; remove it first");
@@ -92,10 +103,15 @@ impl Store {
     }
 
     pub fn job_remove(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .runtime()
-            .execute("DELETE FROM jobs WHERE name = ?1", [name])?
-            > 0)
+        self.job_remove_in(name, None)
+    }
+
+    /// Removes job `name` if it is within `scope` (`None`: any job).
+    pub fn job_remove_in(&self, name: &str, scope: Option<&str>) -> Result<bool> {
+        Ok(self.runtime().execute(
+            "DELETE FROM jobs WHERE name = ?1 AND (?2 IS NULL OR created_by = ?2)",
+            params![name, scope],
+        )? > 0)
     }
 
     /// Claims every due job and advances it past `at` before it runs, so a
@@ -149,9 +165,13 @@ mod tests {
     fn claims_a_missed_job_once_and_reschedules_it() {
         let store = Store::open_in_memory().unwrap();
         let job = store
-            .job_add("tea", "0 15 * * *", "main", "提醒我喝茶")
+            .job_add("tea", "0 15 * * *", "main", "提醒我喝茶", "cli")
             .unwrap();
-        assert!(store.job_add("tea", "0 15 * * *", "main", "x").is_err());
+        assert!(
+            store
+                .job_add("tea", "0 15 * * *", "main", "x", "cli")
+                .is_err()
+        );
         assert!(store.job_claim_due(job.next_run - 1).unwrap().is_empty());
         // Three days late: one run, then the next run is after the claim time.
         let late = job.next_run + 3 * 86_400;
@@ -170,6 +190,7 @@ mod tests {
                 .as_deref(),
             Some("ok")
         );
+        assert!(!store.job_remove_in("tea", Some("qq:X")).unwrap());
         assert!(store.job_remove("tea").unwrap());
     }
 }

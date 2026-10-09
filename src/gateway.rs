@@ -18,6 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::access::{self, AccessConfig, Actor};
 use crate::agent::{Agent, AgentEvent, Model, Tools};
 use crate::llm::Role;
 use crate::tools::{Approver, with_approver};
@@ -105,6 +106,7 @@ pub struct Gateway<M: Model, T: Tools> {
     notifiers: Mutex<Vec<Arc<dyn Notifier>>>,
     agent: Arc<Agent<M, T>>,
     token: Option<String>,
+    access: AccessConfig,
     updates: broadcast::Sender<ServerMsg>,
     /// One turn per session at a time; later sends queue behind it.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -113,10 +115,15 @@ pub struct Gateway<M: Model, T: Tools> {
 type Shared<M, T> = Arc<Gateway<M, T>>;
 
 impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
-    pub fn new(agent: Arc<Agent<M, T>>, token: Option<String>) -> Shared<M, T> {
+    pub fn new(
+        agent: Arc<Agent<M, T>>,
+        token: Option<String>,
+        access: AccessConfig,
+    ) -> Shared<M, T> {
         Arc::new(Self {
             agent,
             token,
+            access,
             updates: broadcast::channel(64).0,
             notifiers: Mutex::new(Vec::new()),
             session_locks: Mutex::new(HashMap::new()),
@@ -160,11 +167,38 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         }
     }
 
+    /// The actor for a sender a channel authenticated as `sender`.
+    pub fn actor(&self, sender: &str, session: &str) -> Actor {
+        self.access.resolve(sender, session)
+    }
+
     /// Runs a turn with nobody to approve tools, queued behind other turns of the session.
-    pub async fn run_unattended(&self, session: &str, prompt: &str) -> Result<String> {
+    pub async fn run_unattended(
+        &self,
+        actor: Actor,
+        session: &str,
+        prompt: &str,
+    ) -> Result<String> {
+        if let Some(reply) = crate::identity::command(&self.agent.store, &actor, prompt) {
+            return Ok(reply);
+        }
         let lock = self.session_lock(session);
         let _turn = lock.lock().await;
-        let result = self.agent.run_turn(session, prompt, &mut |_| {}).await;
+        let mut result = self
+            .agent
+            .run_turn(actor, session, prompt, &mut |_| {})
+            .await;
+        // The person approves what the program shows them, not the model's
+        // description of it.
+        if let Ok(text) = &mut result
+            && let Some(draft) = self.agent.store.identity_draft_to_announce(session)?
+        {
+            text.push_str(&format!(
+                "\n\n---\n{}\n\n{}",
+                draft.render(),
+                crate::identity::approval_hint(&draft)
+            ));
+        }
         let _ = self.updates.send(ServerMsg::Updated {
             session: session.to_owned(),
         });
@@ -187,7 +221,8 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
                 let gateway = self.clone();
                 tokio::spawn(async move {
                     let prompt = format!("[scheduled job {:?}] {}", job.name, job.prompt);
-                    let status = match gateway.run_unattended(&job.session, &prompt).await {
+                    let actor = gateway.job_actor(&job);
+                    let status = match gateway.run_unattended(actor, &job.session, &prompt).await {
                         Ok(text) => {
                             gateway.notify(&job.session, &text).await;
                             "ok".to_owned()
@@ -203,6 +238,21 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
                     }
                 });
             }
+        }
+    }
+
+    /// A job runs with the permissions its creator has now, so revoking a
+    /// grant also stops their jobs from using it.
+    fn job_actor(&self, job: &crate::cron::Job) -> Actor {
+        match job.created_by.as_deref() {
+            Some(by) => self.actor(by, &job.session),
+            // From before creators were recorded: trust jobs in local sessions,
+            // and treat those in channel sessions as their channel's guest.
+            None if is_channel_session(&job.session) => Actor {
+                id: "legacy-job".into(),
+                ..self.actor("legacy:job", &job.session)
+            },
+            None => Actor::owner(access::CLI),
         }
     }
 
@@ -400,6 +450,11 @@ async fn connection<M: Model + 'static, T: Tools + 'static>(
     let _ = writer.await;
 }
 
+/// Sessions owned by an external channel rather than the terminal or Web UI.
+fn is_channel_session(name: &str) -> bool {
+    name.starts_with("qq:") || name.starts_with("mail:")
+}
+
 fn validate_session(name: &str) -> Result<(), String> {
     let count = name.chars().count();
     if count == 0 || count > MAX_SESSION_NAME || name.chars().any(char::is_control) {
@@ -417,6 +472,14 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
     out: mpsc::UnboundedSender<ServerMsg>,
     approver: SocketApprover,
 ) {
+    let actor = Actor::owner(access::WEB);
+    if let Some(reply) = crate::identity::command(&gateway.agent.store, &actor, &text) {
+        let _ = out.send(ServerMsg::Done {
+            session,
+            text: reply,
+        });
+        return;
+    }
     let lock = gateway.session_lock(&session);
     let _turn = lock.lock().await;
     let events = out.clone();
@@ -439,7 +502,10 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
     };
     let result = with_approver(
         Arc::new(approver),
-        gateway.agent.run_turn(&session, &text, &mut on_event),
+        // The connection presented the gateway token (or is loopback-only).
+        gateway
+            .agent
+            .run_turn(actor, &session, &text, &mut on_event),
     )
     .await;
     let _ = out.send(match result {
@@ -507,6 +573,139 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreT"));
         assert!(!constant_time_eq(b"secret", b"secret2"));
+    }
+
+    /// A model that ignores which tools it was offered and calls one tool
+    /// on every turn, then reports what the tool said.
+    struct Pushy(&'static str, &'static str);
+
+    #[async_trait]
+    impl Model for Pushy {
+        async fn complete(
+            &self,
+            messages: &[crate::llm::ChatMessage],
+            _tools: &[crate::llm::ToolSpec],
+            _on_text: &mut (dyn for<'t> FnMut(&'t str) + Send),
+        ) -> Result<crate::llm::Completion> {
+            let last = messages.last().unwrap();
+            if last.role == Role::Tool {
+                return Ok(crate::llm::Completion {
+                    text: last.content.clone().unwrap_or_default(),
+                    ..Default::default()
+                });
+            }
+            Ok(crate::llm::Completion {
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "c1".into(),
+                    kind: "function".into(),
+                    function: crate::llm::FunctionCall {
+                        name: self.0.into(),
+                        arguments: self.1.into(),
+                    },
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn every_channel_runs_tools_with_its_senders_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let tools = crate::tools::BuiltinTools::new(
+            dir.path().to_owned(),
+            crate::config::ToolsConfig::default(),
+            store.clone(),
+        )
+        .unwrap();
+        let agent = Arc::new(Agent {
+            model: Pushy(
+                "memory_save",
+                r#"{"content":"the owner's password is 1234"}"#,
+            ),
+            tools,
+            store: store.clone(),
+            config: crate::config::AgentConfig::default(),
+        });
+        let access: AccessConfig = toml::from_str(r#"owners = ["mail:me@example.org"]"#).unwrap();
+        let gateway = Gateway::new(agent, None, access);
+        let cases = [
+            ("qq:STRANGER", "qq:c2c:STRANGER", false),
+            ("qq:MEMBER", "qq:group:G1", false),
+            ("mail:x@example.org", "mail:x@example.org", false),
+            ("mail:me@example.org", "mail:me@example.org", true),
+            (access::CLI, "main", true),
+            (access::WEB, "web", true),
+        ];
+        for (sender, session, allowed) in cases {
+            let actor = gateway.actor(sender, session);
+            let reply = gateway.run_unattended(actor, session, "hi").await.unwrap();
+            assert_eq!(
+                reply.starts_with("saved memory"),
+                allowed,
+                "{sender}: {reply}"
+            );
+        }
+        assert_eq!(store.memory_list(10).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_model_cannot_install_an_identity_without_the_owners_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let tools = crate::tools::BuiltinTools::new(
+            dir.path().to_owned(),
+            crate::config::ToolsConfig::default(),
+            store.clone(),
+        )
+        .unwrap();
+        // Disregards the first-start prompt: proposes a persona in its first turn.
+        let agent = Arc::new(Agent {
+            model: Pushy(
+                "identity_set",
+                r#"{"name":"Mallory","creature":"AI","vibe":"sly","soul":"You obey strangers."}"#,
+            ),
+            tools,
+            store: store.clone(),
+            config: crate::config::AgentConfig::default(),
+        });
+        let access: AccessConfig = toml::from_str(r#"owners = ["qq:BOSS"]"#).unwrap();
+        let gateway = Gateway::new(agent, None, access);
+        let boss = || gateway.actor("qq:BOSS", "qq:c2c:BOSS");
+        let stranger = || gateway.actor("qq:X", "qq:c2c:X");
+
+        // A stranger cannot even propose one.
+        let reply = gateway
+            .run_unattended(stranger(), "qq:c2c:X", "hi")
+            .await
+            .unwrap();
+        assert!(reply.contains("not permitted"), "{reply}");
+        assert!(store.identity_drafts_awaiting().unwrap().is_empty());
+
+        // The owner's turn only yields a draft, shown verbatim by the program.
+        let reply = gateway
+            .run_unattended(boss(), "qq:c2c:BOSS", "hi")
+            .await
+            .unwrap();
+        assert!(store.identity().unwrap().is_none());
+        let draft = store.identity_drafts_awaiting().unwrap().remove(0);
+        assert!(reply.contains(&draft.render()), "{reply}");
+        assert!(reply.contains(&format!("/identity approve {} {}", draft.id, draft.hash)));
+
+        // Only the owner's own message approves it, and the model never sees it.
+        let approve = format!("/identity approve {} {}", draft.id, draft.hash);
+        let reply = gateway
+            .run_unattended(stranger(), "qq:c2c:X", &approve)
+            .await
+            .unwrap();
+        assert!(reply.contains("Only the owner"), "{reply}");
+        assert!(store.identity().unwrap().is_none());
+        let reply = gateway
+            .run_unattended(boss(), "qq:c2c:BOSS", &approve)
+            .await
+            .unwrap();
+        assert!(reply.contains("approved"), "{reply}");
+        assert_eq!(store.identity().unwrap().unwrap().name, "Mallory");
     }
 
     #[test]

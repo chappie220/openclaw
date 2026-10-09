@@ -26,7 +26,13 @@ fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
 }
 
 impl Store {
+    /// Saves a memory as the owner.
     pub fn memory_save(&self, content: &str) -> Result<i64> {
+        self.memory_save_by(content, None)
+    }
+
+    /// Saves a memory recorded as `created_by`'s.
+    pub fn memory_save_by(&self, content: &str, created_by: Option<&str>) -> Result<i64> {
         let content = content.trim();
         if content.is_empty() {
             bail!("memory content is empty");
@@ -36,17 +42,22 @@ impl Store {
         }
         let conn = self.soul();
         conn.execute(
-            "INSERT INTO memories(content, created_at) VALUES (?1, ?2)",
-            params![content, now()],
+            "INSERT INTO memories(content, created_at, created_by) VALUES (?1, ?2, ?3)",
+            params![content, now(), created_by],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     pub fn memory_delete(&self, id: i64) -> Result<bool> {
-        Ok(self
-            .soul()
-            .execute("DELETE FROM memories WHERE id = ?1", [id])?
-            > 0)
+        self.memory_delete_in(id, None)
+    }
+
+    /// Deletes memory `id` if it is within `scope` (`None`: any memory).
+    pub fn memory_delete_in(&self, id: i64, scope: Option<&str>) -> Result<bool> {
+        Ok(self.soul().execute(
+            "DELETE FROM memories WHERE id = ?1 AND (?2 IS NULL OR created_by = ?2)",
+            params![id, scope],
+        )? > 0)
     }
 
     pub fn memory_list(&self, limit: usize) -> Result<Vec<Memory>> {
@@ -60,6 +71,16 @@ impl Store {
 
     /// Any-term match: full-text ranked hits first, then short-term substring hits.
     pub fn memory_search(&self, query: &str, limit: usize) -> Result<Vec<Memory>> {
+        self.memory_search_in(query, limit, None)
+    }
+
+    /// Like [`Store::memory_search`], limited to memories saved by `scope`.
+    pub fn memory_search_in(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<Memory>> {
         let (long, short): (Vec<&str>, Vec<&str>) = query
             .split_whitespace()
             .partition(|term| term.chars().count() >= TRIGRAM);
@@ -75,10 +96,11 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT m.id, m.content, m.created_at FROM memories_fts f
                  JOIN memories m ON m.id = f.rowid
-                 WHERE memories_fts MATCH ?1 ORDER BY bm25(memories_fts) LIMIT ?2",
+                 WHERE memories_fts MATCH ?1 AND (?3 IS NULL OR m.created_by = ?3)
+                 ORDER BY bm25(memories_fts) LIMIT ?2",
             )?;
             found.extend(
-                stmt.query_map(params![expr, limit as i64], row)?
+                stmt.query_map(params![expr, limit as i64, scope], row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?,
             );
         }
@@ -94,9 +116,9 @@ impl Store {
             );
             let mut stmt = conn.prepare(
                 "SELECT id, content, created_at FROM memories WHERE content LIKE ?1 ESCAPE '\\'
-                 ORDER BY id DESC LIMIT ?2",
+                 AND (?3 IS NULL OR created_by = ?3) ORDER BY id DESC LIMIT ?2",
             )?;
-            for memory in stmt.query_map(params![pattern, limit as i64], row)? {
+            for memory in stmt.query_map(params![pattern, limit as i64, scope], row)? {
                 let memory = memory?;
                 if found.len() < limit && !found.iter().any(|m| m.id == memory.id) {
                     found.push(memory);
@@ -142,5 +164,32 @@ mod tests {
         assert!(store.memory_search("乌龙茶", 5).unwrap().is_empty());
         assert_eq!(store.memory_list(10).unwrap().len(), 2);
         assert!(store.memory_save("  ").is_err());
+    }
+
+    #[test]
+    fn scoped_memories_are_private_to_their_creator() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = store.memory_save("主人的银行卡密码提示").unwrap();
+        let guest = store.memory_save_by("访客喜欢猫咪", Some("qq:X")).unwrap();
+        assert!(
+            store
+                .memory_search_in("银行卡", 5, Some("qq:X"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .memory_search_in("卡", 5, Some("qq:X"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.memory_search_in("猫咪", 5, Some("qq:X")).unwrap()[0].id,
+            guest
+        );
+        assert!(!store.memory_delete_in(owner, Some("qq:X")).unwrap());
+        assert!(!store.memory_delete_in(guest, Some("qq:Y")).unwrap());
+        assert!(store.memory_delete_in(guest, Some("qq:X")).unwrap());
+        assert!(store.memory_delete(owner).unwrap());
     }
 }

@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::access::{self, Actor, Capability};
 use crate::agent::Tools;
 use crate::config::{Permission, ToolsConfig};
 use crate::identity::Identity;
@@ -216,34 +217,52 @@ impl BuiltinTools {
         }
     }
 
-    async fn identity_set(&self, args: IdentitySetArgs) -> Result<String, String> {
-        let current = self.store.identity().map_err(|e| format!("error: {e:#}"))?;
-        // The first identity is the setup the agent was asked to do; changes need consent.
-        if current.is_some() {
-            let summary = format!(
-                "become {:?} ({}, {})\n{}",
-                args.name.trim(),
-                args.creature.trim(),
-                args.vibe.trim(),
-                args.soul.trim()
-            );
-            self.permit(self.config.identity, "identity_set", &summary)
-                .await?;
+    /// Proposes an identity. Nothing is saved until a person approves this
+    /// exact draft: here when the turn has someone to ask, otherwise later
+    /// with `/identity approve`, which the program handles, not the model.
+    async fn identity_set(&self, actor: &Actor, args: IdentitySetArgs) -> Result<String, String> {
+        if self.config.identity == Permission::Deny {
+            return Err("error: identity_set is disabled by configuration".into());
         }
-        self.store
-            .identity_set(&Identity {
-                name: args.name.clone(),
-                creature: args.creature,
-                vibe: args.vibe,
-                emoji: args.emoji,
-                soul: args.soul,
-                ..Identity::default()
-            })
+        let session = crate::agent::current_session()
+            .ok_or("error: identity_set can only be used in a conversation")?;
+        let proposed = Identity {
+            name: args.name,
+            creature: args.creature,
+            vibe: args.vibe,
+            emoji: args.emoji,
+            soul: args.soul,
+            ..Identity::default()
+        };
+        let draft = self
+            .store
+            .identity_propose(&proposed, &actor.id, &session)
             .map_err(|e| format!("error: {e:#}"))?;
-        Ok(format!(
-            "identity saved: you are now {}; it applies to every conversation from your next reply",
-            args.name.trim()
-        ))
+        let Ok(approver) = TURN_APPROVER.try_with(Arc::clone) else {
+            return Ok(format!(
+                "identity draft #{} is NOT saved yet. After your reply the user is shown the exact \
+                 draft and how to approve or reject it; tell them briefly that it needs their \
+                 approval, and do not act as the new identity until it is approved.",
+                draft.id
+            ));
+        };
+        let approved = approver.approve("identity_set", &draft.render()).await;
+        let decided = self
+            .store
+            .identity_decide(draft.id, approved, Some(&draft.hash), &actor.id)
+            .map_err(|e| format!("error: {e:#}"))?;
+        if approved {
+            Ok(format!(
+                "identity saved: you are now {}; it applies to every conversation from your next reply",
+                decided.identity.name
+            ))
+        } else {
+            Err(format!(
+                "error: the user rejected identity draft #{}; nothing was saved. Ask what to \
+                 change, then propose a revised draft.",
+                draft.id
+            ))
+        }
     }
 
     async fn web_search(&self, args: WebSearchArgs) -> Result<String, String> {
@@ -255,19 +274,20 @@ impl BuiltinTools {
         Ok(truncate(found.as_bytes(), self.config.max_output_bytes))
     }
 
-    fn memory_save(&self, args: MemorySaveArgs) -> Result<String, String> {
+    fn memory_save(&self, actor: &Actor, args: MemorySaveArgs) -> Result<String, String> {
+        // The owner's memories stay unattributed, like those saved from the terminal.
         let id = self
             .store
-            .memory_save(&args.content)
+            .memory_save_by(&args.content, actor.scope())
             .map_err(|e| format!("error: {e:#}"))?;
         Ok(format!("saved memory #{id}"))
     }
 
-    fn memory_search(&self, args: MemorySearchArgs) -> Result<String, String> {
+    fn memory_search(&self, actor: &Actor, args: MemorySearchArgs) -> Result<String, String> {
         let limit = args.limit.unwrap_or(10).clamp(1, 50);
         let hits = self
             .store
-            .memory_search(&args.query, limit)
+            .memory_search_in(&args.query, limit, actor.scope())
             .map_err(|e| format!("error: {e:#}"))?;
         if hits.is_empty() {
             return Ok("no matching memories".into());
@@ -279,12 +299,19 @@ impl BuiltinTools {
             .join("\n"))
     }
 
-    fn cron_add(&self, args: CronAddArgs) -> Result<String, String> {
+    fn cron_add(&self, actor: &Actor, args: CronAddArgs) -> Result<String, String> {
+        // Always this conversation: nobody schedules into another person's session.
         let session = crate::agent::current_session()
             .ok_or("error: cron_add can only schedule from a conversation")?;
         let job = self
             .store
-            .job_add(&args.name, &args.schedule, &session, &args.prompt)
+            .job_add(
+                &args.name,
+                &args.schedule,
+                &session,
+                &args.prompt,
+                &actor.id,
+            )
             .map_err(|e| format!("error: {e:#}"))?;
         Ok(format!(
             "scheduled {:?}; next run {}",
@@ -293,8 +320,9 @@ impl BuiltinTools {
         ))
     }
 
-    fn cron_list(&self) -> Result<String, String> {
-        let jobs = self.store.job_list().map_err(|e| format!("error: {e:#}"))?;
+    fn cron_list(&self, actor: &Actor) -> Result<String, String> {
+        let mut jobs = self.store.job_list().map_err(|e| format!("error: {e:#}"))?;
+        jobs.retain(|j| actor.owns(j.created_by.as_deref()));
         if jobs.is_empty() {
             return Ok("no scheduled jobs".into());
         }
@@ -314,16 +342,16 @@ impl BuiltinTools {
             .join("\n"))
     }
 
-    fn cron_remove(&self, args: CronRemoveArgs) -> Result<String, String> {
-        match self.store.job_remove(&args.name) {
+    fn cron_remove(&self, actor: &Actor, args: CronRemoveArgs) -> Result<String, String> {
+        match self.store.job_remove_in(&args.name, actor.scope()) {
             Ok(true) => Ok(format!("removed job {:?}", args.name)),
             Ok(false) => Err(format!("error: no job named {:?}", args.name)),
             Err(e) => Err(format!("error: {e:#}")),
         }
     }
 
-    fn memory_delete(&self, args: MemoryDeleteArgs) -> Result<String, String> {
-        match self.store.memory_delete(args.id) {
+    fn memory_delete(&self, actor: &Actor, args: MemoryDeleteArgs) -> Result<String, String> {
+        match self.store.memory_delete_in(args.id, actor.scope()) {
             Ok(true) => Ok(format!("deleted memory #{}", args.id)),
             Ok(false) => Err(format!("error: no memory #{}", args.id)),
             Err(e) => Err(format!("error: {e:#}")),
@@ -377,44 +405,48 @@ impl BuiltinTools {
             .kill_on_drop(true)
             .spawn()
             .map_err(|err| format!("error: cannot start shell: {err}"))?;
-        let pid = child.id();
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        // Kills the whole group if this future is dropped or times out mid-run.
+        let group = child.id().map(GroupKill);
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let cap = self.config.max_output_bytes;
         let run = async {
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let (read_out, read_err, status) = tokio::join!(
-                stdout.read_to_end(&mut out),
-                stderr.read_to_end(&mut err),
+            // Both pipes drain concurrently into fixed-size buffers, so neither a
+            // blocked writer nor endless output can grow memory past the cap.
+            let (out, err, status) = tokio::join!(
+                Capture::drain(stdout, cap),
+                Capture::drain(stderr, cap),
                 child.wait()
             );
-            read_out.and(read_err).map_err(|e| e.to_string())?;
-            Ok::<_, String>((status.map_err(|e| e.to_string())?, out, err))
+            Ok::<_, String>((
+                status.map_err(|e| e.to_string())?,
+                out.map_err(|e| e.to_string())?,
+                err.map_err(|e| e.to_string())?,
+            ))
         };
         let timeout = Duration::from_secs(self.config.shell_timeout_secs);
         let (status, out, err) = match tokio::time::timeout(timeout, run).await {
             Ok(result) => result.map_err(|e| format!("error: {e}"))?,
             Err(_) => {
-                if let Some(pid) = pid {
-                    // SAFETY: signalling a process group we created; failure is harmless.
-                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                }
+                drop(group);
                 return Err(format!(
                     "error: command timed out after {}s and was killed",
                     timeout.as_secs()
                 ));
             }
         };
-        let cap = self.config.max_output_bytes;
+        // Finished normally: leave deliberately detached descendants alone.
+        std::mem::forget(group);
         let code = status
             .code()
             .map_or_else(|| "killed by signal".into(), |c| c.to_string());
         let mut text = reviewed.map(|note| format!("{note}\n")).unwrap_or_default();
         text.push_str(&format!("exit code: {code}\n"));
-        if !out.is_empty() {
-            text.push_str(&format!("stdout:\n{}\n", truncate(&out, cap)));
+        if out.total > 0 {
+            text.push_str(&format!("stdout:\n{}\n", out.render()));
         }
-        if !err.is_empty() {
-            text.push_str(&format!("stderr:\n{}\n", truncate(&err, cap)));
+        if err.total > 0 {
+            text.push_str(&format!("stderr:\n{}\n", err.render()));
         }
         Ok(text)
     }
@@ -535,6 +567,90 @@ fn parse<T: DeserializeOwned>(call: &ToolCall) -> Result<T, String> {
         .map_err(|err| format!("error: invalid arguments for {}: {err}", call.function.name))
 }
 
+/// SIGKILLs a process group when dropped.
+struct GroupKill(u32);
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        // SAFETY: signalling a process group we created; failure is harmless.
+        unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+    }
+}
+
+/// The head and tail of a stream, at most `cap` bytes however much is read.
+struct Capture {
+    head: Vec<u8>,
+    head_cap: usize,
+    /// Ring buffer of the latest bytes past the head; `tail_start` is the oldest.
+    tail: Vec<u8>,
+    tail_cap: usize,
+    tail_start: usize,
+    total: u64,
+}
+
+impl Capture {
+    fn new(cap: usize) -> Self {
+        let head_cap = cap / 2;
+        Self {
+            head: Vec::new(),
+            head_cap,
+            tail: Vec::new(),
+            tail_cap: cap - head_cap,
+            tail_start: 0,
+            total: 0,
+        }
+    }
+
+    async fn drain(mut reader: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<Self> {
+        let mut capture = Self::new(cap);
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf).await? {
+                0 => return Ok(capture),
+                n => capture.push(&buf[..n]),
+            }
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        let take = (self.head_cap - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..take]);
+        let rest = &bytes[take..];
+        if rest.len() >= self.tail_cap {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&rest[rest.len() - self.tail_cap..]);
+            self.tail_start = 0;
+            return;
+        }
+        for &b in rest {
+            if self.tail.len() < self.tail_cap {
+                self.tail.push(b);
+            } else {
+                self.tail[self.tail_start] = b;
+                self.tail_start = (self.tail_start + 1) % self.tail_cap;
+            }
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut tail = self.tail[self.tail_start..].to_vec();
+        tail.extend_from_slice(&self.tail[..self.tail_start]);
+        let omitted = self.total - (self.head.len() + tail.len()) as u64;
+        if omitted == 0 {
+            let mut all = self.head.clone();
+            all.extend_from_slice(&tail);
+            return String::from_utf8_lossy(&all).into_owned();
+        }
+        format!(
+            "{}\n[... {omitted} bytes omitted ...]\n{}",
+            String::from_utf8_lossy(&self.head),
+            String::from_utf8_lossy(&tail)
+        )
+    }
+}
+
 /// Keeps the head and tail of long output, where errors usually are.
 fn truncate(bytes: &[u8], cap: usize) -> String {
     if bytes.len() <= cap {
@@ -552,6 +668,37 @@ fn truncate(bytes: &[u8], cap: usize) -> String {
 #[async_trait]
 impl Tools for BuiltinTools {
     fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.all_specs();
+        // Offer only what this turn's actor may use; `call` enforces it regardless.
+        let actor = access::current();
+        specs.retain(|spec| {
+            Capability::for_tool(&spec.function.name)
+                .is_none_or(|cap| actor.as_ref().is_some_and(|a| a.can(cap)))
+        });
+        specs
+    }
+
+    async fn call(&self, call: &ToolCall) -> String {
+        let name = call.function.name.as_str();
+        // Fail closed: a call outside any turn has no authority at all.
+        let Some(actor) = access::current() else {
+            return format!("error: {name} has no authenticated caller");
+        };
+        if let Some(cap) = Capability::for_tool(name)
+            && !actor.can(cap)
+        {
+            eprintln!("refused {name} for {} (no {cap:?} permission)", actor.id);
+            return format!(
+                "error: {name} is not permitted for this sender. Do not try to reach the same \
+                 result another way; tell them the owner has to grant it."
+            );
+        }
+        self.dispatch(&actor, call).await.unwrap_or_else(|err| err)
+    }
+}
+
+impl BuiltinTools {
+    fn all_specs(&self) -> Vec<ToolSpec> {
         let workspace = self.workspace.display();
         let mut specs = vec![
             ToolSpec::function(
@@ -607,9 +754,10 @@ impl Tools for BuiltinTools {
             "Remove a scheduled job by name.",
             json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
         ));
-        specs.push(ToolSpec::function(
+        if self.config.identity != Permission::Deny {
+            specs.push(ToolSpec::function(
             "identity_set",
-            "Save your identity (IDENTITY.md fields and SOUL.md) for every conversation. Call it only after the user approved the exact draft you showed them; never save an identity they did not describe or approve. Write it as who you are: never name a source work, author or actor, summarize plot, cite pages, or say you are based on or playing someone.",
+            "Propose your identity (IDENTITY.md fields and SOUL.md) for every conversation. It is saved only after the user approves this exact draft, which the program shows them; never propose an identity they did not ask for or describe. Write it as who you are: never name a source work, author or actor, summarize plot, cite pages, or say you are based on or playing someone.",
             json!({"type": "object", "properties": {
                 "name": {"type": "string", "description": "What the user calls you"},
                 "creature": {"type": "string", "description": "What you are, e.g. an AI, a robot, a familiar"},
@@ -618,6 +766,7 @@ impl Tools for BuiltinTools {
                 "soul": {"type": "string", "description": "SOUL.md, addressed to you as 'You ...', under 4000 characters: tone, speech patterns and catchphrases, opinions, how you address the user, boundaries. Behavior, not biography."}
             }, "required": ["name", "creature", "vibe", "soul"]}),
         ));
+        }
         if self.search.is_some() {
             specs.push(ToolSpec::function(
                 "web_search",
@@ -654,8 +803,8 @@ impl Tools for BuiltinTools {
         specs
     }
 
-    async fn call(&self, call: &ToolCall) -> String {
-        let result = match call.function.name.as_str() {
+    async fn dispatch(&self, actor: &Actor, call: &ToolCall) -> Result<String, String> {
+        match call.function.name.as_str() {
             "shell" => match parse(call) {
                 Ok(args) => self.shell(args).await,
                 Err(e) => Err(e),
@@ -676,23 +825,22 @@ impl Tools for BuiltinTools {
                 Ok(args) => self.list_dir(args).await,
                 Err(e) => Err(e),
             },
-            "memory_save" => parse(call).and_then(|args| self.memory_save(args)),
-            "memory_search" => parse(call).and_then(|args| self.memory_search(args)),
-            "memory_delete" => parse(call).and_then(|args| self.memory_delete(args)),
+            "memory_save" => parse(call).and_then(|args| self.memory_save(actor, args)),
+            "memory_search" => parse(call).and_then(|args| self.memory_search(actor, args)),
+            "memory_delete" => parse(call).and_then(|args| self.memory_delete(actor, args)),
             "identity_set" => match parse(call) {
-                Ok(args) => self.identity_set(args).await,
+                Ok(args) => self.identity_set(actor, args).await,
                 Err(e) => Err(e),
             },
             "web_search" => match parse(call) {
                 Ok(args) => self.web_search(args).await,
                 Err(e) => Err(e),
             },
-            "cron_add" => parse(call).and_then(|args| self.cron_add(args)),
-            "cron_list" => self.cron_list(),
-            "cron_remove" => parse(call).and_then(|args| self.cron_remove(args)),
+            "cron_add" => parse(call).and_then(|args| self.cron_add(actor, args)),
+            "cron_list" => self.cron_list(actor),
+            "cron_remove" => parse(call).and_then(|args| self.cron_remove(actor, args)),
             other => Err(format!("error: unknown tool {other}")),
-        };
-        result.unwrap_or_else(|err| err)
+        }
     }
 }
 
@@ -721,12 +869,17 @@ mod tests {
         }
     }
 
+    /// Runs `turn` as the terminal's owner.
+    async fn owner<F: std::future::Future>(turn: F) -> F::Output {
+        access::with_actor(Actor::owner(access::CLI), turn).await
+    }
+
     /// Calls tools as a turn whose approvals `Answer` decides.
     struct Scoped(BuiltinTools, Arc<dyn Approver>);
 
     impl Scoped {
         async fn call(&self, call: &ToolCall) -> String {
-            with_approver(self.1.clone(), self.0.call(call)).await
+            owner(with_approver(self.1.clone(), self.0.call(call))).await
         }
         fn specs(&self) -> Vec<ToolSpec> {
             self.0.specs()
@@ -831,47 +984,118 @@ mod tests {
             Store::open_in_memory().unwrap(),
         )
         .unwrap();
-        let out = t
-            .call(&call("shell", json!({"command": "touch ran"})))
-            .await;
+        let out = owner(t.call(&call("shell", json!({"command": "touch ran"})))).await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("ran").exists());
     }
 
+    fn set_identity(name: &str) -> ToolCall {
+        call(
+            "identity_set",
+            json!({"name": name, "creature": "AI", "vibe": "curious", "soul": "You ask why."}),
+        )
+    }
+
+    /// Calls `c` as the owner in session `main`, with `approver` if any.
+    async fn as_owner_in_main(
+        t: &BuiltinTools,
+        approver: Option<Arc<dyn Approver>>,
+        c: &ToolCall,
+    ) -> String {
+        let turn = crate::agent::with_session("main".into(), async {
+            match approver {
+                Some(a) => with_approver(a, t.call(c)).await,
+                None => t.call(c).await,
+            }
+        });
+        owner(turn).await
+    }
+
     #[tokio::test]
-    async fn first_identity_saves_freely_but_changes_need_approval() {
+    async fn identity_set_never_saves_without_an_approval_of_that_exact_draft() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
-        // No approver, as on QQ or email: first-start setup must still work there.
-        let t = BuiltinTools::new(dir.path().to_owned(), ToolsConfig::default(), store.clone())
-            .unwrap();
-        let set = |name: &str| {
-            call(
-                "identity_set",
-                json!({"name": name, "creature": "AI", "vibe": "curious", "soul": "You ask why."}),
-            )
+        // Even "allow" does not let the model save an identity on its own.
+        let config = ToolsConfig {
+            identity: Permission::Allow,
+            ..ToolsConfig::default()
         };
-        let out = t.call(&set("Ada")).await;
-        assert!(out.starts_with("identity saved"), "{out}");
-        let out = t.call(&set("Eve")).await;
-        assert!(out.contains("nobody can answer"), "{out}");
-        assert_eq!(store.identity().unwrap().unwrap().name, "Ada");
+        let t = BuiltinTools::new(dir.path().to_owned(), config, store.clone()).unwrap();
+        let owner_actor = Actor::owner(access::CLI);
 
-        let approved = Scoped(t, Arc::new(Answer(true)));
-        assert!(
-            approved
-                .call(&set("Eve"))
-                .await
-                .starts_with("identity saved")
+        // No approver, as on QQ or email: the first identity is only a draft.
+        let out = as_owner_in_main(&t, None, &set_identity("Ada")).await;
+        assert!(out.contains("NOT saved"), "{out}");
+        assert!(store.identity().unwrap().is_none());
+        let ada = store.identity_drafts_awaiting().unwrap().remove(0);
+
+        // A revision supersedes it, so approving the old draft is refused.
+        as_owner_in_main(&t, None, &set_identity("Eve")).await;
+        let eve = store.identity_drafts_awaiting().unwrap().remove(0);
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {}", ada.id),
         );
+        assert!(out.unwrap().contains("replaced by a newer draft"));
+        // A code from another version is refused too.
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {} {}", eve.id, ada.hash),
+        );
+        assert!(out.unwrap().contains("has code"));
+        // A guest cannot approve.
+        let guest = crate::access::AccessConfig::default().resolve("qq:X", "qq:c2c:X");
+        let out =
+            crate::identity::command(&store, &guest, &format!("/identity approve {}", eve.id));
+        assert!(out.unwrap().contains("Only the owner"));
+        assert!(store.identity().unwrap().is_none());
+
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {} {}", eve.id, eve.hash),
+        )
+        .unwrap();
+        assert!(out.contains("approved"), "{out}");
         assert_eq!(store.identity().unwrap().unwrap().name, "Eve");
+        // Replaying the approval does nothing more.
+        let out = crate::identity::command(
+            &store,
+            &owner_actor,
+            &format!("/identity approve {}", eve.id),
+        );
+        assert!(out.unwrap().contains("already committed"));
+
+        // With someone to ask, the exact draft is put to them.
+        let out = as_owner_in_main(&t, Some(Arc::new(Answer(false))), &set_identity("Zed")).await;
+        assert!(out.contains("rejected"), "{out}");
+        assert_eq!(store.identity().unwrap().unwrap().name, "Eve");
+        let out = as_owner_in_main(&t, Some(Arc::new(Answer(true))), &set_identity("Zed")).await;
+        assert!(out.starts_with("identity saved"), "{out}");
+        assert_eq!(store.identity().unwrap().unwrap().name, "Zed");
         // web_search is only offered when a provider is configured.
         assert!(
-            !approved
-                .specs()
+            !owner(async { t.specs() })
+                .await
                 .iter()
                 .any(|s| s.function.name == "web_search")
         );
+    }
+
+    #[tokio::test]
+    async fn identity_set_can_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            identity: Permission::Deny,
+            ..ToolsConfig::default()
+        };
+        let store = Store::open_in_memory().unwrap();
+        let t = BuiltinTools::new(dir.path().to_owned(), config, store.clone()).unwrap();
+        let out = as_owner_in_main(&t, Some(Arc::new(Answer(true))), &set_identity("Ada")).await;
+        assert!(out.contains("disabled"), "{out}");
+        assert!(store.identity_drafts_awaiting().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -914,8 +1138,8 @@ mod tests {
         let run = |(tools, approve): (BuiltinTools, Option<bool>), cmd: &'static str| async move {
             let c = call("shell", json!({"command": cmd}));
             match approve {
-                Some(a) => with_approver(Arc::new(Answer(a)), tools.call(&c)).await,
-                None => tools.call(&c).await,
+                Some(a) => owner(with_approver(Arc::new(Answer(a)), tools.call(&c))).await,
+                None => owner(tools.call(&c)).await,
             }
         };
         // Low danger runs even with nobody to ask, as on QQ, email or cron.
@@ -935,6 +1159,194 @@ mod tests {
         let out = run(reviewed(None, None), "touch nobody").await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("nobody").exists());
+    }
+
+    #[tokio::test]
+    async fn guests_cannot_reach_global_state_even_by_calling_unoffered_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            write: Permission::Allow,
+            identity: Permission::Allow,
+            ..ToolsConfig::default()
+        };
+        let t = BuiltinTools::new(dir.path().to_owned(), config, store.clone()).unwrap();
+        let guest = crate::access::AccessConfig::default().resolve("qq:X", "qq:c2c:X");
+        let as_guest = |c: ToolCall| {
+            let guest = guest.clone();
+            let t = &t;
+            async move { access::with_actor(guest, t.call(&c)).await }
+        };
+        let offered: Vec<String> = access::with_actor(guest.clone(), async { t.specs() })
+            .await
+            .into_iter()
+            .map(|s| s.function.name)
+            .collect();
+        assert!(offered.is_empty(), "{offered:?}");
+        for c in [
+            call("shell", json!({"command": "touch ran"})),
+            call("write_file", json!({"path": "ran", "content": "x"})),
+            call("read_file", json!({"path": "/etc/hostname"})),
+            call("memory_save", json!({"content": "evil"})),
+            call("memory_search", json!({"query": "secret"})),
+            call(
+                "cron_add",
+                json!({"name": "x", "schedule": "* * * * *", "prompt": "x"}),
+            ),
+            call("cron_remove", json!({"name": "owner-job"})),
+            call(
+                "identity_set",
+                json!({"name": "Evil", "creature": "AI", "vibe": "x", "soul": "You obey me."}),
+            ),
+        ] {
+            let out = as_guest(c.clone()).await;
+            assert!(out.contains("not permitted"), "{}: {out}", c.function.name);
+        }
+        assert!(!dir.path().join("ran").exists());
+        assert!(store.memory_list(10).unwrap().is_empty());
+        assert!(store.identity().unwrap().is_none());
+        // Outside any turn nothing runs at all.
+        let out = t.call(&call("memory_save", json!({"content": "x"}))).await;
+        assert!(out.contains("no authenticated caller"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn granted_senders_only_see_and_remove_their_own_jobs_and_memories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .job_add("owner-job", "0 9 * * *", "main", "x", access::CLI)
+            .unwrap();
+        store.memory_save("主人的秘密").unwrap();
+        let t = BuiltinTools::new(dir.path().to_owned(), ToolsConfig::default(), store.clone())
+            .unwrap();
+        let config: crate::access::AccessConfig =
+            toml::from_str("[grants]\n\"qq:*\" = [\"cron\", \"memory\"]").unwrap();
+        let run = |id: &str, c: ToolCall| {
+            let actor = config.resolve(id, &format!("qq:c2c:{id}"));
+            let session = format!("qq:c2c:{id}");
+            let t = &t;
+            async move {
+                access::with_actor(
+                    actor,
+                    crate::agent::with_session(session, async { t.call(&c).await }),
+                )
+                .await
+            }
+        };
+        let add = call(
+            "cron_add",
+            json!({"name": "mine", "schedule": "0 8 * * *", "prompt": "hi"}),
+        );
+        assert!(run("qq:A", add).await.starts_with("scheduled"));
+        let listed = run("qq:B", call("cron_list", json!({}))).await;
+        assert_eq!(listed, "no scheduled jobs");
+        let listed = run("qq:A", call("cron_list", json!({}))).await;
+        assert!(
+            listed.contains("mine") && !listed.contains("owner-job"),
+            "{listed}"
+        );
+        let out = run("qq:B", call("cron_remove", json!({"name": "mine"}))).await;
+        assert!(out.contains("no job"), "{out}");
+        let out = run("qq:A", call("cron_remove", json!({"name": "owner-job"}))).await;
+        assert!(out.contains("no job"), "{out}");
+        assert_eq!(store.job_list().unwrap().len(), 2);
+
+        let out = run("qq:A", call("memory_search", json!({"query": "秘密"}))).await;
+        assert_eq!(out, "no matching memories");
+        let out = run("qq:A", call("memory_delete", json!({"id": 1}))).await;
+        assert!(out.contains("no memory"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_approval_answers_only_the_turn_that_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = BuiltinTools::new(
+            dir.path().to_owned(),
+            ToolsConfig::default(),
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let touch = |f: &str| call("shell", json!({"command": format!("touch {f}")}));
+        // Two concurrent turns: one person approves, the other declines.
+        let (a, b) = (touch("a"), touch("b"));
+        let (yes, no) = tokio::join!(
+            owner(with_approver(Arc::new(Answer(true)), t.call(&a))),
+            owner(with_approver(Arc::new(Answer(false)), t.call(&b))),
+        );
+        assert!(yes.starts_with("exit code: 0"), "{yes}");
+        assert!(no.contains("declined"), "{no}");
+        assert!(dir.path().join("a").exists() && !dir.path().join("b").exists());
+        // Nothing is remembered: the next call asks again.
+        let c = touch("c");
+        let again = owner(with_approver(Arc::new(Answer(false)), t.call(&c))).await;
+        assert!(again.contains("declined"), "{again}");
+    }
+
+    #[test]
+    fn capture_keeps_head_and_tail_within_its_cap() {
+        let mut c = Capture::new(4);
+        for chunk in [&b"abc"[..], b"defg", b"hij"] {
+            c.push(chunk);
+        }
+        assert_eq!(c.render(), "ab\n[... 6 bytes omitted ...]\nij");
+        assert!(c.head.len() + c.tail.len() <= 4);
+        let mut short = Capture::new(16);
+        short.push(b"hello\n");
+        assert_eq!(short.render(), "hello\n");
+    }
+
+    #[tokio::test]
+    async fn shell_output_memory_is_bounded_and_both_pipes_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            shell_timeout_secs: 60,
+            max_output_bytes: 1024,
+            ..ToolsConfig::default()
+        };
+        let t = tools(dir.path(), config, false);
+        // 128 MiB on each stream at once, with invalid UTF-8 in the mix.
+        let cmd = "head -c 134217728 /dev/zero | tr '\\0' '\\377' & \
+                   head -c 134217728 /dev/zero >&2; wait; echo done";
+        let out = t.call(&call("shell", json!({"command": cmd}))).await;
+        assert!(out.starts_with("exit code: 0"), "{out}");
+        // stdout also carries "done\n"; each stream keeps 1 KiB.
+        assert!(out.contains("[... 134216709 bytes omitted ...]"), "{out}");
+        assert!(out.contains("done\n\nstderr:"), "{out}");
+        assert!(out.contains("[... 134216704 bytes omitted ...]"), "{out}");
+        assert!(out.len() < 8 * 1024, "{}", out.len());
+    }
+
+    #[tokio::test]
+    async fn endless_output_is_killed_at_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            shell_timeout_secs: 1,
+            ..ToolsConfig::default()
+        };
+        let t = tools(dir.path(), config, false);
+        let out = t
+            .call(&call("shell", json!({"command": "yes; yes >&2"})))
+            .await;
+        assert!(out.contains("timed out"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_running_shell_kills_its_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            ..ToolsConfig::default()
+        };
+        let t = tools(dir.path(), config, false);
+        let cmd = "(sleep 2; touch leaked) & sleep 30";
+        let c = call("shell", json!({"command": cmd}));
+        let _ = tokio::time::timeout(Duration::from_millis(300), t.call(&c)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!dir.path().join("leaked").exists());
     }
 
     #[test]
