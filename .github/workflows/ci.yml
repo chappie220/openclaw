@@ -27,3 +27,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+
+  aarch64-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install ziglang cargo-zigbuild
+      - run: cargo zigbuild --locked --release --target aarch64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-rs-aarch64-unknown-linux-musl
+          path: target/aarch64-unknown-linux-musl/release/openclaw-rs
