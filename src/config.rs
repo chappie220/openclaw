@@ -197,8 +197,13 @@ pub struct AgentConfig {
     pub system_prompt: String,
     /// Upper bound on model calls per user turn, so a tool loop cannot run forever.
     pub max_steps: usize,
-    /// Most recent messages sent to the model; older history stays in SQLite.
-    pub history_limit: usize,
+    /// Token budget for each model call: system prompt, tool specs and
+    /// history. Keep it below the model's context window, leaving room for
+    /// the answer. Older history stays in SQLite.
+    pub context_tokens: usize,
+    /// Model that writes the context summary, e.g. a cheaper one; default:
+    /// model.model.
+    pub summary_model: Option<String>,
 }
 
 /// What a tool category may do without asking.
@@ -315,7 +320,8 @@ impl Default for AgentConfig {
         Self {
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
             max_steps: 25,
-            history_limit: 200,
+            context_tokens: 64_000,
+            summary_model: None,
         }
     }
 }

@@ -3,6 +3,7 @@
 mod access;
 mod agent;
 mod config;
+mod context;
 mod cron;
 mod gateway;
 mod identity;
@@ -349,8 +350,19 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
     let api_key = config.api_key()?;
     let search = search::Searcher::new(&config.search, &config.model, &api_key)?;
     let review = review::Reviewer::from_config(&config.tools.review, &config.model, &api_key)?;
+    let summarizer = match &config.agent.summary_model {
+        Some(model) if !model.trim().is_empty() => Some(llm::Client::new(
+            &config::ModelConfig {
+                model: model.clone(),
+                ..config.model.clone()
+            },
+            api_key.clone(),
+        )?),
+        _ => None,
+    };
     Ok(Agent {
         model: llm::Client::new(&config.model, api_key)?,
+        summarizer,
         tools: BuiltinTools::new(workspace, config.tools.clone(), store.clone())?
             .with_search(search)
             .with_review(review),
