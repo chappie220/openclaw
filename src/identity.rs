@@ -115,7 +115,7 @@ fn no_titles(label: &str, value: &str) -> Result<()> {
 impl Store {
     pub fn identity(&self) -> Result<Option<Identity>> {
         Ok(self
-            .lock()
+            .soul()
             .query_row(
                 "SELECT name, creature, vibe, emoji, soul, updated_at FROM identity WHERE id = 1",
                 [],
@@ -150,7 +150,7 @@ impl Store {
             }
             no_titles("emoji", emoji)?;
         }
-        self.lock().execute(
+        self.soul().execute(
             "INSERT INTO identity(id, name, creature, vibe, emoji, soul, updated_at)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, creature = excluded.creature,
@@ -163,7 +163,7 @@ impl Store {
 
     /// Forgets the identity; the next conversation runs the first-start setup again.
     pub fn identity_clear(&self) -> Result<bool> {
-        Ok(self.lock().execute("DELETE FROM identity", [])? > 0)
+        Ok(self.soul().execute("DELETE FROM identity", [])? > 0)
     }
 }
 

@@ -472,7 +472,7 @@ impl Store {
         if message_id.is_empty() {
             return Ok(true);
         }
-        Ok(self.lock().execute(
+        Ok(self.runtime().execute(
             "INSERT INTO mail_seen(message_id, seen_at) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
             params![message_id, now()],
         )? > 0)
