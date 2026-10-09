@@ -222,6 +222,64 @@ pub struct ToolsConfig {
     pub shell_timeout_secs: u64,
     /// Per-stream cap on tool output returned to the model.
     pub max_output_bytes: usize,
+    /// Model review of `shell` commands before anyone is asked.
+    pub review: ReviewConfig,
+}
+
+/// Which model judges whether a shell command is dangerous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewProvider {
+    /// Every `ask` command goes to a person.
+    Off,
+    /// A decision model on OpenRouter's decisions API (`typesafe/jev-1.13`), with the OpenRouter key.
+    Openrouter,
+    /// Any OpenRouter chat model, asked for a JSON rating, with the OpenRouter key.
+    #[serde(rename = "openrouter-chat")]
+    OpenrouterChat,
+    /// TypeSafe AI's own System One API (`jev-latest` hosted, or a local Kev server).
+    Typesafe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReviewConfig {
+    pub provider: ReviewProvider,
+    /// Default: `typesafe/jev-1.13` (openrouter), model.model (openrouter-chat),
+    /// `jev-latest` (typesafe), or `kev-latest` (typesafe with base_url).
+    pub model: Option<String>,
+    /// TypeSafe key; prefer `TYPESAFE_API_KEY`. Not sent to a local base_url.
+    pub api_key: Option<String>,
+    /// Loopback origin of a local Kev System One server, e.g. http://127.0.0.1:8009.
+    pub base_url: Option<String>,
+    /// Danger probability below which a command runs without asking.
+    pub allow_below: f64,
+    /// Danger probability at or above which a command is declined without asking.
+    pub deny_at: f64,
+    pub timeout_secs: u64,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            provider: ReviewProvider::Off,
+            model: None,
+            api_key: None,
+            base_url: None,
+            allow_below: 0.2,
+            deny_at: 0.9,
+            timeout_secs: 20,
+        }
+    }
+}
+
+impl ReviewConfig {
+    pub fn api_key(&self) -> Option<String> {
+        std::env::var("TYPESAFE_API_KEY")
+            .ok()
+            .or_else(|| self.api_key.clone())
+            .filter(|k| !k.trim().is_empty())
+    }
 }
 
 impl Default for ToolsConfig {
@@ -233,6 +291,7 @@ impl Default for ToolsConfig {
             identity: Permission::Ask,
             shell_timeout_secs: 120,
             max_output_bytes: 16 * 1024,
+            review: ReviewConfig::default(),
         }
     }
 }

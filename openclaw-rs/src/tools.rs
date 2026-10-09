@@ -15,6 +15,7 @@ use crate::agent::Tools;
 use crate::config::{Permission, ToolsConfig};
 use crate::identity::Identity;
 use crate::llm::{ToolCall, ToolSpec};
+use crate::review::{Reviewer, Verdict};
 use crate::search::Searcher;
 use crate::store::Store;
 
@@ -75,6 +76,7 @@ pub struct BuiltinTools {
     config: ToolsConfig,
     store: Store,
     search: Option<Searcher>,
+    review: Option<Reviewer>,
 }
 
 #[derive(Deserialize)]
@@ -162,12 +164,56 @@ impl BuiltinTools {
             config,
             store,
             search: None,
+            review: None,
         })
     }
 
     pub fn with_search(mut self, search: Option<Searcher>) -> Self {
         self.search = search;
         self
+    }
+
+    /// Reviews `shell` commands set to `ask` before anyone is asked.
+    pub fn with_review(mut self, review: Option<Reviewer>) -> Self {
+        self.review = review;
+        self
+    }
+
+    /// Returns the auto-review note when the reviewer let the command run.
+    async fn permit_shell(&self, command: &str) -> Result<Option<String>, String> {
+        let review = match (&self.review, self.config.shell) {
+            (Some(review), Permission::Ask) => review,
+            _ => {
+                return self
+                    .permit(self.config.shell, "shell", command)
+                    .await
+                    .map(|_| None);
+            }
+        };
+        let verdict = review.review(command, &self.workspace).await;
+        let preview: String = command.chars().take(200).collect();
+        match verdict {
+            Verdict::Allow(note) => {
+                eprintln!("auto-review allowed shell ({note}): {preview}");
+                Ok(Some(format!("auto-review allowed this command ({note})")))
+            }
+            Verdict::Deny(note) => {
+                eprintln!("auto-review declined shell ({note}): {preview}");
+                Err(format!(
+                    "error: auto-review declined this command as dangerous ({note}). Do not try \
+                     the same outcome through a workaround or another tool; use a clearly safer \
+                     command, or explain the risk and ask the user to run it themselves."
+                ))
+            }
+            Verdict::Ask(note) => self
+                .permit(
+                    Permission::Ask,
+                    "shell",
+                    &format!("{command}\n  auto-review: {note}"),
+                )
+                .await
+                .map(|_| None),
+        }
     }
 
     async fn identity_set(&self, args: IdentitySetArgs) -> Result<String, String> {
@@ -318,8 +364,7 @@ impl BuiltinTools {
     }
 
     async fn shell(&self, args: ShellArgs) -> Result<String, String> {
-        self.permit(self.config.shell, "shell", &args.command)
-            .await?;
+        let reviewed = self.permit_shell(&args.command).await?;
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&args.command)
@@ -363,7 +408,8 @@ impl BuiltinTools {
         let code = status
             .code()
             .map_or_else(|| "killed by signal".into(), |c| c.to_string());
-        let mut text = format!("exit code: {code}\n");
+        let mut text = reviewed.map(|note| format!("{note}\n")).unwrap_or_default();
+        text.push_str(&format!("exit code: {code}\n"));
         if !out.is_empty() {
             text.push_str(&format!("stdout:\n{}\n", truncate(&out, cap)));
         }
@@ -849,6 +895,46 @@ mod tests {
                 .await
                 .contains("no memory")
         );
+    }
+
+    #[tokio::test]
+    async fn auto_review_runs_safe_commands_declines_dangerous_and_asks_otherwise() {
+        use crate::review::tests::fixed;
+        let dir = tempfile::tempdir().unwrap();
+        let reviewed = |danger, approve: Option<bool>| {
+            let tools = BuiltinTools::new(
+                dir.path().to_owned(),
+                ToolsConfig::default(),
+                Store::open_in_memory().unwrap(),
+            )
+            .unwrap()
+            .with_review(Some(fixed(danger)));
+            (tools, approve)
+        };
+        let run = |(tools, approve): (BuiltinTools, Option<bool>), cmd: &'static str| async move {
+            let c = call("shell", json!({"command": cmd}));
+            match approve {
+                Some(a) => with_approver(Arc::new(Answer(a)), tools.call(&c)).await,
+                None => tools.call(&c).await,
+            }
+        };
+        // Low danger runs even with nobody to ask, as on QQ, email or cron.
+        let out = run(reviewed(Some(0.01), None), "touch safe").await;
+        assert!(out.starts_with("auto-review allowed"), "{out}");
+        assert!(dir.path().join("safe").exists());
+        // High danger is declined without asking a person who would say yes.
+        let out = run(reviewed(Some(0.99), Some(true)), "touch denied").await;
+        assert!(out.contains("auto-review declined"), "{out}");
+        assert!(!dir.path().join("denied").exists());
+        // Uncertain ratings and reviewer failures go to the person.
+        let out = run(reviewed(Some(0.5), Some(false)), "touch unsure").await;
+        assert!(out.contains("the user declined"), "{out}");
+        let out = run(reviewed(None, Some(true)), "touch asked").await;
+        assert!(out.starts_with("exit code: 0"), "{out}");
+        assert!(dir.path().join("asked").exists());
+        let out = run(reviewed(None, None), "touch nobody").await;
+        assert!(out.contains("nobody can answer"), "{out}");
+        assert!(!dir.path().join("nobody").exists());
     }
 
     #[test]
