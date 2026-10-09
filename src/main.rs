@@ -197,7 +197,7 @@ async fn run(cli: Cli) -> Result<()> {
     let state = config::state_dir()?;
     let config_path = cli.config.unwrap_or_else(|| state.join("config.toml"));
     let config = Config::load(&config_path)?;
-    let store = Store::open(&state.join("state.sqlite"))?;
+    let store = Store::open(&state)?;
     match cli.command {
         Command::Memory { action } => memory(&store, action),
         Command::Identity { action } => identity(&store, action.unwrap_or(IdentityAction::Show)),

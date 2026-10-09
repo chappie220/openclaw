@@ -56,7 +56,7 @@ impl Store {
             bail!("job name, session and prompt must not be empty");
         }
         let next = next_run(schedule, now())?;
-        let conn = self.lock();
+        let conn = self.runtime();
         let inserted = conn.execute(
             "INSERT INTO jobs(name, schedule, session, prompt, next_run) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(name) DO NOTHING",
@@ -73,7 +73,7 @@ impl Store {
     }
 
     pub fn job_list(&self) -> Result<Vec<Job>> {
-        let conn = self.lock();
+        let conn = self.runtime();
         let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM jobs ORDER BY next_run"))?;
         Ok(stmt.query_map([], job)?.collect::<rusqlite::Result<_>>()?)
     }
@@ -81,7 +81,7 @@ impl Store {
     #[cfg(test)]
     pub fn job_get(&self, name: &str) -> Result<Option<Job>> {
         use rusqlite::OptionalExtension;
-        let conn = self.lock();
+        let conn = self.runtime();
         Ok(conn
             .query_row(
                 &format!("SELECT {COLUMNS} FROM jobs WHERE name = ?1"),
@@ -93,7 +93,7 @@ impl Store {
 
     pub fn job_remove(&self, name: &str) -> Result<bool> {
         Ok(self
-            .lock()
+            .runtime()
             .execute("DELETE FROM jobs WHERE name = ?1", [name])?
             > 0)
     }
@@ -101,7 +101,7 @@ impl Store {
     /// Claims every due job and advances it past `at` before it runs, so a
     /// crash or long outage triggers at most one catch-up run per job.
     pub fn job_claim_due(&self, at: i64) -> Result<Vec<Job>> {
-        let mut conn = self.lock();
+        let mut conn = self.runtime();
         let tx = conn.transaction()?;
         let due: Vec<Job> = {
             let mut stmt = tx.prepare(&format!(
@@ -124,7 +124,7 @@ impl Store {
 
     pub fn job_record(&self, id: i64, status: &str) -> Result<()> {
         let status: String = status.chars().take(500).collect();
-        self.lock().execute(
+        self.runtime().execute(
             "UPDATE jobs SET last_status = ?2 WHERE id = ?1",
             params![id, status],
         )?;

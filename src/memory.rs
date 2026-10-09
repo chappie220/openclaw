@@ -34,7 +34,7 @@ impl Store {
         if content.chars().count() > MAX_MEMORY_CHARS {
             bail!("memory is longer than {MAX_MEMORY_CHARS} characters; save a shorter summary");
         }
-        let conn = self.lock();
+        let conn = self.soul();
         conn.execute(
             "INSERT INTO memories(content, created_at) VALUES (?1, ?2)",
             params![content, now()],
@@ -44,13 +44,13 @@ impl Store {
 
     pub fn memory_delete(&self, id: i64) -> Result<bool> {
         Ok(self
-            .lock()
+            .soul()
             .execute("DELETE FROM memories WHERE id = ?1", [id])?
             > 0)
     }
 
     pub fn memory_list(&self, limit: usize) -> Result<Vec<Memory>> {
-        let conn = self.lock();
+        let conn = self.soul();
         let mut stmt =
             conn.prepare("SELECT id, content, created_at FROM memories ORDER BY id DESC LIMIT ?1")?;
         Ok(stmt
@@ -63,7 +63,7 @@ impl Store {
         let (long, short): (Vec<&str>, Vec<&str>) = query
             .split_whitespace()
             .partition(|term| term.chars().count() >= TRIGRAM);
-        let conn = self.lock();
+        let conn = self.soul();
         let mut found: Vec<Memory> = Vec::new();
         if !long.is_empty() {
             // Quoted phrases keep FTS5 operators in user text from being interpreted.

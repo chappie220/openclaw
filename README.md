@@ -192,7 +192,7 @@ book-title marks (《》), from the model and from the CLI alike.
 [tool identity_set {"name": "悟空", "creature": "石猴", "vibe": "顽皮直率，天不怕地不怕", "emoji": "🐒", "soul": "你自称俺老孙，说话爽快，称用户为师父。..."}]
 ```
 
-It is stored in `state.sqlite` and shared by every session, the Web UI, QQ
+It is stored in `soul.sqlite` and shared by every session, the Web UI, QQ
 and email. The first one is saved without asking; later changes through the
 `identity_set` tool follow `tools.identity` (`ask` by default, so QQ and email
 users cannot change it). From the shell:
@@ -229,7 +229,17 @@ gets `memory_save`, `memory_search` and `memory_delete` tools.
 State lives in `~/.openclaw-rs` (override with `OPENCLAW_RS_HOME`):
 
 - `config.toml`: optional settings
-- `state.sqlite`: sessions, messages, memories and scheduled jobs
+- `soul.sqlite`: identity and long-term memories
+- `chats.sqlite`: sessions and their full message history
+- `runtime.sqlite`: scheduled jobs and mail already handled (deleting it makes
+  the email channel answer old mail again)
+
+Each file can be backed up, moved or deleted on its own: copy `soul.sqlite`
+to another host to bring the same agent there without its chats, or delete
+`chats.sqlite` to start every conversation fresh. Copy a file while the
+Gateway is stopped, or with `sqlite3 soul.sqlite ".backup soul-backup.sqlite"`.
+An older single `state.sqlite` is split into these on the first start and kept
+as `state.sqlite.migrated`.
 
 ```toml
 [model]
