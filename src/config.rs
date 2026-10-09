@@ -201,6 +201,9 @@ pub struct AgentConfig {
     /// history. Keep it below the model's context window, leaving room for
     /// the answer. Older history stays in SQLite.
     pub context_tokens: usize,
+    /// Model that writes the context summary, e.g. a cheaper one; default:
+    /// model.model.
+    pub summary_model: Option<String>,
 }
 
 /// What a tool category may do without asking.
@@ -318,6 +321,7 @@ impl Default for AgentConfig {
             system_prompt: DEFAULT_SYSTEM_PROMPT.into(),
             max_steps: 25,
             context_tokens: 64_000,
+            summary_model: None,
         }
     }
 }

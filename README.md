@@ -367,6 +367,7 @@ request_timeout_secs = 300
 system_prompt = "You are a helpful personal assistant running on OpenClaw."
 max_steps = 25       # model calls per turn before giving up
 context_tokens = 64000  # token budget per model call; keep below the model's window
+# summary_model = "..."  # model that writes the context summary; default: model.model
 
 [tools]
 # workspace = "/path"   # default: <state dir>/workspace
@@ -383,7 +384,9 @@ assistant's replies. When a conversation outgrows `context_tokens`, it is cut
 back to half the budget: the oldest turns are folded by the model into a
 running summary sent at the start of the window.
 The full history stays in `chats.sqlite`. If the summary call fails, nothing
-is moved and the next call tries again.
+is moved and the next call tries again. Send `/compact` in any chat (CLI, Web
+UI, QQ, email) to fold the whole conversation into the summary now; the
+command itself never reaches the model.
 
 Tools: `read_file`, `list_dir`, `write_file`, `edit_file` (one exact, unique
 replacement) and `shell` (`sh -c` in the workspace; the whole process group is
