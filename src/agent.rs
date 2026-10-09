@@ -6,8 +6,8 @@ use crate::access::{self, Actor};
 use crate::config::AgentConfig;
 use crate::context;
 use crate::identity;
-use crate::llm::{ChatMessage, Client, Completion, Role, ToolCall, ToolSpec};
-use crate::store::{SessionContext, Store};
+use crate::llm::{ChatMessage, Client, Completion, ToolCall, ToolSpec};
+use crate::store::Store;
 
 tokio::task_local! {
     static CURRENT_SESSION: String;
@@ -179,42 +179,6 @@ impl<M: Model, T: Tools> Agent<M, T> {
         ))
     }
 
-    /// Has the summary model write notes on the tool output of the turn
-    /// before the current one, which later turns see instead of that output.
-    /// Written once per turn; on failure the turn goes without and the next
-    /// call tries again.
-    async fn note_previous_turn(&self, ctx: &mut SessionContext) {
-        let users: Vec<usize> = ctx
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, m))| m.role == Role::User)
-            .map(|(i, _)| i)
-            .collect();
-        let [.., previous, current] = users[..] else {
-            return;
-        };
-        let (start_id, _) = ctx.messages[previous];
-        let turn = &ctx.messages[previous..current];
-        if ctx.notes.contains_key(&start_id) || !turn.iter().any(|(_, m)| m.role == Role::Tool) {
-            return;
-        }
-        let turn: Vec<ChatMessage> = turn.iter().map(|(_, m)| m.clone()).collect();
-        let budget = self.config.context_tokens;
-        let note = match context::tool_note(self.summarizer(), &turn, budget, budget / 64).await {
-            Ok(note) => note,
-            Err(err) => {
-                eprintln!("context: cannot write notes on the last turn's tool output: {err:#}");
-                return;
-            }
-        };
-        if let Err(err) = self.store.set_turn_note(start_id, &note) {
-            eprintln!("context: cannot save tool notes: {err:#}");
-            return;
-        }
-        ctx.notes.insert(start_id, note);
-    }
-
     /// The history to send after the system prompt, within the token budget.
     /// Turns that no longer fit are folded into the session's summary first;
     /// if that fails they are left out of this call only and the next call
@@ -226,14 +190,13 @@ impl<M: Model, T: Tools> Agent<M, T> {
         tool_json: &str,
     ) -> Result<Vec<ChatMessage>> {
         let budget = self.config.context_tokens;
-        let mut ctx = self.store.context(session_id)?;
-        self.note_previous_turn(&mut ctx).await;
+        let ctx = self.store.context(session_id)?;
         let summary_limit = budget / 16;
         let summary_tokens = ctx.summary.as_deref().map_or(0, context::estimate);
         let overhead = context::estimate(system)
             + context::estimate(tool_json)
             + summary_tokens.max(summary_limit);
-        let fitted = context::fit(ctx.messages, &ctx.notes, ctx.marks, overhead, budget);
+        let fitted = context::fit(ctx.messages, ctx.marks, overhead, budget);
         let mut summary = ctx.summary;
         let mut save = fitted.marks != ctx.marks;
         if !fitted.dropped.is_empty() {
@@ -478,88 +441,6 @@ mod tests {
             agent.store.context(id).unwrap().summary.as_deref(),
             Some("CHEAP")
         );
-    }
-
-    /// Calls `echo` when the user says "run", answers "done" otherwise, and
-    /// writes "NOTE" when asked for tool notes.
-    struct Tooling {
-        notes: Mutex<usize>,
-        seen: Mutex<Vec<Vec<ChatMessage>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Model for Tooling {
-        async fn complete(
-            &self,
-            messages: &[ChatMessage],
-            _tools: &[ToolSpec],
-            _on_text: &mut (dyn for<'t> FnMut(&'t str) + Send),
-        ) -> Result<Completion> {
-            if messages[0]
-                .content
-                .as_deref()
-                .is_some_and(|c| c.starts_with("You write short notes"))
-            {
-                assert!(messages[1].content.as_deref().unwrap().contains("echo:{}"));
-                *self.notes.lock().unwrap() += 1;
-                return Ok(Completion {
-                    text: "NOTE".into(),
-                    ..Default::default()
-                });
-            }
-            self.seen.lock().unwrap().push(messages.to_vec());
-            let last = messages.last().unwrap();
-            if last.role == crate::llm::Role::User && last.content.as_deref() == Some("run") {
-                return Ok(Completion {
-                    tool_calls: vec![ToolCall {
-                        id: "c1".into(),
-                        kind: "function".into(),
-                        function: FunctionCall {
-                            name: "echo".into(),
-                            arguments: "{}".into(),
-                        },
-                    }],
-                    ..Default::default()
-                });
-            }
-            Ok(Completion {
-                text: "done".into(),
-                ..Default::default()
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn later_turns_get_notes_instead_of_tool_output() {
-        let agent = Agent {
-            model: Tooling {
-                notes: Mutex::new(0),
-                seen: Mutex::new(Vec::new()),
-            },
-            summarizer: None,
-            tools: Echo,
-            store: Store::open_in_memory().unwrap(),
-            config: AgentConfig::default(),
-        };
-        for input in ["run", "next", "again"] {
-            agent
-                .run_turn(Actor::owner(access::CLI), "s", input, &mut |_| {})
-                .await
-                .unwrap();
-        }
-        assert_eq!(*agent.model.notes.lock().unwrap(), 1, "written once");
-        let seen = agent.model.seen.lock().unwrap();
-        let last = seen.last().unwrap();
-        let contents: Vec<_> = last[1..]
-            .iter()
-            .map(|m| m.content.clone().unwrap_or_default())
-            .collect();
-        assert_eq!(contents.len(), 5, "{contents:?}");
-        assert_eq!(contents[0], "run");
-        assert!(contents[1].starts_with("done\n\n[Notes on this turn's tool results"));
-        assert!(contents[1].ends_with("NOTE"));
-        assert_eq!(&contents[2..], ["next", "done", "again"]);
-        assert!(last.iter().all(|m| m.tool_calls.is_none()));
     }
 
     #[tokio::test]
