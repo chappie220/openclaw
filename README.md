@@ -377,6 +377,12 @@ shell_timeout_secs = 120
 max_output_bytes = 16384  # per stream; also the most shell output held in memory
 ```
 
+When a conversation outgrows `context_tokens`, it is cut back to half the
+budget: old tool output becomes a one-line stub, and the oldest turns are
+folded by the model into a running summary sent at the start of the window.
+The full history stays in `chats.sqlite`. If the summary call fails, nothing
+is moved and the next call tries again.
+
 Tools: `read_file`, `list_dir`, `write_file`, `edit_file` (one exact, unique
 replacement) and `shell` (`sh -c` in the workspace; the whole process group is
 killed on timeout or when the turn is cancelled). Shell stdout and stderr are

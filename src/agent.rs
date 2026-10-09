@@ -100,15 +100,8 @@ impl<M: Model, T: Tools> Agent<M, T> {
             let can_set = access::current().is_some_and(|a| a.can(access::Capability::Identity));
             let system =
                 identity::system_prompt(&self.config.system_prompt, identity.as_ref(), can_set);
-            let overhead = context::estimate(&system) + context::estimate(&tool_json);
-            let (history, marks) = self.store.context(session_id)?;
-            let (window, fitted) =
-                context::fit(history, marks, overhead, self.config.context_tokens);
-            if fitted != marks {
-                self.store.set_marks(session_id, fitted)?;
-            }
-            let mut messages = vec![ChatMessage::system(system)];
-            messages.extend(window);
+            let mut messages = vec![ChatMessage::system(&system)];
+            messages.extend(self.window(session_id, &system, &tool_json).await?);
             let completion = self
                 .model
                 .complete(&messages, &specs, &mut |text| {
@@ -144,11 +137,64 @@ impl<M: Model, T: Tools> Agent<M, T> {
             self.config.max_steps
         )
     }
+
+    /// The history to send after the system prompt, within the token budget.
+    /// Turns that no longer fit are folded into the session's summary first;
+    /// if that fails they are left out of this call only and the next call
+    /// tries again, so nothing is dropped without a summary.
+    async fn window(
+        &self,
+        session_id: i64,
+        system: &str,
+        tool_json: &str,
+    ) -> Result<Vec<ChatMessage>> {
+        let budget = self.config.context_tokens;
+        let ctx = self.store.context(session_id)?;
+        let summary_limit = budget / 16;
+        let summary_tokens = ctx.summary.as_deref().map_or(0, context::estimate);
+        let overhead = context::estimate(system)
+            + context::estimate(tool_json)
+            + summary_tokens.max(summary_limit);
+        let fitted = context::fit(ctx.messages, ctx.marks, overhead, budget);
+        let mut summary = ctx.summary;
+        let mut save = fitted.marks != ctx.marks;
+        if !fitted.dropped.is_empty() {
+            match context::summarize(
+                &self.model,
+                summary.as_deref(),
+                &fitted.dropped,
+                budget,
+                summary_limit,
+            )
+            .await
+            {
+                Ok(text) => summary = Some(text),
+                Err(err) => {
+                    eprintln!(
+                        "context: cannot summarize older messages, retrying next call: {err:#}"
+                    );
+                    save = false;
+                }
+            }
+        }
+        if save {
+            self.store
+                .set_context(session_id, fitted.marks, summary.as_deref())?;
+        }
+        Ok(summary
+            .as_deref()
+            .map(context::summary_message)
+            .into_iter()
+            .chain(fitted.messages)
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use anyhow::Context as _;
 
     use super::*;
     use crate::llm::FunctionCall;
@@ -232,6 +278,99 @@ mod tests {
             .collect();
         use crate::llm::Role::*;
         assert_eq!(roles, vec![User, Assistant, Tool, Assistant]);
+    }
+
+    /// Answers "ok", or `summary` when asked to summarize; keeps every
+    /// request that was not a summary.
+    struct Recorder {
+        summary: Option<&'static str>,
+        seen: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for Recorder {
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[ToolSpec],
+            _on_text: &mut (dyn for<'t> FnMut(&'t str) + Send),
+        ) -> Result<Completion> {
+            let first = messages[0].content.as_deref().unwrap_or("");
+            if first.starts_with("You keep the running summary") {
+                let text = self.summary.context("summary refused")?;
+                return Ok(Completion {
+                    text: text.into(),
+                    ..Default::default()
+                });
+            }
+            self.seen.lock().unwrap().push(messages.to_vec());
+            Ok(Completion {
+                text: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn long_chat(summary: Option<&'static str>) -> Agent<Recorder, Echo> {
+        let agent = Agent {
+            model: Recorder {
+                summary,
+                seen: Mutex::new(Vec::new()),
+            },
+            tools: Echo,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig {
+                context_tokens: 4000,
+                ..AgentConfig::default()
+            },
+        };
+        // Each turn is about 500 tokens, so the budget overflows by turn 8.
+        for turn in 0..8 {
+            let input = format!("turn {turn} {}", "x".repeat(2000));
+            agent
+                .run_turn(Actor::owner(access::CLI), "s", &input, &mut |_| {})
+                .await
+                .unwrap();
+        }
+        agent
+    }
+
+    #[tokio::test]
+    async fn folds_dropped_turns_into_a_summary() {
+        let agent = long_chat(Some("SUMMARY")).await;
+        let seen = agent.model.seen.lock().unwrap();
+        let last = seen.last().unwrap();
+        let summary = last[1].content.as_deref().unwrap();
+        assert!(summary.starts_with("[Summary of the earlier conversation"));
+        assert!(summary.ends_with("SUMMARY"));
+        assert!(
+            !last
+                .iter()
+                .any(|m| m.content.as_deref().unwrap_or("").starts_with("turn 0 "))
+        );
+        let id = agent.store.session_id("s").unwrap();
+        let ctx = agent.store.context(id).unwrap();
+        assert_eq!(ctx.summary.as_deref(), Some("SUMMARY"));
+        assert!(ctx.marks.start > 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_moves_nothing() {
+        let agent = long_chat(None).await;
+        let seen = agent.model.seen.lock().unwrap();
+        let last = seen.last().unwrap();
+        assert!(
+            last.iter()
+                .all(|m| !m.content.as_deref().unwrap_or("").starts_with("[Summary"))
+        );
+        assert!(
+            last.iter()
+                .all(|m| !m.content.as_deref().unwrap_or("").starts_with("turn 0 "))
+        );
+        let id = agent.store.session_id("s").unwrap();
+        let ctx = agent.store.context(id).unwrap();
+        assert_eq!(ctx.summary, None);
+        assert_eq!(ctx.marks, context::Marks::default());
     }
 
     #[tokio::test]

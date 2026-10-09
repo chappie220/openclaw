@@ -117,6 +117,10 @@ CREATE INDEX messages_by_session ON messages(session_id, id);
 ALTER TABLE sessions ADD COLUMN context_start INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sessions ADD COLUMN context_pruned_before INTEGER NOT NULL DEFAULT 0;
 "#,
+        r#"
+-- Running summary of the messages before context_start.
+ALTER TABLE sessions ADD COLUMN context_summary TEXT;
+"#,
     ],
     legacy: &[
         ("sessions", "id, name, created_at, updated_at"),
@@ -209,6 +213,14 @@ pub struct SessionSummary {
     pub name: String,
     pub messages: i64,
     pub updated_at: i64,
+}
+
+/// What `Store::context` returns.
+#[derive(Debug)]
+pub struct SessionContext {
+    pub messages: Vec<(i64, ChatMessage)>,
+    pub marks: Marks,
+    pub summary: Option<String>,
 }
 
 pub(crate) fn now() -> i64 {
@@ -717,18 +729,22 @@ impl Store {
         ))
     }
 
-    /// The session's context marks and every message from the window start
-    /// on, with ids, for `context::fit`.
-    pub fn context(&self, session_id: i64) -> Result<(Vec<(i64, ChatMessage)>, Marks)> {
+    /// The session's context marks, its summary of what came before them,
+    /// and every message from the window start on, with ids.
+    pub fn context(&self, session_id: i64) -> Result<SessionContext> {
         let conn = self.chats();
-        let marks = conn.query_row(
-            "SELECT context_start, context_pruned_before FROM sessions WHERE id = ?1",
+        let (marks, summary) = conn.query_row(
+            "SELECT context_start, context_pruned_before, context_summary FROM sessions
+             WHERE id = ?1",
             [session_id],
             |row| {
-                Ok(Marks {
-                    start: row.get(0)?,
-                    pruned_before: row.get(1)?,
-                })
+                Ok((
+                    Marks {
+                        start: row.get(0)?,
+                        pruned_before: row.get(1)?,
+                    },
+                    row.get(2)?,
+                ))
             },
         )?;
         let mut stmt = conn.prepare(
@@ -736,13 +752,18 @@ impl Store {
              WHERE session_id = ?1 AND id >= ?2 ORDER BY id ASC",
         )?;
         let messages = read_messages(&mut stmt, params![session_id, marks.start])?;
-        Ok((messages, marks))
+        Ok(SessionContext {
+            messages,
+            marks,
+            summary,
+        })
     }
 
-    pub fn set_marks(&self, session_id: i64, marks: Marks) -> Result<()> {
+    pub fn set_context(&self, session_id: i64, marks: Marks, summary: Option<&str>) -> Result<()> {
         self.chats().execute(
-            "UPDATE sessions SET context_start = ?2, context_pruned_before = ?3 WHERE id = ?1",
-            params![session_id, marks.start, marks.pruned_before],
+            "UPDATE sessions SET context_start = ?2, context_pruned_before = ?3,
+             context_summary = ?4 WHERE id = ?1",
+            params![session_id, marks.start, marks.pruned_before, summary],
         )?;
         Ok(())
     }
@@ -859,18 +880,20 @@ mod tests {
         for text in ["a", "b", "c"] {
             store.append(id, &ChatMessage::user(text)).unwrap();
         }
-        let (all, marks) = store.context(id).unwrap();
-        assert_eq!(marks, Marks::default());
-        assert_eq!(all.len(), 3);
+        let all = store.context(id).unwrap();
+        assert_eq!(all.marks, Marks::default());
+        assert_eq!(all.summary, None);
+        assert_eq!(all.messages.len(), 3);
         let marks = Marks {
-            start: all[1].0,
-            pruned_before: all[2].0,
+            start: all.messages[1].0,
+            pruned_before: all.messages[2].0,
         };
-        store.set_marks(id, marks).unwrap();
-        let (rest, again) = store.context(id).unwrap();
-        assert_eq!(again, marks);
-        assert_eq!(rest[0].1.content.as_deref(), Some("b"));
-        assert_eq!(rest.len(), 2);
+        store.set_context(id, marks, Some("said a")).unwrap();
+        let rest = store.context(id).unwrap();
+        assert_eq!(rest.marks, marks);
+        assert_eq!(rest.summary.as_deref(), Some("said a"));
+        assert_eq!(rest.messages[0].1.content.as_deref(), Some("b"));
+        assert_eq!(rest.messages.len(), 2);
     }
 
     fn legacy_file(dir: &Path) {
