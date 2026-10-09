@@ -239,7 +239,30 @@ to another host to bring the same agent there without its chats, or delete
 `chats.sqlite` to start every conversation fresh. Copy a file while the
 Gateway is stopped, or with `sqlite3 soul.sqlite ".backup soul-backup.sqlite"`.
 An older single `state.sqlite` is split into these on the first start and kept
-as `state.sqlite.migrated`.
+as `state.sqlite.migrated` (or `state.sqlite.migrated.<unix time>` if that
+name is taken, so an earlier backup is never replaced).
+
+The split is safe to interrupt at any point (crash, power loss, `kill -9`):
+
+1. Each new file is built as `<name>.sqlite.migrating`, flushed to disk, and
+   checked: SQLite integrity check, foreign keys, schema version and the row
+   count of every copied table against `state.sqlite`.
+2. Only then is `state.sqlite.migration` written: a journal of what was
+   verified and the size and modification time of `state.sqlite`.
+3. The files are renamed into place, `state.sqlite` is archived, and the
+   journal is removed, each step flushed before the next.
+
+On the next start, leftover `.migrating` files without a journal are
+discarded and the split starts over. With a journal, the start finishes the
+remaining renames after re-checking each file; if a copy no longer checks out
+or `state.sqlite` changed in the meantime, and `state.sqlite` is still in
+place, the copies are discarded and the split starts over. A split file is
+only ever removed when it still holds exactly what the migration staged, and
+`state.sqlite` is never modified apart from folding in its WAL. If the
+Gateway refuses to start, the error names the files to move aside; the data
+is always still in `state.sqlite` or its `.migrated` backup. Having both
+`state.sqlite` and a split file without a journal is treated as a conflict
+and nothing is touched.
 
 ```toml
 [model]

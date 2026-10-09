@@ -182,11 +182,195 @@ fn guard(conn: &Shared) -> MutexGuard<'_, Connection> {
     conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Splits a pre-split `state.sqlite` into the three files, once. Each copy is
-/// built under a temporary name and renamed only when all three are complete,
-/// so an interrupted run leaves the old file in charge and simply runs again.
+/// Records a verified staging so a restart can finish or undo the commit.
+const JOURNAL: &str = "state.sqlite.migration";
+
+/// Where a migration stops in tests; production never stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Checkpointed,
+    Created(&'static str),
+    Copied(&'static str),
+    Staged,
+    Journaled,
+    Renamed(&'static str),
+    Archived,
+}
+
+type Hook<'a> = &'a mut dyn FnMut(Step) -> Result<()>;
+
+/// What a verified staging looked like, written before anything is renamed.
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct Journal {
+    /// Size and modification time of `state.sqlite` when it was copied.
+    source: Fingerprint,
+    /// Name the legacy file is archived under.
+    backup: String,
+    files: Vec<StagedFile>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct Fingerprint {
+    len: u64,
+    modified_ns: u128,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+struct StagedFile {
+    file: String,
+    user_version: i64,
+    /// `(table, rows)` for every table copied from the legacy file.
+    rows: Vec<(String, i64)>,
+}
+
+fn fingerprint(path: &Path) -> Result<Fingerprint> {
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("cannot stat {}", path.display()))?;
+    let modified_ns = meta
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(Fingerprint {
+        len: meta.len(),
+        modified_ns,
+    })
+}
+
+fn staging(dir: &Path, schema: &Schema) -> std::path::PathBuf {
+    dir.join(format!("{}.migrating", schema.file))
+}
+
+/// Removes a database file and its WAL companions, if present.
+fn remove_db(path: &Path) -> Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let file = format!("{}{suffix}", path.display());
+        match std::fs::remove_file(&file) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                return Err(err).with_context(|| format!("cannot remove {file}"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("cannot flush {}", path.display()))
+}
+
+/// Makes renames and creations in `dir` durable.
+fn sync_dir(dir: &Path) -> Result<()> {
+    sync_file(dir)
+}
+
+/// The rows each table holds, `None` for tables the file does not have.
+fn row_counts(conn: &Connection, db: &str, schema: &Schema) -> Result<Vec<(String, i64)>> {
+    let mut counts = Vec::new();
+    for (table, _) in schema.legacy {
+        let exists: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {db}.sqlite_master WHERE type = 'table' AND name = ?1)"
+            ),
+            [table],
+            |row| row.get(0),
+        )?;
+        let rows = if exists {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {db}.{table}"), [], |row| {
+                row.get(0)
+            })?
+        } else {
+            0
+        };
+        counts.push((table.to_string(), rows));
+    }
+    Ok(counts)
+}
+
+/// Checks a staged file is intact and holds what the journal expects.
+fn verify_staged(path: &Path, schema: &Schema, expected: &StagedFile) -> Result<()> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!("{} failed its integrity check: {integrity}", path.display());
+    }
+    let broken: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if broken > 0 {
+        bail!("{} has {broken} broken foreign keys", path.display());
+    }
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let actual = StagedFile {
+        file: schema.file.into(),
+        user_version: version,
+        rows: row_counts(&conn, "main", schema)?,
+    };
+    if &actual != expected {
+        bail!(
+            "{} does not match what was staged: {actual:?} != {expected:?}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Splits a pre-split `state.sqlite` into the three files, once.
+///
+/// Each file is built and verified under a `.migrating` name; a journal
+/// recording what was verified is flushed before the first rename, and the
+/// legacy file is archived only after every file is in place. A restart after
+/// an interruption at any point either finishes the commit or, while
+/// `state.sqlite` is still there, discards the copies and starts over.
 fn migrate_legacy(dir: &Path) -> Result<()> {
+    migrate_legacy_with(dir, &mut |_| Ok(()))
+}
+
+fn migrate_legacy_with(dir: &Path, hook: Hook) -> Result<()> {
     let legacy = dir.join(LEGACY_FILE);
+    let journal_path = dir.join(JOURNAL);
+    if journal_path.exists() {
+        let journal: Result<Journal> = std::fs::read(&journal_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
+            .with_context(|| format!("cannot read {}", journal_path.display()));
+        match journal {
+            Ok(journal) => match commit(dir, &journal, hook) {
+                Ok(()) => return Ok(()),
+                Err(err) if legacy.exists() => {
+                    eprintln!(
+                        "cannot finish the interrupted state migration ({err:#}); starting it over"
+                    );
+                    rollback(dir, &journal)?;
+                }
+                Err(err) => {
+                    return Err(err.context(format!(
+                        "the state migration was interrupted after {} was archived and cannot be \
+                         finished; restore it as {} from the backup named in {}, remove the split \
+                         files and that journal, then start again",
+                        LEGACY_FILE,
+                        legacy.display(),
+                        journal_path.display()
+                    )));
+                }
+            },
+            // The journal is only renamed into place once complete, so an
+            // unreadable one was damaged afterwards: trust nothing it says.
+            Err(err) if legacy.exists() => {
+                return Err(err.context(format!(
+                    "the state migration journal is damaged; {} is untouched, so remove {} and the \
+                     split .sqlite files, then start again",
+                    legacy.display(),
+                    journal_path.display()
+                )));
+            }
+            Err(err) => return Err(err),
+        }
+    }
     if !legacy.exists() {
         return Ok(());
     }
@@ -201,47 +385,156 @@ fn migrate_legacy(dir: &Path) -> Result<()> {
             existing.display()
         );
     }
+    let journal = stage(dir, &legacy, hook)?;
+    let temp = dir.join(format!("{JOURNAL}.tmp"));
+    std::fs::write(&temp, serde_json::to_vec_pretty(&journal)?)
+        .with_context(|| format!("cannot write {}", temp.display()))?;
+    sync_file(&temp)?;
+    std::fs::rename(&temp, &journal_path)?;
+    sync_dir(dir)?;
+    hook(Step::Journaled)?;
+    commit(dir, &journal, hook)
+}
+
+/// Copies the legacy file into verified `.migrating` files.
+fn stage(dir: &Path, legacy: &Path, hook: Hook) -> Result<Journal> {
     // Fold the WAL into the file so the copy and the kept backup are complete.
-    Connection::open(&legacy)
-        .with_context(|| format!("cannot open {}", legacy.display()))?
-        .pragma_update(None, "journal_mode", "DELETE")?;
-    let temp = |schema: &Schema| dir.join(format!("{}.migrating", schema.file));
+    let source =
+        Connection::open(legacy).with_context(|| format!("cannot open {}", legacy.display()))?;
+    source.pragma_update(None, "journal_mode", "DELETE")?;
+    let integrity: String = source.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        bail!(
+            "{} failed its integrity check ({integrity}); repair it with sqlite3 .recover first",
+            legacy.display()
+        );
+    }
+    drop(source);
+    hook(Step::Checkpointed)?;
+    let mut files = Vec::new();
     for schema in SCHEMAS {
-        let path = temp(schema);
-        for suffix in ["", "-wal", "-shm"] {
-            let file = format!("{}{suffix}", path.display());
-            match std::fs::remove_file(&file) {
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(err).with_context(|| format!("cannot remove {file}"));
-                }
-                _ => {}
-            }
-        }
+        let path = staging(dir, schema);
+        // Leftovers of an earlier interrupted run are never trusted.
+        remove_db(&path)?;
         let conn = init(Connection::open(&path)?, schema)?;
-        copy_legacy(&conn, &legacy, schema)
+        hook(Step::Created(schema.file))?;
+        let expected = copy_legacy(&conn, legacy, schema)
             .with_context(|| format!("cannot migrate {} into {}", legacy.display(), schema.file))?;
         // Leave a single self-contained file to rename; opening it restores WAL.
         conn.pragma_update(None, "journal_mode", "DELETE")?;
+        drop(conn);
+        sync_file(&path)?;
+        hook(Step::Copied(schema.file))?;
+        let staged = StagedFile {
+            file: schema.file.into(),
+            user_version: schema.migrations.len() as i64,
+            rows: expected,
+        };
+        verify_staged(&path, schema, &staged)?;
+        files.push(staged);
     }
-    for schema in SCHEMAS {
-        std::fs::rename(temp(schema), dir.join(schema.file))?;
+    sync_dir(dir)?;
+    hook(Step::Staged)?;
+    let mut backup = LEGACY_BACKUP.to_string();
+    if dir.join(&backup).exists() {
+        // Never replace the backup of an earlier migration.
+        backup = format!("{LEGACY_BACKUP}.{}", now());
     }
-    std::fs::rename(&legacy, dir.join(LEGACY_BACKUP))?;
+    Ok(Journal {
+        source: fingerprint(legacy)?,
+        backup,
+        files,
+    })
+}
+
+/// Moves verified files into place and archives the legacy file. Every step
+/// can be repeated, so an interrupted commit is finished by running it again.
+fn commit(dir: &Path, journal: &Journal, hook: Hook) -> Result<()> {
+    let legacy = dir.join(LEGACY_FILE);
+    let backup = dir.join(&journal.backup);
+    let wal = dir.join(format!("{LEGACY_FILE}-wal"));
+    if legacy.exists()
+        && (fingerprint(&legacy)? != journal.source
+            || std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0))
+    {
+        bail!("{} changed after it was staged", legacy.display());
+    }
+    if !legacy.exists() && !backup.exists() {
+        bail!(
+            "neither {} nor its backup {} exists",
+            legacy.display(),
+            backup.display()
+        );
+    }
+    for staged in &journal.files {
+        let schema = SCHEMAS
+            .iter()
+            .find(|schema| schema.file == staged.file)
+            .with_context(|| format!("unknown file {} in the journal", staged.file))?;
+        let temp = staging(dir, schema);
+        let target = dir.join(schema.file);
+        match (temp.exists(), target.exists()) {
+            (true, false) => {
+                verify_staged(&temp, schema, staged)?;
+                std::fs::rename(&temp, &target)?;
+                sync_dir(dir)?;
+                hook(Step::Renamed(schema.file))?;
+            }
+            (false, true) => verify_staged(&target, schema, staged)?,
+            (true, true) => bail!(
+                "both {} and {} exist; the migration did not create {}",
+                temp.display(),
+                target.display(),
+                target.display()
+            ),
+            (false, false) => bail!("{} is missing", temp.display()),
+        }
+    }
+    if legacy.exists() {
+        std::fs::rename(&legacy, &backup)?;
+        sync_dir(dir)?;
+    }
+    hook(Step::Archived)?;
+    std::fs::remove_file(dir.join(JOURNAL))?;
+    sync_dir(dir)?;
     Ok(())
 }
 
-fn copy_legacy(conn: &Connection, legacy: &Path, schema: &Schema) -> Result<()> {
+/// Undoes an unfinished commit while `state.sqlite` is still in charge.
+/// A split file is removed only when it still holds exactly what was staged.
+fn rollback(dir: &Path, journal: &Journal) -> Result<()> {
+    for staged in &journal.files {
+        let Some(schema) = SCHEMAS.iter().find(|schema| schema.file == staged.file) else {
+            continue;
+        };
+        let target = dir.join(schema.file);
+        if target.exists() {
+            verify_staged(&target, schema, staged).with_context(|| {
+                format!(
+                    "{} is not the copy this migration made; move it aside, remove {}, then \
+                     start again",
+                    target.display(),
+                    dir.join(JOURNAL).display()
+                )
+            })?;
+            remove_db(&target)?;
+        }
+        remove_db(&staging(dir, schema))?;
+    }
+    std::fs::remove_file(dir.join(JOURNAL))?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
+/// Copies `schema`'s tables and returns how many rows the legacy file held.
+fn copy_legacy(conn: &Connection, legacy: &Path, schema: &Schema) -> Result<Vec<(String, i64)>> {
     let legacy = legacy.to_str().context("state path is not valid UTF-8")?;
     conn.execute("ATTACH DATABASE ?1 AS legacy", [legacy])?;
     let tx = conn.unchecked_transaction()?;
-    for (table, columns) in schema.legacy {
+    let counts = row_counts(&tx, "legacy", schema)?;
+    for ((table, columns), (_, rows)) in schema.legacy.iter().zip(&counts) {
         // Older files predate some tables; there is nothing to copy for those.
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM legacy.sqlite_master WHERE type = 'table' AND name = ?1)",
-            [table],
-            |row| row.get(0),
-        )?;
-        if exists {
+        if *rows > 0 {
             tx.execute(
                 &format!(
                     "INSERT INTO main.{table}({columns}) SELECT {columns} FROM legacy.{table}"
@@ -252,7 +545,7 @@ fn copy_legacy(conn: &Connection, legacy: &Path, schema: &Schema) -> Result<()> 
     }
     tx.commit()?;
     conn.execute("DETACH DATABASE legacy", [])?;
-    Ok(())
+    Ok(counts)
 }
 
 impl Store {
@@ -498,5 +791,197 @@ mod tests {
         legacy_file(dir.path());
         let err = Store::open(dir.path()).err().unwrap().to_string();
         assert!(err.contains("move one of them aside"), "{err}");
+    }
+
+    /// Data `legacy_file` wrote, as the split store sees it.
+    fn assert_migrated(store: &Store) {
+        let id = store.session_id("main").unwrap();
+        assert_eq!(id, 7);
+        let history = store.history(id, 10).unwrap();
+        assert_eq!(history.len(), 1, "no duplicate import");
+        assert_eq!(history[0].content.as_deref(), Some("hi"));
+        assert_eq!(store.memory_search("乌龙茶", 5).unwrap().len(), 1);
+        assert_eq!(store.identity().unwrap().unwrap().name, "悟空");
+        assert_eq!(store.job_list().unwrap().len(), 1);
+        assert!(!store.mail_first_sight("<a@b>").unwrap());
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("migrating") || n == JOURNAL || n.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn migration_recovers_from_an_interruption_at_every_step() {
+        let mut stops = Vec::new();
+        for stop_at in 0.. {
+            let dir = tempfile::tempdir().unwrap();
+            legacy_file(dir.path());
+            let mut seen = 0;
+            let mut stopped = None;
+            let result = migrate_legacy_with(dir.path(), &mut |step| {
+                seen += 1;
+                if seen > stop_at {
+                    stopped = Some(step);
+                    bail!("interrupted at {step:?}");
+                }
+                Ok(())
+            });
+            let Some(step) = stopped else {
+                result.unwrap();
+                break;
+            };
+            assert!(result.is_err());
+            stops.push(step);
+            // The legacy data stays reachable at every point: either the
+            // original file or its backup is there.
+            assert!(
+                dir.path().join(LEGACY_FILE).exists() || dir.path().join(LEGACY_BACKUP).exists(),
+                "{step:?}"
+            );
+            let store = Store::open(dir.path()).unwrap_or_else(|e| panic!("{step:?}: {e:#}"));
+            assert_migrated(&store);
+            drop(store);
+            assert!(
+                leftovers(dir.path()).is_empty(),
+                "{step:?}: {:?}",
+                leftovers(dir.path())
+            );
+            assert!(!dir.path().join(LEGACY_FILE).exists(), "{step:?}");
+            assert!(dir.path().join(LEGACY_BACKUP).exists(), "{step:?}");
+            // And again: restarting a finished migration changes nothing.
+            assert_migrated(&Store::open(dir.path()).unwrap());
+        }
+        for step in [
+            Step::Checkpointed,
+            Step::Created("soul.sqlite"),
+            Step::Copied("runtime.sqlite"),
+            Step::Staged,
+            Step::Journaled,
+            Step::Renamed("soul.sqlite"),
+            Step::Renamed("chats.sqlite"),
+            Step::Renamed("runtime.sqlite"),
+            Step::Archived,
+        ] {
+            assert!(stops.contains(&step), "{step:?} not exercised: {stops:?}");
+        }
+    }
+
+    /// Stops a migration right after its journal is flushed.
+    fn interrupted_after_journal(dir: &Path) {
+        legacy_file(dir);
+        let err = migrate_legacy_with(dir, &mut |step| {
+            if step == Step::Journaled {
+                bail!("stop");
+            }
+            Ok(())
+        });
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn corrupt_staging_files_are_rebuilt() {
+        // Without a journal the staged copies are never trusted.
+        let dir = tempfile::tempdir().unwrap();
+        legacy_file(dir.path());
+        std::fs::write(dir.path().join("soul.sqlite.migrating"), b"garbage").unwrap();
+        assert_migrated(&Store::open(dir.path()).unwrap());
+
+        // With one, a staged copy that no longer verifies is redone from the
+        // legacy file, which is still in place.
+        let dir = tempfile::tempdir().unwrap();
+        interrupted_after_journal(dir.path());
+        std::fs::write(dir.path().join("chats.sqlite.migrating"), b"garbage").unwrap();
+        assert_migrated(&Store::open(dir.path()).unwrap());
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_legacy_file_changed_mid_commit_is_staged_again() {
+        let dir = tempfile::tempdir().unwrap();
+        interrupted_after_journal(dir.path());
+        {
+            let conn = Connection::open(dir.path().join(LEGACY_FILE)).unwrap();
+            conn.execute(
+                "INSERT INTO messages VALUES (2, 7, 'user', 'more', NULL, NULL, 3)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.history(7, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_split_file_the_migration_did_not_make_is_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        interrupted_after_journal(dir.path());
+        // Someone puts their own soul.sqlite in place and damages a staged copy.
+        let mine = Connection::open(dir.path().join("soul.sqlite.migrating")).unwrap();
+        drop(mine);
+        std::fs::rename(
+            dir.path().join("soul.sqlite.migrating"),
+            dir.path().join("keep"),
+        )
+        .unwrap();
+        {
+            let conn = Connection::open(dir.path().join("soul.sqlite")).unwrap();
+            conn.execute_batch("CREATE TABLE mine(x); INSERT INTO mine VALUES (1);")
+                .unwrap();
+        }
+        let err = Store::open(dir.path()).err().unwrap();
+        assert!(format!("{err:#}").contains("move it aside"), "{err:#}");
+        let conn = Connection::open(dir.path().join("soul.sqlite")).unwrap();
+        let x: i64 = conn
+            .query_row("SELECT x FROM mine", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(x, 1);
+        assert!(dir.path().join(LEGACY_FILE).exists());
+    }
+
+    #[test]
+    fn migrates_an_old_file_missing_optional_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join(LEGACY_FILE)).unwrap();
+        conn.execute_batch(CHATS.migrations[0]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions VALUES (1, 'main', 1, 2);
+             INSERT INTO messages VALUES (1, 1, 'user', 'hi', NULL, NULL, 2);",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.sessions().unwrap()[0].messages, 1);
+        assert!(store.identity().unwrap().is_none());
+        assert!(store.job_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_earlier_backup_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LEGACY_BACKUP), b"older backup").unwrap();
+        legacy_file(dir.path());
+        assert_migrated(&Store::open(dir.path()).unwrap());
+        assert_eq!(
+            std::fs::read(dir.path().join(LEGACY_BACKUP)).unwrap(),
+            b"older backup"
+        );
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{LEGACY_BACKUP}."))
+            })
+            .count();
+        assert_eq!(backups, 1);
     }
 }
