@@ -11,7 +11,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | CLI (`chat`, `ask`, `sessions`) | phase 1 ✅ |
 | Tools: shell and files, with approval | phase 2 ✅ |
 | Long-term memory search (SQLite FTS5) | phase 3 ✅ |
-| Gateway HTTP/WebSocket + Web UI | phase 4 |
+| Gateway HTTP/WebSocket + Web UI | phase 4 ✅ |
 | Scheduled tasks / heartbeat, OpenRC service | phase 5 |
 | QQ channel (official QQ Bot API) | phase 6 |
 
@@ -25,6 +25,24 @@ cargo build --release
 ./target/release/openclaw-rs sessions
 ./target/release/openclaw-rs memory add "Prefers answers in Chinese"
 ./target/release/openclaw-rs memory search chinese
+```
+
+## Gateway and Web UI
+
+```sh
+export OPENCLAW_RS_TOKEN=$(head -c 24 /dev/urandom | base64)
+./target/release/openclaw-rs serve            # http://127.0.0.1:18789/#token=<token>
+```
+
+The Web UI streams replies, lists sessions, and shows an approve/deny card
+for every `ask` tool. Turns run one at a time per session and keep running if
+the browser disconnects; an approval nobody answers within five minutes is
+declined. Without a token the Gateway only binds to loopback.
+
+```toml
+[gateway]
+bind = "127.0.0.1:18789"
+# token = "..."   # prefer OPENCLAW_RS_TOKEN
 ```
 
 Long-term memory is a SQLite FTS5 index with the trigram tokenizer, so Chinese

@@ -22,6 +22,19 @@ pub trait Approver: Send + Sync {
     async fn approve(&self, tool: &str, summary: &str) -> bool;
 }
 
+tokio::task_local! {
+    /// The person who can answer for the turn running on this task.
+    static TURN_APPROVER: Arc<dyn Approver>;
+}
+
+/// Runs a turn whose `ask` permissions are answered by `approver`.
+pub async fn with_approver<F: std::future::Future>(
+    approver: Arc<dyn Approver>,
+    turn: F,
+) -> F::Output {
+    TURN_APPROVER.scope(approver, turn).await
+}
+
 /// Prompts on the controlling terminal, so piped stdin cannot answer for the user.
 pub struct TerminalApprover;
 
@@ -58,7 +71,6 @@ impl Approver for TerminalApprover {
 pub struct BuiltinTools {
     workspace: PathBuf,
     config: ToolsConfig,
-    approver: Arc<dyn Approver>,
     store: Store,
 }
 
@@ -113,17 +125,11 @@ struct ListArgs {
 }
 
 impl BuiltinTools {
-    pub fn new(
-        workspace: PathBuf,
-        config: ToolsConfig,
-        approver: Arc<dyn Approver>,
-        store: Store,
-    ) -> std::io::Result<Self> {
+    pub fn new(workspace: PathBuf, config: ToolsConfig, store: Store) -> std::io::Result<Self> {
         std::fs::create_dir_all(&workspace)?;
         Ok(Self {
             workspace,
             config,
-            approver,
             store,
         })
     }
@@ -178,8 +184,18 @@ impl BuiltinTools {
         match permission {
             Permission::Allow => Ok(()),
             Permission::Deny => Err(format!("error: {tool} is disabled by configuration")),
-            Permission::Ask if self.approver.approve(tool, summary).await => Ok(()),
-            Permission::Ask => Err(format!("error: the user declined {tool}")),
+            Permission::Ask => {
+                let Ok(approver) = TURN_APPROVER.try_with(Arc::clone) else {
+                    return Err(format!(
+                        "error: {tool} needs approval, but nobody can answer for this conversation"
+                    ));
+                };
+                if approver.approve(tool, summary).await {
+                    Ok(())
+                } else {
+                    Err(format!("error: the user declined {tool}"))
+                }
+            }
         }
     }
 
@@ -485,14 +501,22 @@ mod tests {
         }
     }
 
-    fn tools(dir: &Path, config: ToolsConfig, approve: bool) -> BuiltinTools {
-        BuiltinTools::new(
-            dir.to_owned(),
-            config,
-            Arc::new(Answer(approve)),
-            Store::open_in_memory().unwrap(),
-        )
-        .unwrap()
+    /// Calls tools as a turn whose approvals `Answer` decides.
+    struct Scoped(BuiltinTools, Arc<dyn Approver>);
+
+    impl Scoped {
+        async fn call(&self, call: &ToolCall) -> String {
+            with_approver(self.1.clone(), self.0.call(call)).await
+        }
+        fn specs(&self) -> Vec<ToolSpec> {
+            self.0.specs()
+        }
+    }
+
+    fn tools(dir: &Path, config: ToolsConfig, approve: bool) -> Scoped {
+        let tools =
+            BuiltinTools::new(dir.to_owned(), config, Store::open_in_memory().unwrap()).unwrap();
+        Scoped(tools, Arc::new(Answer(approve)))
     }
 
     #[tokio::test]
@@ -576,6 +600,22 @@ mod tests {
             .call(&call("shell", json!({"command": "sleep 30 & sleep 30"})))
             .await;
         assert!(out.contains("timed out"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn ask_without_an_approver_is_declined() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = BuiltinTools::new(
+            dir.path().to_owned(),
+            ToolsConfig::default(),
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let out = t
+            .call(&call("shell", json!({"command": "touch ran"})))
+            .await;
+        assert!(out.contains("nobody can answer"), "{out}");
+        assert!(!dir.path().join("ran").exists());
     }
 
     #[tokio::test]

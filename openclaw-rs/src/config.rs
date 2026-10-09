@@ -17,6 +17,33 @@ pub struct Config {
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
+    pub gateway: GatewayConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayConfig {
+    pub bind: String,
+    /// Required for non-loopback binds; prefer `OPENCLAW_RS_TOKEN`.
+    pub token: Option<String>,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18789".into(),
+            token: None,
+        }
+    }
+}
+
+impl GatewayConfig {
+    pub fn token(&self) -> Option<String> {
+        std::env::var("OPENCLAW_RS_TOKEN")
+            .ok()
+            .or_else(|| self.token.clone())
+            .filter(|t| !t.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

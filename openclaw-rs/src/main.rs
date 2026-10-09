@@ -2,6 +2,7 @@
 
 mod agent;
 mod config;
+mod gateway;
 mod llm;
 mod memory;
 mod store;
@@ -18,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
 use crate::store::Store;
-use crate::tools::{BuiltinTools, TerminalApprover};
+use crate::tools::{BuiltinTools, TerminalApprover, with_approver};
 
 #[derive(Parser)]
 #[command(name = "openclaw-rs", version, about = "Single-binary OpenClaw")]
@@ -42,6 +43,12 @@ enum Command {
         #[arg(short, long, default_value = "main")]
         session: String,
         message: Vec<String>,
+    },
+    /// Run the Gateway: Web UI and WebSocket API.
+    Serve {
+        /// Listen address (default: gateway.bind, 127.0.0.1:18789).
+        #[arg(long)]
+        bind: Option<String>,
     },
     /// Manage long-term memory.
     Memory {
@@ -95,6 +102,11 @@ async fn run(cli: Cli) -> Result<()> {
     let store = Store::open(&state.join("state.sqlite"))?;
     match cli.command {
         Command::Memory { action } => memory(&store, action),
+        Command::Serve { bind } => {
+            let agent = Arc::new(build_agent(&config, &state, store)?);
+            let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
+            gateway::serve(gateway::Gateway::new(agent, config.gateway.token()), &bind).await
+        }
         Command::Sessions { action } => sessions(&store, action.unwrap_or(SessionsAction::List)),
         Command::Ask { session, message } => {
             let message = message.join(" ");
@@ -138,12 +150,7 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         .unwrap_or_else(|| state.join("workspace"));
     Ok(Agent {
         model: llm::Client::new(&config.model, config.api_key()?)?,
-        tools: BuiltinTools::new(
-            workspace,
-            config.tools.clone(),
-            Arc::new(TerminalApprover),
-            store.clone(),
-        )?,
+        tools: BuiltinTools::new(workspace, config.tools.clone(), store.clone())?,
         store,
         config: config.agent.clone(),
     })
@@ -151,18 +158,18 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
 
 async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
     let mut stdout = std::io::stdout();
-    agent
-        .run_turn(session, input, &mut |event| match event {
-            AgentEvent::Text(text) => {
-                let _ = stdout.write_all(text.as_bytes());
-                let _ = stdout.flush();
-            }
-            AgentEvent::ToolStart { name, arguments } => eprintln!("\n[tool {name} {arguments}]"),
-            AgentEvent::ToolEnd { name, output } => {
-                eprintln!("[tool {name} → {} bytes]", output.len());
-            }
-        })
-        .await?;
+    let mut on_event = |event| match event {
+        AgentEvent::Text(text) => {
+            let _ = stdout.write_all(text.as_bytes());
+            let _ = stdout.flush();
+        }
+        AgentEvent::ToolStart { name, arguments } => eprintln!("\n[tool {name} {arguments}]"),
+        AgentEvent::ToolEnd { name, output } => {
+            eprintln!("[tool {name} → {} bytes]", output.len());
+        }
+    };
+    let run = agent.run_turn(session, input, &mut on_event);
+    with_approver(Arc::new(TerminalApprover), run).await?;
     println!();
     Ok(())
 }

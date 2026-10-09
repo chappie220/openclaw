@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+axum = { version = "0.8.9", features = ["ws"] }
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = "0.3.34"
 libc = "0.2.190"
@@ -20,7 +21,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "s
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "time", "sync", "process", "fs"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "time", "sync", "process", "fs", "net"] }
 toml = "1.1.8"
 
 [profile.release]
