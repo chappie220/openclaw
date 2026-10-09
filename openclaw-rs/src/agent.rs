@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 
 use crate::config::AgentConfig;
+use crate::identity;
 use crate::llm::{ChatMessage, Client, Completion, ToolCall, ToolSpec};
 use crate::store::Store;
 
@@ -84,7 +85,12 @@ impl<M: Model, T: Tools> Agent<M, T> {
         self.store.append(session_id, &ChatMessage::user(input))?;
         let specs = self.tools.specs();
         for _ in 0..self.config.max_steps {
-            let mut messages = vec![ChatMessage::system(&self.config.system_prompt)];
+            // Read per call so an identity saved mid-turn takes effect on the next call.
+            let identity = self.store.identity()?;
+            let mut messages = vec![ChatMessage::system(identity::system_prompt(
+                &self.config.system_prompt,
+                identity.as_ref(),
+            ))];
             messages.extend(self.store.history(session_id, self.config.history_limit)?);
             let completion = self
                 .model

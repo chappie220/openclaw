@@ -65,6 +65,16 @@ CREATE TABLE mail_seen (
   seen_at INTEGER NOT NULL
 );
 "#,
+    r#"
+-- One row: the agent's name and persona, shared by every session.
+CREATE TABLE identity (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  name TEXT NOT NULL,
+  persona TEXT NOT NULL,
+  source TEXT,
+  updated_at INTEGER NOT NULL
+);
+"#,
 ];
 
 #[derive(Clone)]

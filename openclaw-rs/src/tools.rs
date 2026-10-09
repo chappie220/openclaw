@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 use crate::agent::Tools;
 use crate::config::{Permission, ToolsConfig};
 use crate::llm::{ToolCall, ToolSpec};
+use crate::search::Searcher;
 use crate::store::Store;
 
 /// Asks a person whether a gated action may run. Front ends supply their own.
@@ -72,6 +73,7 @@ pub struct BuiltinTools {
     workspace: PathBuf,
     config: ToolsConfig,
     store: Store,
+    search: Option<Searcher>,
 }
 
 #[derive(Deserialize)]
@@ -126,6 +128,19 @@ struct CronRemoveArgs {
 }
 
 #[derive(Deserialize)]
+struct IdentitySetArgs {
+    name: String,
+    persona: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WebSearchArgs {
+    query: String,
+}
+
+#[derive(Deserialize)]
 struct MemoryDeleteArgs {
     id: i64,
 }
@@ -143,7 +158,39 @@ impl BuiltinTools {
             workspace,
             config,
             store,
+            search: None,
         })
+    }
+
+    pub fn with_search(mut self, search: Option<Searcher>) -> Self {
+        self.search = search;
+        self
+    }
+
+    async fn identity_set(&self, args: IdentitySetArgs) -> Result<String, String> {
+        let current = self.store.identity().map_err(|e| format!("error: {e:#}"))?;
+        // The first identity is the setup the agent was asked to do; changes need consent.
+        if current.is_some() {
+            let summary = format!("become {:?}: {}", args.name.trim(), args.persona.trim());
+            self.permit(self.config.identity, "identity_set", &summary)
+                .await?;
+        }
+        self.store
+            .identity_set(&args.name, &args.persona, args.source.as_deref())
+            .map_err(|e| format!("error: {e:#}"))?;
+        Ok(format!(
+            "identity saved: you are now {}; it applies to every conversation from your next reply",
+            args.name.trim()
+        ))
+    }
+
+    async fn web_search(&self, args: WebSearchArgs) -> Result<String, String> {
+        let search = self.search.as_ref().ok_or("error: web search is off")?;
+        let found = search
+            .search(&args.query)
+            .await
+            .map_err(|e| format!("error: {e:#}"))?;
+        Ok(truncate(found.as_bytes(), self.config.max_output_bytes))
     }
 
     fn memory_save(&self, args: MemorySaveArgs) -> Result<String, String> {
@@ -498,6 +545,22 @@ impl Tools for BuiltinTools {
             "Remove a scheduled job by name.",
             json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}),
         ));
+        specs.push(ToolSpec::function(
+            "identity_set",
+            "Save your identity (name and persona) for every conversation. Use it to finish first-start setup, or when the user asks to change who you are; show them the draft first.",
+            json!({"type": "object", "properties": {
+                "name": {"type": "string", "description": "What you are called"},
+                "persona": {"type": "string", "description": "Second person, under 4000 characters: personality, speaking style, catchphrases, background, and how to address the user"},
+                "source": {"type": "string", "description": "For a fictional character: the character and the work, e.g. 'Sun Wukong, Journey to the West'"}
+            }, "required": ["name", "persona"]}),
+        ));
+        if self.search.is_some() {
+            specs.push(ToolSpec::function(
+                "web_search",
+                "Search the web and get the relevant facts with source URLs. Use it for current information and to research a fictional character before playing them.",
+                json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
+            ));
+        }
         if self.config.write != Permission::Deny {
             specs.push(ToolSpec::function(
                 "write_file",
@@ -552,6 +615,14 @@ impl Tools for BuiltinTools {
             "memory_save" => parse(call).and_then(|args| self.memory_save(args)),
             "memory_search" => parse(call).and_then(|args| self.memory_search(args)),
             "memory_delete" => parse(call).and_then(|args| self.memory_delete(args)),
+            "identity_set" => match parse(call) {
+                Ok(args) => self.identity_set(args).await,
+                Err(e) => Err(e),
+            },
+            "web_search" => match parse(call) {
+                Ok(args) => self.web_search(args).await,
+                Err(e) => Err(e),
+            },
             "cron_add" => parse(call).and_then(|args| self.cron_add(args)),
             "cron_list" => self.cron_list(),
             "cron_remove" => parse(call).and_then(|args| self.cron_remove(args)),
@@ -701,6 +772,37 @@ mod tests {
             .await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("ran").exists());
+    }
+
+    #[tokio::test]
+    async fn first_identity_saves_freely_but_changes_need_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        // No approver, as on QQ or email: first-start setup must still work there.
+        let t = BuiltinTools::new(dir.path().to_owned(), ToolsConfig::default(), store.clone())
+            .unwrap();
+        let set = |name: &str| call("identity_set", json!({"name": name, "persona": "Curious."}));
+        let out = t.call(&set("Ada")).await;
+        assert!(out.starts_with("identity saved"), "{out}");
+        let out = t.call(&set("Eve")).await;
+        assert!(out.contains("nobody can answer"), "{out}");
+        assert_eq!(store.identity().unwrap().unwrap().name, "Ada");
+
+        let approved = Scoped(t, Arc::new(Answer(true)));
+        assert!(
+            approved
+                .call(&set("Eve"))
+                .await
+                .starts_with("identity saved")
+        );
+        assert_eq!(store.identity().unwrap().unwrap().name, "Eve");
+        // web_search is only offered when a provider is configured.
+        assert!(
+            !approved
+                .specs()
+                .iter()
+                .any(|s| s.function.name == "web_search")
+        );
     }
 
     #[tokio::test]

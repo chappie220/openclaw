@@ -4,10 +4,12 @@ mod agent;
 mod config;
 mod cron;
 mod gateway;
+mod identity;
 mod llm;
 mod mail;
 mod memory;
 mod qq;
+mod search;
 mod service;
 mod store;
 mod tools;
@@ -69,6 +71,11 @@ enum Command {
         #[command(subcommand)]
         action: MailAction,
     },
+    /// Show, set or reset the agent's name and persona.
+    Identity {
+        #[command(subcommand)]
+        action: Option<IdentityAction>,
+    },
     /// Manage long-term memory.
     Memory {
         #[command(subcommand)]
@@ -117,6 +124,24 @@ enum CronAction {
 }
 
 #[derive(Subcommand)]
+enum IdentityAction {
+    Show,
+    /// Set the identity directly instead of in a conversation.
+    Set {
+        #[arg(long)]
+        name: String,
+        /// Personality, speaking style, background, how to address the user.
+        #[arg(long)]
+        persona: String,
+        /// The character and work a persona is based on.
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Forget the identity; the next conversation sets it up again.
+    Reset,
+}
+
+#[derive(Subcommand)]
 enum MemoryAction {
     /// Save a fact.
     Add { content: Vec<String> },
@@ -162,6 +187,7 @@ async fn run(cli: Cli) -> Result<()> {
     let store = Store::open(&state.join("state.sqlite"))?;
     match cli.command {
         Command::Memory { action } => memory(&store, action),
+        Command::Identity { action } => identity(&store, action.unwrap_or(IdentityAction::Show)),
         Command::Cron { action } => cron_command(&store, action),
         Command::Mail {
             action: MailAction::Check,
@@ -184,6 +210,9 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
         Command::Serve { bind } => {
+            if store.identity()?.is_none() {
+                eprintln!("{FIRST_START_HINT}");
+            }
             let agent = Arc::new(build_agent(&config, &state, store)?);
             let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
             let gateway = gateway::Gateway::new(agent, config.gateway.token());
@@ -218,11 +247,16 @@ async fn run(cli: Cli) -> Result<()> {
             turn(&agent, &session, &message).await
         }
         Command::Chat { session } => {
+            let name = store.identity()?.map(|i| i.name);
             let agent = build_agent(&config, &state, store)?;
             eprintln!(
-                "session {session} · model {} · empty line or Ctrl-D to quit",
+                "{} · session {session} · model {} · empty line or Ctrl-D to quit",
+                name.as_deref().unwrap_or("OpenClaw"),
                 config.model.model
             );
+            if name.is_none() {
+                eprintln!("{FIRST_START_HINT}");
+            }
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             loop {
                 eprint!("> ");
@@ -243,15 +277,22 @@ async fn run(cli: Cli) -> Result<()> {
 
 type CliAgent = Agent<llm::Client, BuiltinTools>;
 
+const FIRST_START_HINT: &str = "First start: the agent has no identity yet and will ask who it \
+should be. Describe a persona, or name a fictional character for it to look up and play \
+(e.g. \"be Sun Wukong from Journey to the West\"). `openclaw-rs identity set` works too.";
+
 fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
     let workspace = config
         .tools
         .workspace
         .clone()
         .unwrap_or_else(|| state.join("workspace"));
+    let api_key = config.api_key()?;
+    let search = search::Searcher::new(&config.search, &config.model, &api_key)?;
     Ok(Agent {
-        model: llm::Client::new(&config.model, config.api_key()?)?,
-        tools: BuiltinTools::new(workspace, config.tools.clone(), store.clone())?,
+        model: llm::Client::new(&config.model, api_key)?,
+        tools: BuiltinTools::new(workspace, config.tools.clone(), store.clone())?
+            .with_search(search),
         store,
         config: config.agent.clone(),
     })
@@ -335,6 +376,37 @@ fn memory(store: &Store, action: MemoryAction) -> Result<()> {
                 bail!("no memory #{id}");
             }
             println!("deleted #{id}");
+        }
+    }
+    Ok(())
+}
+
+fn identity(store: &Store, action: IdentityAction) -> Result<()> {
+    match action {
+        IdentityAction::Show => match store.identity()? {
+            Some(i) => {
+                println!("name: {}", i.name);
+                if let Some(source) = i.source {
+                    println!("based on: {source}");
+                }
+                println!("\n{}", i.persona);
+            }
+            None => println!("no identity yet; the next conversation sets one up"),
+        },
+        IdentityAction::Set {
+            name,
+            persona,
+            source,
+        } => {
+            store.identity_set(&name, &persona, source.as_deref())?;
+            println!("identity saved: {}", name.trim());
+        }
+        IdentityAction::Reset => {
+            if store.identity_clear()? {
+                println!("identity removed; the next conversation sets it up again");
+            } else {
+                println!("no identity to remove");
+            }
         }
     }
     Ok(())

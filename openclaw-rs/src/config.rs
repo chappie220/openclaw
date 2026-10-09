@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// OpenRouter's router picks a model when the operator has not chosen one.
 pub const DEFAULT_MODEL: &str = "openrouter/auto";
-const DEFAULT_SYSTEM_PROMPT: &str = "You are OpenClaw, a helpful personal assistant.";
+/// Leaves the name to the identity chosen on first start.
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful personal assistant running on OpenClaw.";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,6 +21,40 @@ pub struct Config {
     pub gateway: GatewayConfig,
     pub qq: QqConfig,
     pub mail: MailConfig,
+    pub search: SearchConfig,
+}
+
+/// Where `web_search` looks things up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchProvider {
+    /// OpenRouter's `web` plugin with the configured key; billed per search.
+    Openrouter,
+    /// A SearXNG instance with the JSON format enabled (`searxng_url`).
+    Searxng,
+    /// No `web_search` tool.
+    Off,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub provider: SearchProvider,
+    /// Model that runs OpenRouter searches (default: model.model).
+    pub model: Option<String>,
+    pub searxng_url: Option<String>,
+    pub max_results: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: SearchProvider::Openrouter,
+            model: None,
+            searxng_url: None,
+            max_results: 5,
+        }
+    }
 }
 
 /// Transport security for a mail connection.
@@ -182,6 +217,8 @@ pub struct ToolsConfig {
     pub shell: Permission,
     /// Covers write_file and edit_file; reads are always allowed.
     pub write: Permission,
+    /// Changing the agent's identity; the first one is always saved without asking.
+    pub identity: Permission,
     pub shell_timeout_secs: u64,
     /// Per-stream cap on tool output returned to the model.
     pub max_output_bytes: usize,
@@ -193,6 +230,7 @@ impl Default for ToolsConfig {
             workspace: None,
             shell: Permission::Ask,
             write: Permission::Ask,
+            identity: Permission::Ask,
             shell_timeout_secs: 120,
             max_output_bytes: 16 * 1024,
         }
