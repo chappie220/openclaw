@@ -15,6 +15,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Scheduled tasks / heartbeat, OpenRC service | phase 5 ✅ |
 | QQ channel (official QQ Bot API) | phase 6 ✅ |
 | Email channel (IMAP in, SMTP out) | ✅ |
+| Identity setup on first start, web search | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -170,6 +171,56 @@ Outlook/Hotmail personal accounts only allow OAuth sign-in and are not supported
 - Email has no way to approve tools, so `ask` tools are declined.
 - Scheduled jobs whose session is a mail session send their result as an email.
 
+## Identity
+
+On first start the agent has no identity. Its first conversation, in any
+channel, sets one up (unless you ask for real work first, which comes first).
+You describe who it should be, or name a fictional character (novel, anime,
+game, film) and it searches the web for that character's personality, way of
+speaking, catchphrases and values, shows you a draft, and saves it after you
+agree.
+
+The identity follows OpenClaw's persona files: an `IDENTITY.md` record and a
+`SOUL.md` voice. A character becomes the agent's own identity instead of a
+reference to it: no titles of works, authors, actors, plot summaries, citations
+or "based on" lines. Saving refuses any field that contains a work title in
+book-title marks (《》), from the model and from the CLI alike.
+
+```text
+> 变成孙悟空
+[tool web_search {"query": "孙悟空 性格 口头禅"}]
+[tool identity_set {"name": "悟空", "creature": "石猴", "vibe": "顽皮直率，天不怕地不怕", "emoji": "🐒", "soul": "你自称俺老孙，说话爽快，称用户为师父。..."}]
+```
+
+It is stored in `state.sqlite` and shared by every session, the Web UI, QQ
+and email. The first one is saved without asking; later changes through the
+`identity_set` tool follow `tools.identity` (`ask` by default, so QQ and email
+users cannot change it). From the shell:
+
+```sh
+openclaw-rs identity                       # print as IDENTITY.md and SOUL.md
+openclaw-rs identity set --name 悟空 --creature 石猴 --vibe "顽皮直率" --emoji 🐒 --soul-file SOUL.md
+openclaw-rs identity reset                 # the next conversation sets it up again
+```
+
+## Web search
+
+The model gets `web_search` for current information and character research.
+By default it runs through OpenRouter's [web plugin](https://openrouter.ai/docs/guides/features/plugins/web-search)
+with the same API key, which works wherever OpenRouter does and is billed per
+search. A self-hosted [SearXNG](https://docs.searxng.org) instance (with the
+`json` format enabled) is free:
+
+```toml
+[search]
+provider = "openrouter"   # openrouter | searxng | off
+# model = "..."           # model that runs OpenRouter searches (default: model.model)
+# searxng_url = "http://127.0.0.1:8888"
+max_results = 5
+```
+
+## Memory
+
 Long-term memory is a SQLite FTS5 index with the trigram tokenizer, so Chinese
 text matches by substring without word segmentation. Space-separated terms
 match any; terms shorter than three characters fall back to `LIKE`. The model
@@ -187,7 +238,7 @@ base_url = "https://openrouter.ai/api/v1"
 request_timeout_secs = 300
 
 [agent]
-system_prompt = "You are OpenClaw, a helpful personal assistant."
+system_prompt = "You are a helpful personal assistant running on OpenClaw."
 max_steps = 25       # model calls per turn before giving up
 history_limit = 200  # recent messages sent to the model
 
@@ -195,6 +246,7 @@ history_limit = 200  # recent messages sent to the model
 # workspace = "/path"   # default: <state dir>/workspace
 shell = "ask"           # allow | ask | deny
 write = "ask"           # write_file and edit_file; reads are always allowed
+identity = "ask"        # identity_set after the first identity exists
 shell_timeout_secs = 120
 max_output_bytes = 16384
 ```

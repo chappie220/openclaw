@@ -65,6 +65,18 @@ CREATE TABLE mail_seen (
   seen_at INTEGER NOT NULL
 );
 "#,
+    r#"
+-- One row: the agent's IDENTITY.md fields and SOUL.md, shared by every session.
+CREATE TABLE identity (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  name TEXT NOT NULL,
+  creature TEXT NOT NULL,
+  vibe TEXT NOT NULL,
+  emoji TEXT,
+  soul TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+"#,
 ];
 
 #[derive(Clone)]
