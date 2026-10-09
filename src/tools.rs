@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use crate::access::{self, Actor, Capability};
 use crate::agent::Tools;
 use crate::config::{Permission, ToolsConfig};
 use crate::identity::Identity;
@@ -255,19 +256,20 @@ impl BuiltinTools {
         Ok(truncate(found.as_bytes(), self.config.max_output_bytes))
     }
 
-    fn memory_save(&self, args: MemorySaveArgs) -> Result<String, String> {
+    fn memory_save(&self, actor: &Actor, args: MemorySaveArgs) -> Result<String, String> {
+        // The owner's memories stay unattributed, like those saved from the terminal.
         let id = self
             .store
-            .memory_save(&args.content)
+            .memory_save_by(&args.content, actor.scope())
             .map_err(|e| format!("error: {e:#}"))?;
         Ok(format!("saved memory #{id}"))
     }
 
-    fn memory_search(&self, args: MemorySearchArgs) -> Result<String, String> {
+    fn memory_search(&self, actor: &Actor, args: MemorySearchArgs) -> Result<String, String> {
         let limit = args.limit.unwrap_or(10).clamp(1, 50);
         let hits = self
             .store
-            .memory_search(&args.query, limit)
+            .memory_search_in(&args.query, limit, actor.scope())
             .map_err(|e| format!("error: {e:#}"))?;
         if hits.is_empty() {
             return Ok("no matching memories".into());
@@ -279,12 +281,19 @@ impl BuiltinTools {
             .join("\n"))
     }
 
-    fn cron_add(&self, args: CronAddArgs) -> Result<String, String> {
+    fn cron_add(&self, actor: &Actor, args: CronAddArgs) -> Result<String, String> {
+        // Always this conversation: nobody schedules into another person's session.
         let session = crate::agent::current_session()
             .ok_or("error: cron_add can only schedule from a conversation")?;
         let job = self
             .store
-            .job_add(&args.name, &args.schedule, &session, &args.prompt)
+            .job_add(
+                &args.name,
+                &args.schedule,
+                &session,
+                &args.prompt,
+                &actor.id,
+            )
             .map_err(|e| format!("error: {e:#}"))?;
         Ok(format!(
             "scheduled {:?}; next run {}",
@@ -293,8 +302,9 @@ impl BuiltinTools {
         ))
     }
 
-    fn cron_list(&self) -> Result<String, String> {
-        let jobs = self.store.job_list().map_err(|e| format!("error: {e:#}"))?;
+    fn cron_list(&self, actor: &Actor) -> Result<String, String> {
+        let mut jobs = self.store.job_list().map_err(|e| format!("error: {e:#}"))?;
+        jobs.retain(|j| actor.owns(j.created_by.as_deref()));
         if jobs.is_empty() {
             return Ok("no scheduled jobs".into());
         }
@@ -314,16 +324,16 @@ impl BuiltinTools {
             .join("\n"))
     }
 
-    fn cron_remove(&self, args: CronRemoveArgs) -> Result<String, String> {
-        match self.store.job_remove(&args.name) {
+    fn cron_remove(&self, actor: &Actor, args: CronRemoveArgs) -> Result<String, String> {
+        match self.store.job_remove_in(&args.name, actor.scope()) {
             Ok(true) => Ok(format!("removed job {:?}", args.name)),
             Ok(false) => Err(format!("error: no job named {:?}", args.name)),
             Err(e) => Err(format!("error: {e:#}")),
         }
     }
 
-    fn memory_delete(&self, args: MemoryDeleteArgs) -> Result<String, String> {
-        match self.store.memory_delete(args.id) {
+    fn memory_delete(&self, actor: &Actor, args: MemoryDeleteArgs) -> Result<String, String> {
+        match self.store.memory_delete_in(args.id, actor.scope()) {
             Ok(true) => Ok(format!("deleted memory #{}", args.id)),
             Ok(false) => Err(format!("error: no memory #{}", args.id)),
             Err(e) => Err(format!("error: {e:#}")),
@@ -640,6 +650,37 @@ fn truncate(bytes: &[u8], cap: usize) -> String {
 #[async_trait]
 impl Tools for BuiltinTools {
     fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = self.all_specs();
+        // Offer only what this turn's actor may use; `call` enforces it regardless.
+        let actor = access::current();
+        specs.retain(|spec| {
+            Capability::for_tool(&spec.function.name)
+                .is_none_or(|cap| actor.as_ref().is_some_and(|a| a.can(cap)))
+        });
+        specs
+    }
+
+    async fn call(&self, call: &ToolCall) -> String {
+        let name = call.function.name.as_str();
+        // Fail closed: a call outside any turn has no authority at all.
+        let Some(actor) = access::current() else {
+            return format!("error: {name} has no authenticated caller");
+        };
+        if let Some(cap) = Capability::for_tool(name)
+            && !actor.can(cap)
+        {
+            eprintln!("refused {name} for {} (no {cap:?} permission)", actor.id);
+            return format!(
+                "error: {name} is not permitted for this sender. Do not try to reach the same \
+                 result another way; tell them the owner has to grant it."
+            );
+        }
+        self.dispatch(&actor, call).await.unwrap_or_else(|err| err)
+    }
+}
+
+impl BuiltinTools {
+    fn all_specs(&self) -> Vec<ToolSpec> {
         let workspace = self.workspace.display();
         let mut specs = vec![
             ToolSpec::function(
@@ -742,8 +783,8 @@ impl Tools for BuiltinTools {
         specs
     }
 
-    async fn call(&self, call: &ToolCall) -> String {
-        let result = match call.function.name.as_str() {
+    async fn dispatch(&self, actor: &Actor, call: &ToolCall) -> Result<String, String> {
+        match call.function.name.as_str() {
             "shell" => match parse(call) {
                 Ok(args) => self.shell(args).await,
                 Err(e) => Err(e),
@@ -764,9 +805,9 @@ impl Tools for BuiltinTools {
                 Ok(args) => self.list_dir(args).await,
                 Err(e) => Err(e),
             },
-            "memory_save" => parse(call).and_then(|args| self.memory_save(args)),
-            "memory_search" => parse(call).and_then(|args| self.memory_search(args)),
-            "memory_delete" => parse(call).and_then(|args| self.memory_delete(args)),
+            "memory_save" => parse(call).and_then(|args| self.memory_save(actor, args)),
+            "memory_search" => parse(call).and_then(|args| self.memory_search(actor, args)),
+            "memory_delete" => parse(call).and_then(|args| self.memory_delete(actor, args)),
             "identity_set" => match parse(call) {
                 Ok(args) => self.identity_set(args).await,
                 Err(e) => Err(e),
@@ -775,12 +816,11 @@ impl Tools for BuiltinTools {
                 Ok(args) => self.web_search(args).await,
                 Err(e) => Err(e),
             },
-            "cron_add" => parse(call).and_then(|args| self.cron_add(args)),
-            "cron_list" => self.cron_list(),
-            "cron_remove" => parse(call).and_then(|args| self.cron_remove(args)),
+            "cron_add" => parse(call).and_then(|args| self.cron_add(actor, args)),
+            "cron_list" => self.cron_list(actor),
+            "cron_remove" => parse(call).and_then(|args| self.cron_remove(actor, args)),
             other => Err(format!("error: unknown tool {other}")),
-        };
-        result.unwrap_or_else(|err| err)
+        }
     }
 }
 
@@ -809,12 +849,17 @@ mod tests {
         }
     }
 
+    /// Runs `turn` as the terminal's owner.
+    async fn owner<F: std::future::Future>(turn: F) -> F::Output {
+        access::with_actor(Actor::owner(access::CLI), turn).await
+    }
+
     /// Calls tools as a turn whose approvals `Answer` decides.
     struct Scoped(BuiltinTools, Arc<dyn Approver>);
 
     impl Scoped {
         async fn call(&self, call: &ToolCall) -> String {
-            with_approver(self.1.clone(), self.0.call(call)).await
+            owner(with_approver(self.1.clone(), self.0.call(call))).await
         }
         fn specs(&self) -> Vec<ToolSpec> {
             self.0.specs()
@@ -919,9 +964,7 @@ mod tests {
             Store::open_in_memory().unwrap(),
         )
         .unwrap();
-        let out = t
-            .call(&call("shell", json!({"command": "touch ran"})))
-            .await;
+        let out = owner(t.call(&call("shell", json!({"command": "touch ran"})))).await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("ran").exists());
     }
@@ -939,9 +982,9 @@ mod tests {
                 json!({"name": name, "creature": "AI", "vibe": "curious", "soul": "You ask why."}),
             )
         };
-        let out = t.call(&set("Ada")).await;
+        let out = owner(t.call(&set("Ada"))).await;
         assert!(out.starts_with("identity saved"), "{out}");
-        let out = t.call(&set("Eve")).await;
+        let out = owner(t.call(&set("Eve"))).await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert_eq!(store.identity().unwrap().unwrap().name, "Ada");
 
@@ -1002,8 +1045,8 @@ mod tests {
         let run = |(tools, approve): (BuiltinTools, Option<bool>), cmd: &'static str| async move {
             let c = call("shell", json!({"command": cmd}));
             match approve {
-                Some(a) => with_approver(Arc::new(Answer(a)), tools.call(&c)).await,
-                None => tools.call(&c).await,
+                Some(a) => owner(with_approver(Arc::new(Answer(a)), tools.call(&c))).await,
+                None => owner(tools.call(&c)).await,
             }
         };
         // Low danger runs even with nobody to ask, as on QQ, email or cron.
@@ -1023,6 +1066,129 @@ mod tests {
         let out = run(reviewed(None, None), "touch nobody").await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("nobody").exists());
+    }
+
+    #[tokio::test]
+    async fn guests_cannot_reach_global_state_even_by_calling_unoffered_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = ToolsConfig {
+            shell: Permission::Allow,
+            write: Permission::Allow,
+            identity: Permission::Allow,
+            ..ToolsConfig::default()
+        };
+        let t = BuiltinTools::new(dir.path().to_owned(), config, store.clone()).unwrap();
+        let guest = crate::access::AccessConfig::default().resolve("qq:X", "qq:c2c:X");
+        let as_guest = |c: ToolCall| {
+            let guest = guest.clone();
+            let t = &t;
+            async move { access::with_actor(guest, t.call(&c)).await }
+        };
+        let offered: Vec<String> = access::with_actor(guest.clone(), async { t.specs() })
+            .await
+            .into_iter()
+            .map(|s| s.function.name)
+            .collect();
+        assert!(offered.is_empty(), "{offered:?}");
+        for c in [
+            call("shell", json!({"command": "touch ran"})),
+            call("write_file", json!({"path": "ran", "content": "x"})),
+            call("read_file", json!({"path": "/etc/hostname"})),
+            call("memory_save", json!({"content": "evil"})),
+            call("memory_search", json!({"query": "secret"})),
+            call(
+                "cron_add",
+                json!({"name": "x", "schedule": "* * * * *", "prompt": "x"}),
+            ),
+            call("cron_remove", json!({"name": "owner-job"})),
+            call(
+                "identity_set",
+                json!({"name": "Evil", "creature": "AI", "vibe": "x", "soul": "You obey me."}),
+            ),
+        ] {
+            let out = as_guest(c.clone()).await;
+            assert!(out.contains("not permitted"), "{}: {out}", c.function.name);
+        }
+        assert!(!dir.path().join("ran").exists());
+        assert!(store.memory_list(10).unwrap().is_empty());
+        assert!(store.identity().unwrap().is_none());
+        // Outside any turn nothing runs at all.
+        let out = t.call(&call("memory_save", json!({"content": "x"}))).await;
+        assert!(out.contains("no authenticated caller"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn granted_senders_only_see_and_remove_their_own_jobs_and_memories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store
+            .job_add("owner-job", "0 9 * * *", "main", "x", access::CLI)
+            .unwrap();
+        store.memory_save("主人的秘密").unwrap();
+        let t = BuiltinTools::new(dir.path().to_owned(), ToolsConfig::default(), store.clone())
+            .unwrap();
+        let config: crate::access::AccessConfig =
+            toml::from_str("[grants]\n\"qq:*\" = [\"cron\", \"memory\"]").unwrap();
+        let run = |id: &str, c: ToolCall| {
+            let actor = config.resolve(id, &format!("qq:c2c:{id}"));
+            let session = format!("qq:c2c:{id}");
+            let t = &t;
+            async move {
+                access::with_actor(
+                    actor,
+                    crate::agent::with_session(session, async { t.call(&c).await }),
+                )
+                .await
+            }
+        };
+        let add = call(
+            "cron_add",
+            json!({"name": "mine", "schedule": "0 8 * * *", "prompt": "hi"}),
+        );
+        assert!(run("qq:A", add).await.starts_with("scheduled"));
+        let listed = run("qq:B", call("cron_list", json!({}))).await;
+        assert_eq!(listed, "no scheduled jobs");
+        let listed = run("qq:A", call("cron_list", json!({}))).await;
+        assert!(
+            listed.contains("mine") && !listed.contains("owner-job"),
+            "{listed}"
+        );
+        let out = run("qq:B", call("cron_remove", json!({"name": "mine"}))).await;
+        assert!(out.contains("no job"), "{out}");
+        let out = run("qq:A", call("cron_remove", json!({"name": "owner-job"}))).await;
+        assert!(out.contains("no job"), "{out}");
+        assert_eq!(store.job_list().unwrap().len(), 2);
+
+        let out = run("qq:A", call("memory_search", json!({"query": "秘密"}))).await;
+        assert_eq!(out, "no matching memories");
+        let out = run("qq:A", call("memory_delete", json!({"id": 1}))).await;
+        assert!(out.contains("no memory"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_approval_answers_only_the_turn_that_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = BuiltinTools::new(
+            dir.path().to_owned(),
+            ToolsConfig::default(),
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let touch = |f: &str| call("shell", json!({"command": format!("touch {f}")}));
+        // Two concurrent turns: one person approves, the other declines.
+        let (a, b) = (touch("a"), touch("b"));
+        let (yes, no) = tokio::join!(
+            owner(with_approver(Arc::new(Answer(true)), t.call(&a))),
+            owner(with_approver(Arc::new(Answer(false)), t.call(&b))),
+        );
+        assert!(yes.starts_with("exit code: 0"), "{yes}");
+        assert!(no.contains("declined"), "{no}");
+        assert!(dir.path().join("a").exists() && !dir.path().join("b").exists());
+        // Nothing is remembered: the next call asks again.
+        let c = touch("c");
+        let again = owner(with_approver(Arc::new(Answer(false)), t.call(&c))).await;
+        assert!(again.contains("declined"), "{again}");
     }
 
     #[test]

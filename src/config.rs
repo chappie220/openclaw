@@ -22,6 +22,7 @@ pub struct Config {
     pub qq: QqConfig,
     pub mail: MailConfig,
     pub search: SearchConfig,
+    pub access: crate::access::AccessConfig,
 }
 
 /// Where `web_search` looks things up.

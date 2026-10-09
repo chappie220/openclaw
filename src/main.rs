@@ -1,5 +1,6 @@
 //! `openclaw-rs`: single-binary OpenClaw.
 
+mod access;
 mod agent;
 mod config;
 mod cron;
@@ -245,24 +246,35 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let agent = Arc::new(build_agent(&config, &state, store)?);
             let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
-            let gateway = gateway::Gateway::new(agent, config.gateway.token());
+            let gateway =
+                gateway::Gateway::new(agent, config.gateway.token(), config.access.clone());
             if config.qq.enabled {
                 // Auto-review runs commands nobody approved, so it counts as unattended.
                 let reviewed_shell = config.tools.shell == config::Permission::Ask
                     && config.tools.review.provider != config::ReviewProvider::Off;
-                let unattended_allow = config.tools.shell == config::Permission::Allow
-                    || config.tools.write == config::Permission::Allow
-                    || reviewed_shell;
-                if unattended_allow && config.qq.allow.is_empty() {
+                let strangers = config.access.unnamed("qq");
+                let stranger_runs = (strangers.contains(&access::Capability::Shell)
+                    && (config.tools.shell == config::Permission::Allow || reviewed_shell))
+                    || (strangers.contains(&access::Capability::FilesWrite)
+                        && config.tools.write == config::Permission::Allow);
+                if stranger_runs && config.qq.allow.is_empty() {
                     bail!(
-                        "tools.shell or tools.write is \"allow\", or tools.review is on, so any QQ user \
-                         could run commands; list trusted openids in qq.allow (the log shows each \
-                         sender's openid), or use \"ask\" without review"
+                        "access.guest or access.grants.\"qq:*\" lets any QQ user run commands or \
+                         write files; list trusted openids in qq.allow (the log shows each \
+                         sender's openid), or grant those capabilities to named senders only"
                     );
                 }
                 let bot = qq::QqBot::new(config.qq.clone())?;
                 gateway.add_notifier(bot.clone());
                 tokio::spawn(qq::run(bot, gateway.clone()));
+            }
+            if (config.qq.enabled || config.mail.enabled) && config.access.owners.is_empty() {
+                eprintln!(
+                    "access: no access.owners, so every QQ and email sender is a guest that can \
+                     only use {:?}; add yourself as \"qq:<openid>\" or \"mail:<address>\" to \
+                     use memory, cron, files or shell from there",
+                    config.access.guest
+                );
             }
             if config.mail.enabled {
                 let bot = mail::MailBot::new(config.mail.clone())?;
@@ -347,7 +359,12 @@ async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
             eprintln!("[tool {name} → {} bytes]", output.len());
         }
     };
-    let run = agent.run_turn(session, input, &mut on_event);
+    let run = agent.run_turn(
+        access::Actor::owner(access::CLI),
+        session,
+        input,
+        &mut on_event,
+    );
     with_approver(Arc::new(TerminalApprover), run).await?;
     println!();
     Ok(())
@@ -399,7 +416,7 @@ fn cron_command(store: &Store, action: CronAction) -> Result<()> {
             prompt,
             session,
         } => {
-            let job = store.job_add(&name, &schedule, &session, &prompt.join(" "))?;
+            let job = store.job_add(&name, &schedule, &session, &prompt.join(" "), access::CLI)?;
             println!("added {} · next run {}", job.name, time(job.next_run));
         }
         CronAction::List => {

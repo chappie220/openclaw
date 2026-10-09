@@ -463,7 +463,11 @@ fn handle<M: Model + 'static, T: Tools + 'static>(
     );
     tokio::spawn(async move {
         let session = incoming.target.session();
-        let reply = match gateway.run_unattended(&session, &incoming.text).await {
+        let actor = gateway.actor(&format!("qq:{}", incoming.sender), &session);
+        let reply = match gateway
+            .run_unattended(actor, &session, &incoming.text)
+            .await
+        {
             Ok(text) => text,
             Err(err) => format!("出错了：{err:#}"),
         };
@@ -621,7 +625,7 @@ mod tests {
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
         });
-        let gateway = Gateway::new(agent.clone(), None);
+        let gateway = Gateway::new(agent.clone(), None, Default::default());
         tokio::spawn(run(bot, gateway));
 
         let deadline = Instant::now() + Duration::from_secs(10);

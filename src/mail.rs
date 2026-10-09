@@ -888,7 +888,9 @@ async fn advance<M: Model + 'static, T: Tools + 'static>(
         } else {
             incoming.text.clone()
         };
-        let reply = match gateway.run_unattended(&session, &prompt).await {
+        // `classify` checked the From address against mail.allow.
+        let actor = gateway.actor(&session, &session);
+        let reply = match gateway.run_unattended(actor, &session, &prompt).await {
             Ok(text) => text,
             Err(err) if item.attempts < MAX_TURN_ATTEMPTS => {
                 let state = store.mail_retry(&item, &format!("{err:#}"))?;

@@ -25,7 +25,8 @@ struct Schema {
 
 const SOUL: Schema = Schema {
     file: "soul.sqlite",
-    migrations: &[r#"
+    migrations: &[
+        r#"
 CREATE TABLE memories (
   id INTEGER PRIMARY KEY,
   content TEXT NOT NULL,
@@ -51,7 +52,12 @@ CREATE TABLE identity (
   soul TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
-"#],
+"#,
+        r#"
+-- The actor that saved each memory; NULL for the owner's older ones.
+ALTER TABLE memories ADD COLUMN created_by TEXT;
+"#,
+    ],
     legacy: &[
         ("memories", "id, content, created_at"),
         (
@@ -137,6 +143,10 @@ CREATE TABLE mail_inbox (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX mail_inbox_due ON mail_inbox(state, next_attempt);
+"#,
+        r#"
+-- The actor that scheduled each job; a job runs with their permissions.
+ALTER TABLE jobs ADD COLUMN created_by TEXT;
 "#,
     ],
     legacy: &[
@@ -770,7 +780,8 @@ mod tests {
         let conn = Connection::open(dir.join(LEGACY_FILE)).unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
         for schema in SCHEMAS {
-            for sql in schema.migrations {
+            // The pre-split file had each table's first layout only.
+            for sql in &schema.migrations[..1] {
                 conn.execute_batch(sql).unwrap();
             }
         }

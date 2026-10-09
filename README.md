@@ -108,9 +108,11 @@ allow = []                # user/group openids allowed to talk to the bot
 
 Each private chat and each group is its own session (`qq:c2c:<openid>`,
 `qq:group:<openid>`). The log prints every sender's openid, so you can fill in
-`allow`. QQ users cannot approve tools, so `ask` tools are declined there; if
-`tools.shell` or `tools.write` is `allow`, or command auto-review is on, the
-Gateway refuses to start QQ until `allow` is set. Replies go out as passive replies (up to 4 messages per
+`allow`. `allow` only decides who may chat; what a sender may make the agent
+do is set under [Access](#access). QQ users cannot approve tools, so `ask`
+tools are declined there; if the access settings let every QQ user run shell
+commands or write files, the Gateway refuses to start QQ until `allow` is set.
+Replies go out as passive replies (up to 4 messages per
 private message, 5 per group message, about 1500 characters each) and fall
 back to active messages once QQ's reply window has passed. Scheduled jobs whose
 session is a QQ session send their result to that chat.
@@ -188,6 +190,51 @@ Outlook/Hotmail personal accounts only allow OAuth sign-in and are not supported
   as Proton Bridge.
 - Email has no way to approve tools, so `ask` tools are declined.
 - Scheduled jobs whose session is a mail session send their result as an email.
+
+## Access
+
+Every turn runs as the sender its channel authenticated, and every tool checks
+that sender's permissions when it runs, so a model that calls a tool it was
+not offered (or is talked into it) is still refused:
+
+- The terminal (`chat`, `ask`) and the Web UI (which needs the gateway token
+  unless it only listens on loopback) act as the **owner**: every tool, subject
+  to the `[tools]` settings.
+- QQ and email senders are **guests** unless listed in `access.owners`. A guest
+  only gets `access.guest` (by default just `web_search`): no shell, no files,
+  no memory, no scheduled jobs and no identity changes.
+
+```toml
+[access]
+owners = ["qq:<your openid>", "mail:me@example.com"]
+guest = ["web_search"]               # what any other sender may use
+[access.grants]                      # more for named senders, sessions or channels
+"qq:<friend openid>" = ["memory", "cron"]
+"qq:group:<group openid>" = ["web_search"]
+"mail:*" = ["memory"]
+```
+
+Capabilities: `shell`, `files_read` (`read_file`, `list_dir`), `files_write`,
+`memory`, `cron`, `identity`, `web_search`. `shell`, `files_write` and
+`identity` still follow `tools.shell`, `tools.write` and `tools.identity`, and
+`ask` is still declined where nobody can approve.
+
+Memories and scheduled jobs record who created them. Someone granted `memory`
+or `cron` only finds, lists and removes their own; the owner sees all. A job
+runs with its creator's permissions as they are when it runs, so removing a
+grant also stops their jobs from using it. Jobs from before creators were
+recorded run as the owner in terminal and Web sessions, and as a guest in QQ
+and email sessions.
+
+An approval in the Web UI or terminal answers exactly one tool call of the
+turn that asked; it is never remembered or reused for another call, session
+or connection.
+
+Upgrading: QQ and email senders used to get every tool `[tools]` allowed.
+They are now guests until you add them to `access.owners` (the Gateway prints
+a reminder at startup while `owners` is empty). Email senders are identified by
+their `From` address, which only the provider's spoofing protection (SPF, DKIM,
+DMARC) vouches for. Prefer QQ, or narrow grants, for anything powerful.
 
 ## Identity
 

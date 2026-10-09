@@ -2,6 +2,7 @@
 
 use anyhow::{Result, bail};
 
+use crate::access::{self, Actor};
 use crate::config::AgentConfig;
 use crate::identity;
 use crate::llm::{ChatMessage, Client, Completion, ToolCall, ToolSpec};
@@ -9,6 +10,12 @@ use crate::store::Store;
 
 tokio::task_local! {
     static CURRENT_SESSION: String;
+}
+
+/// Runs `fut` as part of `session`'s turn.
+#[cfg(test)]
+pub async fn with_session<F: std::future::Future>(session: String, fut: F) -> F::Output {
+    CURRENT_SESSION.scope(session, fut).await
 }
 
 /// The session whose turn is running on this task, for tools that act on it.
@@ -64,15 +71,16 @@ pub struct Agent<M: Model, T: Tools> {
 impl<M: Model, T: Tools> Agent<M, T> {
     /// Runs one turn and returns the final assistant text. Every message is
     /// persisted as it is produced, so an interrupted turn keeps its progress.
+    /// Tools run with `actor`'s permissions.
     pub async fn run_turn(
         &self,
+        actor: Actor,
         session: &str,
         input: &str,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<String> {
-        CURRENT_SESSION
-            .scope(session.to_owned(), self.turn(session, input, on_event))
-            .await
+        let turn = CURRENT_SESSION.scope(session.to_owned(), self.turn(session, input, on_event));
+        access::with_actor(actor, turn).await
     }
 
     async fn turn(
@@ -195,7 +203,9 @@ mod tests {
         };
         let mut events = Vec::new();
         let answer = agent
-            .run_turn("s", "go", &mut |e| events.push(e))
+            .run_turn(Actor::owner(access::CLI), "s", "go", &mut |e| {
+                events.push(e)
+            })
             .await
             .unwrap();
         assert_eq!(answer, "done");
@@ -239,7 +249,10 @@ mod tests {
                 ..AgentConfig::default()
             },
         };
-        let err = agent.run_turn("s", "go", &mut |_| {}).await.unwrap_err();
+        let err = agent
+            .run_turn(Actor::owner(access::CLI), "s", "go", &mut |_| {})
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("max_steps"));
     }
 }
