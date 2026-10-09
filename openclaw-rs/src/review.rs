@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 
 use crate::config::{ModelConfig, ReviewConfig, ReviewProvider};
 
+/// Jev on OpenRouter: a decision model, so it is served by the decisions API, not chat.
+const DEFAULT_OPENROUTER_DECIDER: &str = "typesafe/jev-1.13";
 const TYPESAFE_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 /// Verdicts are a few hundred bytes; anything larger is not a verdict.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
@@ -58,7 +60,7 @@ pub struct Reviewer {
 }
 
 impl Reviewer {
-    /// `None` when review is off. `openrouter_key` is only used by the OpenRouter provider.
+    /// `None` when review is off. `openrouter_key` is only used by the OpenRouter providers.
     pub fn from_config(
         config: &ReviewConfig,
         chat: &ModelConfig,
@@ -112,7 +114,8 @@ impl Reviewer {
                 };
                 let label = format!("typesafe/{model}");
                 (
-                    Box::new(TypeSafe {
+                    Box::new(SystemOne {
+                        service: "TypeSafe",
                         http,
                         endpoint,
                         api_key,
@@ -122,6 +125,24 @@ impl Reviewer {
                 )
             }
             ReviewProvider::Openrouter => {
+                let model = pick(DEFAULT_OPENROUTER_DECIDER);
+                let label = format!("openrouter/{model}");
+                (
+                    Box::new(SystemOne {
+                        service: "OpenRouter decisions",
+                        http,
+                        // https://openrouter.ai/api/v1 -> https://openrouter.ai/api/alpha/decisions
+                        endpoint: format!(
+                            "{}/alpha/decisions",
+                            chat.base_url.trim_end_matches('/').trim_end_matches("/v1")
+                        ),
+                        api_key: Some(openrouter_key.to_owned()),
+                        model,
+                    }),
+                    label,
+                )
+            }
+            ReviewProvider::OpenrouterChat => {
                 let model = pick(&chat.model);
                 let label = format!("openrouter/{model}");
                 (
@@ -231,8 +252,10 @@ fn state(command: &str, cwd: &Path) -> Value {
     json!({"command": command, "shell": "sh -c", "working_directory": cwd.display().to_string()})
 }
 
-/// TypeSafe System One: one Noul (yes/no probability) question per command.
-struct TypeSafe {
+/// System One wire format (TypeSafe, and OpenRouter's decisions API): one Noul
+/// (yes/no probability) question per command.
+struct SystemOne {
+    service: &'static str,
     http: reqwest::Client,
     endpoint: String,
     api_key: Option<String>,
@@ -240,7 +263,7 @@ struct TypeSafe {
 }
 
 #[async_trait]
-impl Judge for TypeSafe {
+impl Judge for SystemOne {
     async fn assess(&self, command: &str, cwd: &Path) -> Result<Assessment> {
         let body = json!({
             "model": self.model,
@@ -259,14 +282,17 @@ impl Judge for TypeSafe {
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
-        let response = request.send().await.context("TypeSafe request failed")?;
-        let value = json_body(response, "TypeSafe").await?;
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("{} request failed", self.service))?;
+        let value = json_body(response, self.service).await?;
         let danger = value
             .pointer("/answers/dangerous")
             .filter(|a| a.get("type").and_then(Value::as_str) == Some("noul"))
             .and_then(|a| a.get("noul"))
             .and_then(Value::as_f64)
-            .context("TypeSafe returned no rating")?;
+            .with_context(|| format!("{} returned no rating", self.service))?;
         Ok(Assessment {
             danger,
             reason: None,
@@ -412,7 +438,8 @@ pub mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let judge = TypeSafe {
+        let judge = SystemOne {
+            service: "TypeSafe",
             http: reqwest::Client::new(),
             endpoint: format!("http://{addr}/v1/systemone"),
             api_key: Some("synthetic-key".into()),

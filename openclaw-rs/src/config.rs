@@ -232,17 +232,21 @@ pub struct ToolsConfig {
 pub enum ReviewProvider {
     /// Every `ask` command goes to a person.
     Off,
-    /// TypeSafe AI System One (`jev-latest` hosted, or a local Kev server).
-    Typesafe,
-    /// Any OpenRouter chat model, with the OpenRouter key.
+    /// A decision model on OpenRouter's decisions API (`typesafe/jev-1.13`), with the OpenRouter key.
     Openrouter,
+    /// Any OpenRouter chat model, asked for a JSON rating, with the OpenRouter key.
+    #[serde(rename = "openrouter-chat")]
+    OpenrouterChat,
+    /// TypeSafe AI's own System One API (`jev-latest` hosted, or a local Kev server).
+    Typesafe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewConfig {
     pub provider: ReviewProvider,
-    /// Default: `jev-latest` (TypeSafe), `kev-latest` (TypeSafe with base_url), or model.model.
+    /// Default: `typesafe/jev-1.13` (openrouter), model.model (openrouter-chat),
+    /// `jev-latest` (typesafe), or `kev-latest` (typesafe with base_url).
     pub model: Option<String>,
     /// TypeSafe key; prefer `TYPESAFE_API_KEY`. Not sent to a local base_url.
     pub api_key: Option<String>,
