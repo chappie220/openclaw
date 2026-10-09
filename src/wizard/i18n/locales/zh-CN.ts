@@ -1199,6 +1199,8 @@ export const zh_CN = {
       quickstartBunRuntime: "QuickStart 使用 Bun 运行 Gateway 服务。",
       reinstall: "重新安装",
       rerunInstallDaemon: "或重新运行：{command}",
+      openrcRootRequired:
+        "检测到 OpenRC。Gateway 以 OpenRC 系统服务运行，需要 root 权限；跳过服务安装。请在 root shell 中运行 `openclaw gateway install` 安装。",
       restart: "重启",
       containerRuntimeTitle: "容器运行环境",
       containerSystemdUnavailable:

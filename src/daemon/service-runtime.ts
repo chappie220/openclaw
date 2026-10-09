@@ -60,6 +60,8 @@ export type GatewayServiceRuntime = {
     plistPath?: string;
   };
   systemd?: GatewayServiceSystemdRuntime;
+  /** OpenRC system service observed through rc-service; no manager UID or cgroup facts. */
+  openrc?: { service: string; initScript: string };
 };
 
 /** Native start policy is diagnostic; it never establishes process or definition ownership. */

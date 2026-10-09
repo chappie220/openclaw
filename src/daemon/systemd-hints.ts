@@ -1,5 +1,6 @@
 import { formatCliCommand } from "../cli/command-format.js";
 import { resolveDaemonContainerContext } from "./container-context.js";
+import { isOpenRcServiceHost } from "./openrc.js";
 import {
   classifySystemdUnavailableDetail,
   type SystemdUnavailableKind,
@@ -12,7 +13,8 @@ type SystemdUnavailableHintOptions = {
 };
 
 export function isSystemdUnavailableDetail(detail?: string): boolean {
-  return classifySystemdUnavailableDetail(detail) !== null;
+  // OpenRC hosts never use systemd, so its absence is not a fixable condition there.
+  return !isOpenRcServiceHost() && classifySystemdUnavailableDetail(detail) !== null;
 }
 
 export function renderSystemdUnavailableHints(

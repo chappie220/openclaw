@@ -26,6 +26,7 @@ import {
 } from "../commands/onboard-helpers.js";
 import type { OnboardOptions } from "../commands/onboard-types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isOpenRcServiceHost } from "../daemon/openrc.js";
 import {
   describeGatewayServiceRestart,
   formatGatewayServiceStartRepairIssues,
@@ -220,11 +221,18 @@ export async function ensureGatewayServiceForOnboarding(params: {
     };
   }
 
+  // OpenRC installs a system service, so it needs root instead of a user systemd manager.
+  const openRc = isOpenRcServiceHost();
+  const openRcWithoutRoot = openRc && process.geteuid?.() !== 0;
   const systemdAvailable =
-    process.platform === "linux" ? await isSystemdUserServiceAvailable() : true;
-  const linuxWithoutUserSystemd = process.platform === "linux" && !systemdAvailable;
-  const containerWithoutUserSystemd = linuxWithoutUserSystemd && isContainerEnvironment();
-  if (linuxWithoutUserSystemd) {
+    process.platform === "linux" && !openRc ? await isSystemdUserServiceAvailable() : true;
+  const linuxWithoutUserSystemd =
+    (process.platform === "linux" && !systemdAvailable) || openRcWithoutRoot;
+  const containerWithoutUserSystemd =
+    !openRc && linuxWithoutUserSystemd && isContainerEnvironment();
+  if (openRcWithoutRoot) {
+    await prompter.note(t("wizard.finalize.openrcRootRequired"), "OpenRC");
+  } else if (linuxWithoutUserSystemd) {
     await prompter.note(
       t(
         containerWithoutUserSystemd
@@ -236,7 +244,7 @@ export async function ensureGatewayServiceForOnboarding(params: {
   }
 
   // Foreground setup must not enable lingering as a side effect of skipping the service.
-  if (process.platform === "linux" && systemdAvailable && opts.installDaemon !== false) {
+  if (process.platform === "linux" && !openRc && systemdAvailable && opts.installDaemon !== false) {
     const { ensureSystemdUserLingerInteractive } = await import("../commands/systemd-linger.js");
     await ensureSystemdUserLingerInteractive({
       runtime,
@@ -267,7 +275,11 @@ export async function ensureGatewayServiceForOnboarding(params: {
 
   if (linuxWithoutUserSystemd && installDaemon) {
     await prompter.note(
-      t("wizard.finalize.systemdInstallSkipped"),
+      t(
+        openRcWithoutRoot
+          ? "wizard.finalize.openrcRootRequired"
+          : "wizard.finalize.systemdInstallSkipped",
+      ),
       t("wizard.finalize.gatewayService"),
     );
     installDaemon = false;
