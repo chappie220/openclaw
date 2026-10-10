@@ -50,6 +50,9 @@ pub struct GuideConfig {
     /// Steps a message may be held back before it goes in anyway.
     pub max_wait_steps: usize,
     pub timeout_secs: u64,
+    /// When messages go in, the agent replies to them at once (written by
+    /// agent.summary_model, else model.model): what it understood, what it will do.
+    pub ack: bool,
 }
 
 impl Default for GuideConfig {
@@ -63,6 +66,7 @@ impl Default for GuideConfig {
             insert_at: 0.5,
             max_wait_steps: 3,
             timeout_secs: 10,
+            ack: true,
         }
     }
 }

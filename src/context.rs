@@ -194,7 +194,7 @@ pub fn summary_message(summary: &str) -> ChatMessage {
 
 /// One message as the summary model reads it. Tool output is passed whole,
 /// cut only at `max_chars` so a single message still fits one request.
-fn render(message: &ChatMessage, max_chars: usize) -> String {
+pub fn render(message: &ChatMessage, max_chars: usize) -> String {
     let clip = |text: &str| -> String {
         if text.chars().count() <= max_chars {
             return text.to_owned();

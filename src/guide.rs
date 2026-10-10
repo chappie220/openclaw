@@ -156,6 +156,8 @@ pub struct Guide {
     label: String,
     insert_at: f64,
     max_wait_steps: usize,
+    /// Messages that go in get a reply from the agent (`guide.ack`).
+    pub ack: bool,
 }
 
 impl Guide {
@@ -186,12 +188,10 @@ impl Guide {
             Some((decider, label)) => (Some(decider), label),
             None => (None, "off".to_owned()),
         };
-        Ok(Some(Self::new(
-            decider,
-            label,
-            config.insert_at,
-            config.max_wait_steps,
-        )))
+        Ok(Some(Self {
+            ack: config.ack,
+            ..Self::new(decider, label, config.insert_at, config.max_wait_steps)
+        }))
     }
 
     pub fn new(
@@ -205,6 +205,7 @@ impl Guide {
             label,
             insert_at,
             max_wait_steps,
+            ack: false,
         }
     }
 

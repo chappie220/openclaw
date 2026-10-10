@@ -148,6 +148,10 @@ pub mod chat {
         "Got it. I'll add this to what I'm working on at a good moment.",
         "收到，我会在合适的时机把这条加入正在进行的对话。",
     );
+    pub const FOLLOW_UP_ADDED: Tr = tr(
+        "Got it, I'm taking that into account now.",
+        "收到，我现在把这条考虑进去。",
+    );
 
     #[cfg(test)]
     pub const ALL: &[Tr] = &[
@@ -169,6 +173,7 @@ pub mod chat {
         NOTHING_RUNNING,
         STOP_NOT_ALLOWED,
         FOLLOW_UP_QUEUED,
+        FOLLOW_UP_ADDED,
     ];
 }
 

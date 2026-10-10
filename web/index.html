@@ -50,6 +50,7 @@
   .chip { font-size: 12px; padding: 3px 8px; border-radius: 12px; background: var(--tool); border: 1px solid var(--line); cursor: pointer; }
   #attach { padding: 0 12px; }
   .msg .file { display: block; font-size: 12px; color: var(--muted); }
+  .ack { background: var(--panel); border: 1px dashed var(--line); color: var(--muted); }
   .msg .state { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; }
   textarea { flex: 1; resize: none; min-height: 44px; max-height: 200px; font: inherit; }
   input, textarea { padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
@@ -139,6 +140,8 @@ let streaming = null; // assistant bubble receiving deltas for the current sessi
 const busy = new Set();
 // Bubbles of messages sent while the current session's turn runs, oldest first.
 let waiting = [];
+// Last bubble of each inserted batch, where its acknowledgement goes.
+let ackAnchors = [];
 
 function token() {
   const fromHash = new URLSearchParams(location.hash.slice(1)).get("token");
@@ -183,7 +186,7 @@ function open(name) {
   current = name;
   localStorage.setItem("openclaw.session", name);
   streaming = null;
-  waiting = [];
+  waiting = []; ackAnchors = [];
   log.textContent = "";
   for (const li of $("sessions").children) li.classList.toggle("active", li.dataset.name === name);
   send({ type: "history", session: name });
@@ -275,9 +278,20 @@ function handle(m) {
     case "follow_up":
       // The reply goes on in a new bubble below the inserted messages.
       streaming = null;
-      for (const div of waiting.splice(0, m.count)) markState(div, m.new_turn ? "nextTurn" : "added");
+      {
+        const batch = waiting.splice(0, m.count);
+        for (const div of batch) markState(div, m.new_turn ? "nextTurn" : "added");
+        if (!m.new_turn && batch.length) ackAnchors.push(batch[batch.length - 1]);
+      }
       if (m.new_turn) { busy.add(m.session); updateComposer(); }
       break;
+    case "ack": {
+      // Right below the messages it answers, ahead of the reply that goes on.
+      const div = bubble("ack", m.text);
+      const anchor = ackAnchors.shift();
+      if (anchor && anchor.isConnected) anchor.after(div);
+      break;
+    }
     case "done":
       // A stopped turn ends with a note that differs from what streamed; a
       // turn that took in later messages returns every answer it gave.

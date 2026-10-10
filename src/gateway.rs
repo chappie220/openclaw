@@ -31,6 +31,8 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SESSION_NAME: usize = 64;
 const SCHEDULER_TICK: Duration = Duration::from_secs(20);
+/// An acknowledgement that takes longer is dropped; the turn goes on regardless.
+const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -107,6 +109,11 @@ enum ServerMsg {
         session: String,
         count: usize,
         new_turn: bool,
+    },
+    /// The agent's short reply to messages just inserted into its turn.
+    Ack {
+        session: String,
+        text: String,
     },
 }
 
@@ -273,6 +280,47 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         })
     }
 
+    /// Whether messages inserted into a turn get an acknowledgement.
+    fn acks(&self) -> bool {
+        self.guide.get().is_some_and(|g| g.ack)
+    }
+
+    /// Replies to each batch of messages inserted into `session`'s running
+    /// turn as it arrives on `inserted`, until the turn ends: on the Web UI
+    /// socket `out`, else through the channel that owns the session.
+    async fn acknowledge_all(
+        &self,
+        session: &str,
+        mut inserted: mpsc::UnboundedReceiver<Vec<String>>,
+        out: Option<&mpsc::UnboundedSender<ServerMsg>>,
+    ) {
+        while let Some(messages) = inserted.recv().await {
+            let text =
+                match tokio::time::timeout(ACK_TIMEOUT, self.agent.acknowledge(session, &messages))
+                    .await
+                {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(err)) => {
+                        eprintln!("guide: cannot acknowledge in {session}: {err:#}");
+                        chat::FOLLOW_UP_ADDED.now().into()
+                    }
+                    Err(_) => {
+                        eprintln!("guide: acknowledgement in {session} timed out");
+                        chat::FOLLOW_UP_ADDED.now().into()
+                    }
+                };
+            match out {
+                Some(out) => {
+                    let _ = out.send(ServerMsg::Ack {
+                        session: session.to_owned(),
+                        text,
+                    });
+                }
+                None => self.notify(session, &text).await,
+            }
+        }
+    }
+
     /// Adds `item` to `session`'s running turn if `actor` started it, so a
     /// sender never steers a turn running with someone else's permissions.
     /// Hands it back to run as a turn of its own otherwise.
@@ -399,6 +447,8 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         };
         if chatting {
             match self.follow_up(session, &actor, next) {
+                // With acknowledgements on, the reply comes once it goes in.
+                Ok(()) if self.acks() => return Ok(String::new()),
                 Ok(()) => return Ok(chat::FOLLOW_UP_QUEUED.now().into()),
                 Err(item) => next = item,
             }
@@ -410,18 +460,32 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
             let (result, leftovers) = {
                 let (cancel, inbox, _running) = self.start_turn(session, &actor);
                 let guided = if chatting { self.guided(&inbox) } else { None };
-                let result = self
-                    .agent
-                    .run_turn_guided(
-                        actor.clone(),
-                        session,
-                        &next.text,
-                        &next.files,
-                        &cancel,
-                        guided.as_ref(),
-                        &mut |_| {},
-                    )
-                    .await;
+                let (inserted, acks) = mpsc::unbounded_channel();
+                let ack = self.acks();
+                let mut on_event = move |event: AgentEvent| {
+                    if let AgentEvent::FollowUp(messages) = event
+                        && ack
+                    {
+                        let _ = inserted.send(messages);
+                    }
+                };
+                let (agent, actor, next, cancel, guided) =
+                    (&self.agent, actor.clone(), &next, &cancel, guided.as_ref());
+                // Owns `on_event`, so the acknowledgements end with the turn.
+                let run = async move {
+                    agent
+                        .run_turn_guided(
+                            actor,
+                            session,
+                            &next.text,
+                            &next.files,
+                            cancel,
+                            guided,
+                            &mut on_event,
+                        )
+                        .await
+                };
+                let (result, ()) = tokio::join!(run, self.acknowledge_all(session, acks, None));
                 (result, inbox.close())
             };
             let _ = self.updates.send(ServerMsg::Updated {
@@ -776,8 +840,15 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
             let guided = gateway.guided(&inbox);
             let events = out.clone();
             let name = session.clone();
+            let (inserted, acks) = mpsc::unbounded_channel();
+            let ack = gateway.acks();
             let mut on_event = move |event: AgentEvent| {
                 let session = name.clone();
+                if let AgentEvent::FollowUp(messages) = &event
+                    && ack
+                {
+                    let _ = inserted.send(messages.clone());
+                }
                 let _ = events.send(match event {
                     AgentEvent::Text(delta) => ServerMsg::Text { session, delta },
                     AgentEvent::ToolStart { name, arguments } => ServerMsg::ToolStart {
@@ -790,27 +861,38 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
                         name,
                         output,
                     },
-                    AgentEvent::FollowUp(count) => ServerMsg::FollowUp {
+                    AgentEvent::FollowUp(messages) => ServerMsg::FollowUp {
                         session,
-                        count,
+                        count: messages.len(),
                         new_turn: false,
                     },
                 });
             };
-            let result = with_approver(
-                approver.clone(),
+            let (agent, turn_actor, name, next, cancel, guided) = (
+                &gateway.agent,
+                actor.clone(),
+                &session,
+                &next,
+                &cancel,
+                guided.as_ref(),
+            );
+            // Owns `on_event`, so the acknowledgements end with the turn.
+            let run = with_approver(approver.clone(), async move {
                 // The connection presented the gateway token (or is loopback-only).
-                gateway.agent.run_turn_guided(
-                    actor.clone(),
-                    &session,
-                    &next.text,
-                    &next.files,
-                    &cancel,
-                    guided.as_ref(),
-                    &mut on_event,
-                ),
-            )
-            .await;
+                agent
+                    .run_turn_guided(
+                        turn_actor,
+                        name,
+                        &next.text,
+                        &next.files,
+                        cancel,
+                        guided,
+                        &mut on_event,
+                    )
+                    .await
+            });
+            let (result, ()) =
+                tokio::join!(run, gateway.acknowledge_all(&session, acks, Some(&out)));
             (result, inbox.close())
         };
         let _ = out.send(match result {
@@ -1198,6 +1280,78 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bob, "re: bob");
+    }
+
+    /// Keeps what was sent to the sessions it handles.
+    struct Recording(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Notifier for Recording {
+        fn handles(&self, session: &str) -> bool {
+            session.starts_with("qq:")
+        }
+        async fn notify(&self, _session: &str, text: &str) -> Result<()> {
+            self.0.lock().unwrap().push(text.to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn inserted_messages_get_a_reply_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let tools = crate::tools::BuiltinTools::new(
+            dir.path().to_owned(),
+            crate::config::ToolsConfig::default(),
+            store.clone(),
+        )
+        .unwrap();
+        let go = Arc::new(tokio::sync::Notify::new());
+        let agent = Arc::new(Agent {
+            model: Gate(go.clone(), AtomicU64::new(0)),
+            summarizer: None,
+            tools,
+            store,
+            config: crate::config::AgentConfig::default(),
+        });
+        let gateway = Gateway::new(agent, None, AccessConfig::default());
+        let mut guide = Guide::new(None, "off".into(), 0.5, 3);
+        guide.ack = true;
+        gateway.set_guide(guide);
+        let sent = Arc::new(Recording(Mutex::new(Vec::new())));
+        gateway.add_notifier(sent.clone());
+        let session = "qq:c2c:A";
+        let alice = gateway.actor("qq:A", session);
+        let turn = tokio::spawn({
+            let gateway = gateway.clone();
+            let alice = alice.clone();
+            async move {
+                gateway
+                    .chat_unattended_with(alice, session, "first", &[])
+                    .await
+            }
+        });
+        while !gateway.running.lock().unwrap().contains_key(session) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let queued = gateway
+            .chat_unattended_with(alice, session, "second", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            queued, "",
+            "answered once it goes in, not with a stock reply"
+        );
+        go.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, "re: first\n\nre: second");
+        let sent = sent.0.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].ends_with("sent just now:\n\nsecond"), "{sent:?}");
     }
 
     #[test]

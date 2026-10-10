@@ -156,8 +156,17 @@ waiting for the turn to end, the new message joins it:
 
 - Web UI: Send stays available during a turn (Stop sits next to it). A
   message sent then is marked "⏳ waiting for a good moment", then "✓ added".
-- QQ: the message is acknowledged at once, and the turn's reply answers it
-  as well.
+- QQ: the turn's reply answers it as well.
+
+When a message goes in, the agent replies to it at once in its own voice,
+for example "明白了，原来是要导出成 CSV，我先把剩下的数据查完再一起导出。": what it
+understood the message to add or change, and what it will do now. This reply
+is written fresh each time (by `agent.summary_model`, else the main model)
+from the turn so far, appears in the Web UI right below the message and is
+sent to the QQ chat. It is not stored in the history, so it never binds the
+model doing the work; if writing it fails or takes over 30 s, a short fixed
+note is sent instead. With `ack = false` QQ answers at once with a fixed
+"got it" instead and the Web UI shows only the marks.
 
 The message waits in the turn's inbox. After each step (a model call and the
 tools it ran) TypeSafe's **Jev** decision model is asked whether this is a
@@ -186,6 +195,7 @@ model = "typesafe/jev-1.13"     # default for openrouter
 insert_at = 0.5                 # Jev's "read it now" probability at or above which it goes in
 max_wait_steps = 3
 timeout_secs = 10
+ack = true                      # reply to each message as it goes in
 ```
 
 The providers work as in [Command auto-review](#command-auto-review). The
