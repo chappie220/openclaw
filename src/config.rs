@@ -319,6 +319,10 @@ pub struct AgentConfig {
     /// Model that writes the context summary, e.g. a cheaper one; default:
     /// model.model.
     pub summary_model: Option<String>,
+    /// Model for the calls that carry images (files people send, browser
+    /// screenshots); default: model.model. Set it when the main model has
+    /// no image input.
+    pub vision_model: Option<String>,
     /// Saved memories looked up from each message and shown with it; 0 turns
     /// recall off.
     pub recall_limit: usize,
@@ -449,6 +453,7 @@ impl Default for AgentConfig {
             max_steps: 25,
             context_tokens: 64_000,
             summary_model: None,
+            vision_model: None,
             recall_limit: 5,
             recall_tokens: 800,
             workspace: PathBuf::new(),

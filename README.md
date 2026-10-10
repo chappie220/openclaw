@@ -132,8 +132,22 @@ message:
 During that message's turn the model sees the images (PNG, JPEG, GIF, WebP up
 to 5 MB, four per message), text files up to 16 KB inline, and a list of
 every file with its workspace path, so tools can open the rest. Later turns
-only get the list. A model without image input is retried once with the
-files only listed. Limits: 20 MB per file, ten files per message.
+only get the list. Limits: 20 MB per file, ten files per message.
+
+Images are looked at by the main model (`model.model`). If it has no image
+input, set an image model yourself; nothing picks one for you:
+
+```toml
+[agent]
+vision_model = "..."   # any OpenRouter model with image input; default: the main model
+```
+
+Only the model calls that carry images (the turn a file arrives in, and
+browser screenshots) go to `vision_model`; everything else stays on the main
+model. When the model given the images refuses them, the call is retried
+once with the files only listed, and the reply ends with a note in your
+language saying the images were not looked at and to set (or change)
+`agent.vision_model`.
 
 ## Stopping a turn
 
@@ -239,8 +253,8 @@ The model looks at its screenshots, so it can read layouts, charts and
 pictures the page text does not carry. During the turn that took them, the
 latest two are sent as images, each right after the tool result that saved
 it, in a note marked as automatic rather than from the user; it is not
-stored, and later turns only see the path. A model without image input is
-retried once with the screenshots only listed, as with
+stored, and later turns only see the path. They go to `agent.vision_model` when it is
+set, and a model without image input gets them only listed, as with
 [images sent by people](#images-and-files).
 
 ```toml
@@ -589,6 +603,7 @@ system_prompt = "You are a helpful personal assistant running on OpenClaw."
 max_steps = 25       # model calls per turn before giving up
 context_tokens = 64000  # token budget per model call; keep below the model's window
 # summary_model = "..."  # model that writes the context summary; default: model.model
+# vision_model = "..."   # model for calls with images; default: model.model
 
 [tools]
 # workspace = "/path"   # default: <state dir>/workspace

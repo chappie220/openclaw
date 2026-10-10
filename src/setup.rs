@@ -163,6 +163,15 @@ const SECTIONS: &[Section] = &[
                 kind: Kind::Text,
             },
             Field {
+                path: &["agent", "vision_model"],
+                label: tr("Image model", "图片模型"),
+                help: tr(
+                    "Model for messages with images (files people send, browser screenshots). Reset (-) to use the main model; set it when the main model has no image input.",
+                    "处理带图片消息（用户发来的图片、浏览器截图）的模型。输入 - 恢复为主模型；主模型不支持图片输入时需要设置。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
                 path: &["agent", "recall_limit"],
                 label: tr("Memories recalled per message", "每条消息自动召回的记忆数"),
                 help: tr(
@@ -917,9 +926,9 @@ mod tests {
         )
         .unwrap();
         // Model (section 2): new id, keep key, two fallbacks, keep retries, cache by number,
-        // a bad then a good budget, reset summary model, keep recall, max steps
-        // and both guide fields.
-        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\ns\n";
+        // a bad then a good budget, reset summary model, keep image model,
+        // recall, max steps and both guide fields.
+        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\n\ns\n";
         let out = drive(&path, script);
         assert!(out.contains("\"lots\" is not a whole number"), "{out}");
         assert!(out.contains("Saved"), "{out}");

@@ -721,6 +721,7 @@ mod tests {
         let agent = Arc::new(Agent {
             model: Echo,
             summarizer: None,
+            vision: None,
             tools: NoTools,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),

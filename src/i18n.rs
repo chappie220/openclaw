@@ -135,6 +135,14 @@ pub mod chat {
     );
     pub const DRAFT_TITLE: Tr = tr("Identity draft #{} (code {})", "身份草稿 #{}（验证码 {}）");
     pub const STOPPED: Tr = tr("Stopped.", "已停止。");
+    pub const NO_VISION_MODEL: Tr = tr(
+        "(The main model cannot take image input, so the images were only listed by name. To have them looked at, set agent.vision_model in config.toml to a model with image input.)",
+        "（主模型不支持图片输入，这次图片只按文件名列出，没有被查看。要让模型看图，请在 config.toml 里把 agent.vision_model 设为支持图片输入的模型。）",
+    );
+    pub const VISION_MODEL_BLIND: Tr = tr(
+        "(The image model {} cannot take image input either, so the images were only listed by name. Set agent.vision_model in config.toml to a model with image input.)",
+        "（图片模型 {} 也不支持图片输入，这次图片只按文件名列出，没有被查看。请在 config.toml 里把 agent.vision_model 改成支持图片输入的模型。）",
+    );
     pub const STOPPING: Tr = tr("Stopping the current turn.", "正在停止当前这一轮。");
     pub const NOTHING_RUNNING: Tr = tr(
         "Nothing is running in this conversation.",
@@ -158,6 +166,8 @@ pub mod chat {
         FAILED,
         EMPTY,
         COMPACT_OWNER_ONLY,
+        NO_VISION_MODEL,
+        VISION_MODEL_BLIND,
         COMPACT_NOTHING,
         COMPACTED,
         IDENTITY_OWNER_ONLY,

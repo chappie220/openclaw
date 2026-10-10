@@ -129,6 +129,8 @@ pub struct Agent<M: Model, T: Tools> {
     pub model: M,
     /// Writes the context summary; `model` when not set.
     pub summarizer: Option<M>,
+    /// Answers the calls that carry images; `model` when not set.
+    pub vision: Option<M>,
     pub tools: T,
     pub store: Store,
     pub config: AgentConfig,
@@ -214,6 +216,8 @@ impl<M: Model, T: Tools> Agent<M, T> {
         self.store.append(session_id, &message)?;
         // Turned off for the rest of the turn if the model rejects images.
         let mut send_images = true;
+        // Images were left unseen; the person is told how to fix it.
+        let mut unseen = false;
         // Looked up once, so every call of this turn sends the same prefix.
         let recall = self.recall(input);
         let specs = self.tools.specs();
@@ -239,9 +243,14 @@ impl<M: Model, T: Tools> Agent<M, T> {
                 .await?,
             );
             let estimated = context::estimate_messages(&messages) + context::estimate(&tool_json);
+            let with_images = messages.iter().any(|m| !m.images.is_empty());
+            let model = match &self.vision {
+                Some(vision) if with_images => vision,
+                _ => &self.model,
+            };
             let mut shown = String::new();
             let completion = cancel
-                .until(self.model.complete(&messages, &specs, &mut |text| {
+                .until(model.complete(&messages, &specs, &mut |text| {
                     shown.push_str(text);
                     on_event(AgentEvent::Text(text.to_owned()))
                 }))
@@ -255,10 +264,11 @@ impl<M: Model, T: Tools> Agent<M, T> {
                 Err(err)
                     if send_images
                         && shown.is_empty()
-                        && messages.iter().any(|m| !m.images.is_empty())
+                        && with_images
                         && format!("{err:#}").to_lowercase().contains("image") =>
                 {
                     eprintln!("model: no image input ({err:#}); sending the files as a list");
+                    unseen = true;
                     send_images = false;
                     continue;
                 }
@@ -283,6 +293,9 @@ impl<M: Model, T: Tools> Agent<M, T> {
                     _ => Vec::new(),
                 };
                 if late.is_empty() {
+                    if unseen {
+                        answers.push(self.unseen_images_hint());
+                    }
                     answers.retain(|a| !a.trim().is_empty());
                     return Ok(answers.join("\n\n"));
                 }
@@ -463,6 +476,19 @@ impl<M: Model, T: Tools> Agent<M, T> {
         self.store
             .append(session_id, &ChatMessage::assistant(note))?;
         Ok(chat::STOPPED.now().into())
+    }
+
+    /// Tells the person their images went unseen and which setting fixes it.
+    fn unseen_images_hint(&self) -> String {
+        match self
+            .config
+            .vision_model
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+        {
+            Some(model) => chat::VISION_MODEL_BLIND.with(&[model]),
+            None => chat::NO_VISION_MODEL.now().into(),
+        }
     }
 
     fn summarizer(&self) -> &M {
@@ -744,6 +770,7 @@ mod tests {
                 },
             ])),
             summarizer: None,
+            vision: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -810,6 +837,7 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
             },
             summarizer: None,
+            vision: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -915,6 +943,7 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
             },
             summarizer: None,
+            vision: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1033,6 +1062,7 @@ mod tests {
                 ..Default::default()
             }])),
             summarizer: None,
+            vision: None,
             tools: Stuck,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1107,6 +1137,7 @@ mod tests {
         Agent {
             model,
             summarizer: None,
+            vision: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1198,10 +1229,81 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(reply, "ok");
+        // The person is told the images went unseen and what to set.
+        assert_eq!(reply, format!("ok\n\n{}", chat::NO_VISION_MODEL.now()));
         let seen = agent.model.0.lock().unwrap();
         let text = seen[0].last().unwrap().content.clone().unwrap();
         assert!(text.contains("cannot see images"), "{text}");
+        let id = agent.store.session_id("s").unwrap();
+        let stored = agent.store.history(id, 10).unwrap();
+        assert_eq!(stored.last().unwrap().content.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn calls_with_images_go_to_the_vision_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = files_agent(Blind(Mutex::new(Vec::new())), dir.path());
+        agent.vision = Some(Blind(Mutex::new(Vec::new())));
+        agent.config.vision_model = Some("blind/too".into());
+        let (files, _) = agent.save_uploads(&uploads());
+        let actor = || Actor::owner(access::CLI);
+        let reply = agent
+            .run_turn_until(
+                actor(),
+                "s",
+                "look",
+                &files,
+                &Cancel::default(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        // A vision model that cannot see either is named in the hint.
+        assert_eq!(
+            reply,
+            format!("ok\n\n{}", chat::VISION_MODEL_BLIND.with(&["blind/too"]))
+        );
+        // After the retry without images the main model answers again.
+        assert_eq!(agent.model.0.lock().unwrap().len(), 1);
+        assert!(agent.vision.as_ref().unwrap().0.lock().unwrap().is_empty());
+
+        let seeing = Agent {
+            vision: Some(Playback {
+                script: Mutex::new(vec![answer("a cat")]),
+                seen: Mutex::new(Vec::new()),
+            }),
+            ..files_agent(
+                Playback {
+                    script: Mutex::new(vec![answer("thanks back")]),
+                    seen: Mutex::new(Vec::new()),
+                },
+                dir.path(),
+            )
+        };
+        let reply = seeing
+            .run_turn_until(
+                actor(),
+                "t",
+                "look",
+                &files,
+                &Cancel::default(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, "a cat");
+        let images = seeing.vision.as_ref().unwrap().seen.lock().unwrap()[0]
+            .last()
+            .unwrap()
+            .images
+            .len();
+        assert_eq!(images, 1);
+        // Later turns carry no images, so the main model answers them.
+        let reply = seeing
+            .run_turn(actor(), "t", "thanks", &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(reply, "thanks back");
     }
 
     #[tokio::test]
@@ -1240,6 +1342,7 @@ mod tests {
                 ..Default::default()
             }])),
             summarizer: None,
+            vision: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1309,6 +1412,7 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
             },
             summarizer: None,
+            vision: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1353,6 +1457,7 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
             },
             summarizer: None,
+            vision: None,
             tools: Camera(dir.path().to_owned(), Default::default()),
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1558,6 +1663,7 @@ mod tests {
         let agent = Agent {
             model: Scripted(Mutex::new(looping)),
             summarizer: None,
+            vision: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {

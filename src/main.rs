@@ -512,9 +512,20 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         )?),
         _ => None,
     };
+    let vision = match &config.agent.vision_model {
+        Some(model) if !model.trim().is_empty() => Some(llm::Client::new(
+            &config::ModelConfig {
+                model: model.clone(),
+                ..config.model.clone()
+            },
+            api_key.clone(),
+        )?),
+        _ => None,
+    };
     Ok(Agent {
         model: llm::Client::new(&config.model, api_key)?,
         summarizer,
+        vision,
         tools: BuiltinTools::new(workspace.clone(), config.tools.clone(), store.clone())?
             .with_search(search)
             .with_browser(browser::Browser::new(&config.browser, state, &workspace))
