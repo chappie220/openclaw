@@ -15,6 +15,10 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful personal assistant runnin
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Language of CLI output and the program's own chat replies; `None`
+    /// follows the locale. Root keys must come before the tables in TOML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<crate::i18n::Lang>,
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,

@@ -51,10 +51,23 @@ default, `?` explains it. Secrets are typed without echo and the prompt says
 when an environment variable overrides them; `+` generates a Gateway token.
 Comments and keys the editor does not know are kept, every change is checked
 before it is accepted, and the file is saved with mode 0600. It also opens a
-file that currently fails to load, so it can be repaired. Menus and help are
-in Chinese when the locale is `zh*` (`LC_ALL`, `LC_MESSAGES` or `LANG`) and in
-English otherwise; `--lang en|zh` overrides it. The full list of
+file that currently fails to load, so it can be repaired. The full list of
 options is under [Memory](#memory) below.
+
+## Language
+
+English and Chinese. CLI output and `--help`, the config editor, and the
+program's own chat replies (`/compact`, `/identity`, errors on QQ and email)
+use, in order: `--lang en|zh`, then `language` in config.toml, then the
+locale (`LC_ALL`, `LC_MESSAGES`, `LANG`; `zh*` means Chinese). A service
+started by OpenRC usually has no locale, so set it in the file:
+
+```toml
+language = "zh"   # first line, above the [tables]
+```
+
+The Web UI follows the browser's language and has a 中文/EN switch, remembered
+per browser. Logs and everything the model reads stay in English.
 
 ## Gateway and Web UI
 

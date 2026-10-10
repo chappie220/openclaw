@@ -2,10 +2,12 @@
 
 mod access;
 mod agent;
+mod cli_text;
 mod config;
 mod context;
 mod cron;
 mod gateway;
+mod i18n;
 mod identity;
 mod llm;
 mod mail;
@@ -24,11 +26,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{FromArgMatches, Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::{Agent, AgentEvent};
+use crate::cli_text as text;
 use crate::config::Config;
+use crate::i18n::Lang;
 use crate::store::Store;
 use crate::tools::{BuiltinTools, TerminalApprover, with_approver};
 
@@ -38,6 +42,9 @@ struct Cli {
     /// Config file (default: <state dir>/config.toml).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Language of output and help (default: `language` in config.toml, else the locale).
+    #[arg(long, global = true, value_enum)]
+    lang: Option<Lang>,
     #[command(subcommand)]
     command: Command,
 }
@@ -87,11 +94,7 @@ enum Command {
         action: MemoryAction,
     },
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
-    Config {
-        /// Language of the editor (default: from LC_ALL / LC_MESSAGES / LANG).
-        #[arg(long, value_enum)]
-        lang: Option<setup::Lang>,
-    },
+    Config,
     /// Tokens and cost of model calls, per session.
     Usage {
         /// How many days back to count.
@@ -214,10 +217,47 @@ enum SessionsAction {
 
 #[tokio::main]
 async fn main() {
-    if let Err(err) = run(Cli::parse()).await {
-        eprintln!("error: {err:#}");
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Chosen before parsing, so `--help` is in the same language.
+    i18n::set(startup_lang(&args));
+    let matches = text::command::<Cli>(i18n::current()).get_matches_from(args);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    if let Err(err) = run(cli).await {
+        eprintln!("{}", text::ERROR.with(&[&format!("{err:#}")]));
         std::process::exit(1);
     }
+}
+
+/// `--lang`, else `language` in the config file, else the locale.
+fn startup_lang(args: &[std::ffi::OsString]) -> Lang {
+    use clap::ValueEnum;
+    let mut lang = None;
+    let mut config = None;
+    let mut words = args
+        .iter()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned());
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if let Some(value) = word.strip_prefix("--lang=") {
+            lang = Some(value.to_owned());
+        } else if word == "--lang" {
+            lang = words.next();
+        } else if let Some(value) = word.strip_prefix("--config=") {
+            config = Some(PathBuf::from(value));
+        } else if word == "--config" {
+            config = words.next().map(PathBuf::from);
+        }
+    }
+    if let Some(lang) = lang.and_then(|l| Lang::from_str(&l, true).ok()) {
+        return lang;
+    }
+    let path = config.or_else(|| config::state_dir().ok().map(|d| d.join("config.toml")));
+    path.and_then(|p| Config::load(&p).ok())
+        .and_then(|c| c.language)
+        .unwrap_or_else(Lang::detect)
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -230,8 +270,11 @@ async fn run(cli: Cli) -> Result<()> {
     let state = config::state_dir()?;
     let config_path = cli.config.unwrap_or_else(|| state.join("config.toml"));
     // Before loading, so a file that does not load can still be repaired.
-    if let Command::Config { lang } = cli.command {
-        return setup::run(&config_path, lang.unwrap_or_else(setup::Lang::detect));
+    if let Some(lang) = cli.lang {
+        i18n::set(lang);
+    }
+    if let Command::Config = cli.command {
+        return setup::run(&config_path, i18n::current());
     }
     let config = Config::load(&config_path)?;
     let store = Store::open(&state)?;
@@ -246,9 +289,9 @@ async fn run(cli: Cli) -> Result<()> {
             action: MailAction::Retry { id },
         } => {
             if !store.mail_requeue(id)? {
-                bail!("no failed or uncertain message #{id}; see `openclaw-rs mail queue`");
+                bail!(text::MAIL_RETRY_NONE.with(&[&id.to_string()]));
             }
-            println!("queued #{id} again; the running Gateway picks it up on its next poll");
+            println!("{}", text::MAIL_REQUEUED.with(&[&id.to_string()]));
             Ok(())
         }
         Command::Mail {
@@ -266,15 +309,15 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             if failed {
-                bail!("mail check failed");
+                bail!(text::MAIL_CHECK_FAILED.now());
             }
             Ok(())
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
-        Command::Config { .. } => unreachable!("handled before the config is loaded"),
+        Command::Config => unreachable!("handled before the config is loaded"),
         Command::Serve { bind } => {
             if store.identity()?.is_none() {
-                eprintln!("{FIRST_START_HINT}");
+                eprintln!("{}", text::FIRST_START.now());
             }
             let agent = Arc::new(build_agent(&config, &state, store)?);
             let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
@@ -290,11 +333,7 @@ async fn run(cli: Cli) -> Result<()> {
                     || (strangers.contains(&access::Capability::FilesWrite)
                         && config.tools.write == config::Permission::Allow);
                 if stranger_runs && config.qq.allow.is_empty() {
-                    bail!(
-                        "access.guest or access.grants.\"qq:*\" lets any QQ user run commands or \
-                         write files; list trusted openids in qq.allow (the log shows each \
-                         sender's openid), or grant those capabilities to named senders only"
-                    );
+                    bail!(text::QQ_OPEN_TO_STRANGERS.now());
                 }
                 let bot = qq::QqBot::new(config.qq.clone())?;
                 gateway.add_notifier(bot.clone());
@@ -302,10 +341,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if (config.qq.enabled || config.mail.enabled) && config.access.owners.is_empty() {
                 eprintln!(
-                    "access: no access.owners, so every QQ and email sender is a guest that can \
-                     only use {:?}; add yourself as \"qq:<openid>\" or \"mail:<address>\" to \
-                     use memory, cron, files or shell from there",
-                    config.access.guest
+                    "{}",
+                    text::NO_OWNERS.with(&[&format!("{:?}", config.access.guest)])
                 );
             }
             if config.mail.enabled {
@@ -319,13 +356,16 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sessions { action } => sessions(&store, action.unwrap_or(SessionsAction::List)),
         Command::Usage { days } => {
             let since = store::now() - i64::from(days) * 86_400;
-            print!("{}", usage::report(&store.usage_since(since)?));
+            print!(
+                "{}",
+                usage::report(&store.usage_since(since)?, i18n::current())
+            );
             Ok(())
         }
         Command::Ask { session, message } => {
             let message = message.join(" ");
             if message.trim().is_empty() {
-                bail!("nothing to send");
+                bail!(text::NOTHING_TO_SEND.now());
             }
             let agent = build_agent(&config, &state, store)?;
             turn(&agent, &session, &message).await
@@ -334,12 +374,15 @@ async fn run(cli: Cli) -> Result<()> {
             let name = store.identity()?.map(|i| i.name);
             let agent = build_agent(&config, &state, store)?;
             eprintln!(
-                "{} · session {session} · model {} · empty line or Ctrl-D to quit",
-                name.as_deref().unwrap_or("OpenClaw"),
-                config.model.model
+                "{}",
+                text::CHAT_BANNER.with(&[
+                    name.as_deref().unwrap_or("OpenClaw"),
+                    &session,
+                    &config.model.model
+                ])
             );
             if name.is_none() {
-                eprintln!("{FIRST_START_HINT}");
+                eprintln!("{}", text::FIRST_START.now());
             }
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             loop {
@@ -351,7 +394,7 @@ async fn run(cli: Cli) -> Result<()> {
                     break;
                 }
                 if let Err(err) = turn(&agent, &session, &line).await {
-                    eprintln!("error: {err:#}");
+                    eprintln!("{}", text::ERROR.with(&[&format!("{err:#}")]));
                 }
             }
             Ok(())
@@ -360,10 +403,6 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 type CliAgent = Agent<llm::Client, BuiltinTools>;
-
-const FIRST_START_HINT: &str = "First start: the agent has no identity yet and will ask who it \
-should be. Describe it, or name a fictional character for it to look up and become \
-(e.g. \"be Sun Wukong\"). `openclaw-rs identity set` works too.";
 
 fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
     let workspace = config
@@ -406,9 +445,14 @@ async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
             let _ = stdout.write_all(text.as_bytes());
             let _ = stdout.flush();
         }
-        AgentEvent::ToolStart { name, arguments } => eprintln!("\n[tool {name} {arguments}]"),
+        AgentEvent::ToolStart { name, arguments } => {
+            eprintln!("\n{}", text::TOOL_START.with(&[&name, &arguments]))
+        }
         AgentEvent::ToolEnd { name, output } => {
-            eprintln!("[tool {name} → {} bytes]", output.len());
+            eprintln!(
+                "{}",
+                text::TOOL_END.with(&[&name, &output.len().to_string()])
+            );
         }
     };
     let run = agent.run_turn(
@@ -425,7 +469,7 @@ async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
 fn mail_queue(store: &Store) -> Result<()> {
     let (counts, entries) = store.mail_inbox()?;
     if counts.is_empty() {
-        println!("no mail received yet");
+        println!("{}", text::NO_MAIL.now());
         return Ok(());
     }
     let counts: Vec<String> = counts.iter().map(|(s, n)| format!("{s} {n}")).collect();
@@ -439,12 +483,15 @@ fn mail_queue(store: &Store) -> Result<()> {
                 .map_or_else(String::new, |t| t.format("%Y-%m-%d %H:%M").to_string())
         };
         println!(
-            "#{} {} {} from {} attempts={} updated {when}",
-            e.id,
-            e.state,
-            e.key,
-            e.sender.as_deref().unwrap_or("?"),
-            e.attempts
+            "{}",
+            text::MAIL_ENTRY.with(&[
+                &e.id.to_string(),
+                &e.state,
+                &e.key,
+                e.sender.as_deref().unwrap_or("?"),
+                &e.attempts.to_string(),
+                &when
+            ])
         );
         if let Some(error) = e.last_error {
             println!("    {error}");
@@ -457,7 +504,7 @@ fn cron_command(store: &Store, action: CronAction) -> Result<()> {
     let time = |unix: i64| {
         use chrono::TimeZone;
         chrono::Local.timestamp_opt(unix, 0).single().map_or_else(
-            || "never".into(),
+            || text::NEVER.now().into(),
             |t| t.format("%Y-%m-%d %H:%M").to_string(),
         )
     };
@@ -469,26 +516,31 @@ fn cron_command(store: &Store, action: CronAction) -> Result<()> {
             session,
         } => {
             let job = store.job_add(&name, &schedule, &session, &prompt.join(" "), access::CLI)?;
-            println!("added {} · next run {}", job.name, time(job.next_run));
+            println!(
+                "{}",
+                text::CRON_ADDED.with(&[&job.name, &time(job.next_run)])
+            );
         }
         CronAction::List => {
             for j in store.job_list()? {
                 println!(
-                    "{}\t{}\tsession={}\tnext={}\tlast={}\t{}",
-                    j.name,
-                    j.schedule,
-                    j.session,
-                    time(j.next_run),
-                    j.last_status.as_deref().unwrap_or("-"),
-                    j.prompt
+                    "{}",
+                    text::CRON_ROW.with(&[
+                        &j.name,
+                        &j.schedule,
+                        &j.session,
+                        &time(j.next_run),
+                        j.last_status.as_deref().unwrap_or("-"),
+                        &j.prompt
+                    ])
                 );
             }
         }
         CronAction::Remove { name } => {
             if !store.job_remove(&name)? {
-                bail!("no job named {name}");
+                bail!(text::NO_JOB.with(&[&name]));
             }
-            println!("removed {name}");
+            println!("{}", text::REMOVED.with(&[&name]));
         }
     }
     Ok(())
@@ -502,7 +554,8 @@ fn memory(store: &Store, action: MemoryAction) -> Result<()> {
     };
     match action {
         MemoryAction::Add { content } => {
-            println!("saved #{}", store.memory_save(&content.join(" "))?)
+            let id = store.memory_save(&content.join(" "))?;
+            println!("{}", text::MEMORY_SAVED.with(&[&id.to_string()]))
         }
         MemoryAction::Search { query, limit } => {
             print(store.memory_search(&query.join(" "), limit)?)
@@ -510,9 +563,9 @@ fn memory(store: &Store, action: MemoryAction) -> Result<()> {
         MemoryAction::List { limit } => print(store.memory_list(limit)?),
         MemoryAction::Delete { id } => {
             if !store.memory_delete(id)? {
-                bail!("no memory #{id}");
+                bail!(text::NO_MEMORY.with(&[&id.to_string()]));
             }
-            println!("deleted #{id}");
+            println!("{}", text::DELETED_NUMBER.with(&[&id.to_string()]));
         }
     }
     Ok(())
@@ -534,7 +587,7 @@ fn identity(store: &Store, action: IdentityAction) -> Result<()> {
                 i.identity_md(),
                 i.soul
             ),
-            None => println!("no identity yet; the next conversation sets one up"),
+            None => println!("{}", text::NO_IDENTITY.now()),
         },
         IdentityAction::Set {
             name,
@@ -547,7 +600,7 @@ fn identity(store: &Store, action: IdentityAction) -> Result<()> {
             let soul = match (soul, soul_file) {
                 (Some(soul), _) => soul,
                 (None, Some(path)) => std::fs::read_to_string(&path)
-                    .with_context(|| format!("cannot read {}", path.display()))?,
+                    .with_context(|| text::CANNOT_READ.with(&[&path.display().to_string()]))?,
                 (None, None) => unreachable!("clap requires --soul or --soul-file"),
             };
             store.identity_set(&identity::Identity {
@@ -558,7 +611,7 @@ fn identity(store: &Store, action: IdentityAction) -> Result<()> {
                 soul,
                 ..identity::Identity::default()
             })?;
-            println!("identity saved");
+            println!("{}", text::IDENTITY_SAVED.now());
         }
         IdentityAction::Drafts => owner_command(store, "/identity show"),
         IdentityAction::Approve { id, code } => owner_command(
@@ -568,9 +621,9 @@ fn identity(store: &Store, action: IdentityAction) -> Result<()> {
         IdentityAction::Reject { id } => owner_command(store, &format!("/identity reject {id}")),
         IdentityAction::Reset => {
             if store.identity_clear()? {
-                println!("identity removed; the next conversation sets it up again");
+                println!("{}", text::IDENTITY_REMOVED.now());
             } else {
-                println!("no identity to remove");
+                println!("{}", text::NO_IDENTITY_TO_REMOVE.now());
             }
         }
     }
@@ -582,16 +635,20 @@ fn sessions(store: &Store, action: SessionsAction) -> Result<()> {
         SessionsAction::List => {
             for s in store.sessions()? {
                 println!(
-                    "{}\t{} messages\tupdated {}",
-                    s.name, s.messages, s.updated_at
+                    "{}",
+                    text::SESSION_ROW.with(&[
+                        &s.name,
+                        &s.messages.to_string(),
+                        &s.updated_at.to_string()
+                    ])
                 );
             }
         }
         SessionsAction::Delete { name } => {
             if !store.delete_session(&name)? {
-                bail!("no session named {name}");
+                bail!(text::NO_SESSION.with(&[&name]));
             }
-            println!("deleted {name}");
+            println!("{}", text::DELETED.with(&[&name]));
         }
     }
     Ok(())

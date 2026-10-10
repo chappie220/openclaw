@@ -901,7 +901,7 @@ async fn advance<M: Model + 'static, T: Tools + 'static>(
                 return Ok(());
             }
             // Out of attempts: tell the sender rather than leaving them waiting.
-            Err(err) => format!("出错了：{err:#}"),
+            Err(err) => crate::i18n::chat::FAILED.with(&[&format!("{err:#}")]),
         };
         let message_id = outgoing_message_id(&bot.from, item.id);
         store.mail_reply_ready(item.id, &reply, &message_id)?;

@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use crate::access::{self, Actor};
 use crate::config::AgentConfig;
 use crate::context;
+use crate::i18n::chat;
 use crate::identity;
 use crate::llm::{ChatMessage, Client, Completion, ToolCall, ToolSpec};
 use crate::store::Store;
@@ -96,7 +97,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
         let session_id = self.store.session_id(session)?;
         if is_compact_command(input) {
             if !access::current().is_some_and(|a| a.owner) {
-                return Ok("Only the owner can compact this conversation.".into());
+                return Ok(chat::COMPACT_OWNER_ONLY.now().into());
             }
             return self.compact(session, session_id).await;
         }
@@ -181,7 +182,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
     async fn compact(&self, session: &str, session_id: i64) -> Result<String> {
         let ctx = self.store.context(session_id)?;
         let Some(&(last, _)) = ctx.messages.last() else {
-            return Ok("Nothing to compact yet.".into());
+            return Ok(chat::COMPACT_NOTHING.now().into());
         };
         let count = ctx.messages.len();
         let messages: Vec<ChatMessage> = ctx.messages.into_iter().map(|(_, m)| m).collect();
@@ -200,10 +201,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
             pruned_before: last + 1,
         };
         self.store.set_context(session_id, marks, Some(&summary))?;
-        Ok(format!(
-            "Compacted {count} messages into the summary (about {} tokens).",
-            context::estimate(&summary)
-        ))
+        Ok(chat::COMPACTED.with(&[&count.to_string(), &context::estimate(&summary).to_string()]))
     }
 
     /// The history to send after the system prompt, within the token budget.

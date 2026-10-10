@@ -229,7 +229,7 @@ fn describe(body: &Value) -> String {
 fn split(text: &str, max_chars: usize) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
-        return vec!["（无回复内容）".into()];
+        return vec![crate::i18n::chat::EMPTY.now().into()];
     }
     let mut chunks = Vec::new();
     let mut rest: Vec<char> = text.chars().collect();
@@ -469,7 +469,7 @@ fn handle<M: Model + 'static, T: Tools + 'static>(
             .await
         {
             Ok(text) => text,
-            Err(err) => format!("出错了：{err:#}"),
+            Err(err) => crate::i18n::chat::FAILED.with(&[&format!("{err:#}")]),
         };
         if let Err(err) = bot.send(&incoming.target, &reply, Some(&incoming.id)).await {
             eprintln!("qq: cannot reply in {session}: {err:#}");
@@ -675,7 +675,7 @@ mod tests {
                 .iter()
                 .all(|c| c.chars().count() <= 10)
         );
-        assert_eq!(split("  ", 10), vec!["（无回复内容）"]);
+        assert_eq!(split("  ", 10), vec![crate::i18n::chat::EMPTY.now()]);
     }
 
     #[test]

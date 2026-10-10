@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -22,7 +22,9 @@
     font: 15px/1.55 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
   aside { width: 230px; flex: none; border-right: 1px solid var(--line); background: var(--panel);
     display: flex; flex-direction: column; }
-  aside h1 { font-size: 16px; margin: 0; padding: 16px; }
+  aside header { display: flex; align-items: center; justify-content: space-between; padding: 12px 12px 12px 16px; }
+  aside h1 { font-size: 16px; margin: 0; }
+  #lang { min-height: 28px; padding: 0 10px; font-size: 12px; }
   #new { display: flex; gap: 6px; padding: 0 12px 12px; }
   #new input { flex: 1; min-width: 0; }
   #sessions { list-style: none; margin: 0; padding: 0 8px; overflow-y: auto; flex: 1; }
@@ -57,21 +59,63 @@
 </head>
 <body>
 <aside>
-  <h1>OpenClaw</h1>
-  <form id="new"><input id="newName" placeholder="新会话名称" maxlength="64"><button>新建</button></form>
+  <header><h1>OpenClaw</h1><button id="lang" class="secondary" type="button"></button></header>
+  <form id="new"><input id="newName" data-i18n-placeholder="newName" maxlength="64"><button data-i18n="create"></button></form>
   <ul id="sessions"></ul>
-  <div id="status">连接中…</div>
+  <div id="status"></div>
 </aside>
 <main>
   <div id="log"></div>
   <form id="composer">
-    <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
-    <button id="send">发送</button>
+    <textarea id="input" rows="1" data-i18n-placeholder="input"></textarea>
+    <button id="send" data-i18n="send"></button>
   </form>
 </main>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+
+// Every text the page shows itself; replies come from the server as they are.
+const STRINGS = {
+  en: {
+    newName: "New session name", create: "New", input: "Message — Enter to send, Shift+Enter for a new line",
+    send: "Send", connecting: "Connecting…", connected: "Connected", reconnecting: "Disconnected, retrying in 3 s",
+    token: "Access token needed (OPENCLAW_RS_TOKEN):", allowTool: "Allow {tool}?", allow: "Allow", deny: "Deny",
+    allowed: "Allowed {tool}", denied: "Denied {tool}", switchTo: "中文",
+  },
+  zh: {
+    newName: "新会话名称", create: "新建", input: "输入消息，Enter 发送，Shift+Enter 换行",
+    send: "发送", connecting: "连接中…", connected: "已连接", reconnecting: "连接断开，3 秒后重试",
+    token: "需要访问令牌（OPENCLAW_RS_TOKEN）：", allowTool: "允许执行 {tool}？", allow: "允许", deny: "拒绝",
+    allowed: "已允许 {tool}", denied: "已拒绝 {tool}", switchTo: "EN",
+  },
+};
+const LANG_KEY = "openclaw.lang";
+function preferredLang() {
+  const saved = localStorage.getItem(LANG_KEY);
+  if (saved && STRINGS[saved]) return saved;
+  const browser = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || "en"];
+  return browser.some((l) => l.toLowerCase().startsWith("zh")) ? "zh" : "en";
+}
+let lang = preferredLang();
+let statusKey = "connecting";
+function t(key, vars = {}) {
+  return (STRINGS[lang][key] || STRINGS.en[key]).replace(/\{(\w+)\}/g, (_, name) => vars[name] ?? "");
+}
+function setStatus(key) { statusKey = key; $("status").textContent = t(key); }
+function applyLang() {
+  document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
+  for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+  for (const el of document.querySelectorAll("[data-i18n-placeholder]")) el.placeholder = t(el.dataset.i18nPlaceholder);
+  $("lang").textContent = t("switchTo");
+  $("status").textContent = t(statusKey);
+}
+$("lang").onclick = () => {
+  lang = lang === "zh" ? "en" : "zh";
+  localStorage.setItem(LANG_KEY, lang);
+  applyLang();
+};
+applyLang();
 const log = $("log"), input = $("input");
 let ws, current = localStorage.getItem("openclaw.session") || "main";
 let streaming = null; // assistant bubble receiving deltas for the current session
@@ -86,12 +130,12 @@ function token() {
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token())}`);
-  ws.onopen = () => { $("status").textContent = "已连接"; send({ type: "sessions" }); open(current); };
+  ws.onopen = () => { setStatus("connected"); send({ type: "sessions" }); open(current); };
   ws.onclose = (e) => {
-    $("status").textContent = "连接断开，3 秒后重试";
+    setStatus("reconnecting");
     if (e.code === 1006 && !ws.everOpened) {
-      const t = prompt("需要访问令牌（OPENCLAW_RS_TOKEN）：");
-      if (t !== null) localStorage.setItem("openclaw.token", t.trim());
+      const entered = prompt(t("token"));
+      if (entered !== null) localStorage.setItem("openclaw.token", entered.trim());
     }
     setTimeout(connect, 3000);
   };
@@ -179,11 +223,11 @@ function handle(m) {
     case "approval": {
       streaming = null;
       const card = bubble("approval", "");
-      const title = document.createElement("strong"); title.textContent = `${elsewhere}允许执行 ${m.tool}？`;
+      const title = document.createElement("strong"); title.textContent = elsewhere + t("allowTool", { tool: m.tool });
       const code = document.createElement("code"); code.textContent = m.summary;
-      const yes = document.createElement("button"); yes.textContent = "允许";
-      const no = document.createElement("button"); no.textContent = "拒绝"; no.className = "secondary"; no.style.marginLeft = "8px";
-      const answer = (allow) => { send({ type: "approve", id: m.id, allow }); card.textContent = allow ? `已允许 ${m.tool}` : `已拒绝 ${m.tool}`; };
+      const yes = document.createElement("button"); yes.textContent = t("allow");
+      const no = document.createElement("button"); no.textContent = t("deny"); no.className = "secondary"; no.style.marginLeft = "8px";
+      const answer = (allow) => { send({ type: "approve", id: m.id, allow }); card.textContent = t(allow ? "allowed" : "denied", { tool: m.tool }); };
       yes.onclick = () => answer(true); no.onclick = () => answer(false);
       card.append(title, code, yes, no);
       break;

@@ -45,7 +45,10 @@ pub struct TerminalApprover;
 #[async_trait]
 impl Approver for TerminalApprover {
     async fn approve(&self, tool: &str, summary: &str) -> bool {
-        let prompt = format!("\nAllow {tool}?\n  {summary}\n[y/N] ");
+        let prompt = format!(
+            "\n{}\n  {summary}\n[y/N] ",
+            crate::cli_text::ALLOW_TOOL.with(&[tool])
+        );
         tokio::task::spawn_blocking(move || {
             use std::io::{BufRead, Write};
             let Ok(tty) = std::fs::OpenOptions::new()
@@ -65,7 +68,7 @@ impl Approver for TerminalApprover {
             }
             let mut answer = String::new();
             std::io::BufReader::new(&tty).read_line(&mut answer).is_ok()
-                && matches!(answer.trim(), "y" | "Y" | "yes")
+                && matches!(answer.trim(), "y" | "Y" | "yes" | "是")
         })
         .await
         .unwrap_or(false)

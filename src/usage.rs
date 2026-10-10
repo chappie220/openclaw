@@ -4,6 +4,7 @@
 use anyhow::Result;
 use rusqlite::params;
 
+use crate::i18n::{Lang, Tr, tr};
 use crate::llm::Usage;
 use crate::store::{Store, now};
 
@@ -99,14 +100,54 @@ fn tokens(n: u64) -> String {
     }
 }
 
-/// A plain-text table of `rows` with a total line.
-pub fn report(rows: &[SessionUsage]) -> String {
-    let mut out = format!(
-        "{:<28} {:>6} {:>9} {:>7} {:>9} {:>10}\n",
-        "session", "calls", "input", "cached", "output", "cost"
-    );
+const HEADERS: [Tr; 6] = [
+    tr("session", "会话"),
+    tr("calls", "调用"),
+    tr("input", "输入"),
+    tr("cached", "缓存"),
+    tr("output", "输出"),
+    tr("cost", "费用"),
+];
+const TOTAL: Tr = tr("total", "合计");
+const NAME_WIDTH: usize = 28;
+const WIDTHS: [usize; 5] = [6, 9, 7, 9, 10];
+
+/// Terminal columns of `text`: CJK and other wide characters take two.
+fn width(text: &str) -> usize {
+    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+fn pad_right(text: &str, to: usize) -> String {
+    format!("{text}{}", " ".repeat(to.saturating_sub(width(text))))
+}
+
+fn pad_left(text: &str, to: usize) -> String {
+    format!("{}{text}", " ".repeat(to.saturating_sub(width(text))))
+}
+
+fn line(name: &str, cells: [String; 5]) -> String {
+    let name: String = name
+        .chars()
+        .scan(0, |used, c| {
+            *used += width(&c.to_string());
+            (*used <= NAME_WIDTH).then_some(c)
+        })
+        .collect();
+    let mut out = pad_right(&name, NAME_WIDTH);
+    for (cell, to) in cells.iter().zip(WIDTHS) {
+        out.push(' ');
+        out.push_str(&pad_left(cell, to));
+    }
+    out.push('\n');
+    out
+}
+
+/// A plain-text table of `rows` with a total line, in `lang`.
+pub fn report(rows: &[SessionUsage], lang: Lang) -> String {
+    let [session, rest @ ..] = HEADERS.map(|h| h.get(lang).to_owned());
+    let mut out = line(&session, rest);
     let mut total = SessionUsage {
-        session: "total".into(),
+        session: TOTAL.get(lang).into(),
         calls: 0,
         usage: Usage::default(),
     };
@@ -124,14 +165,15 @@ pub fn report(rows: &[SessionUsage]) -> String {
                 100.0 * u.cached_tokens as f64 / u.prompt_tokens as f64
             )
         };
-        let name: String = row.session.chars().take(28).collect();
-        out.push_str(&format!(
-            "{name:<28} {:>6} {:>9} {:>7} {:>9} {:>10}\n",
-            row.calls,
-            tokens(u.prompt_tokens),
-            cached,
-            tokens(u.completion_tokens),
-            format!("${:.4}", u.cost)
+        out.push_str(&line(
+            &row.session,
+            [
+                row.calls.to_string(),
+                tokens(u.prompt_tokens),
+                cached,
+                tokens(u.completion_tokens),
+                format!("${:.4}", u.cost),
+            ],
         ));
     }
     out
@@ -166,10 +208,29 @@ mod tests {
         assert_eq!(rows[1].usage.prompt_tokens, 1500);
         assert_eq!(rows[1].usage.cached_tokens, 800);
         assert!(store.usage_since(now() + 10).unwrap().is_empty());
-        let table = report(&rows);
+        let table = report(&rows, Lang::En);
         assert!(table.contains("total"));
         assert!(table.contains("1.6k"), "{table}");
         assert!(table.contains("$0.0620"), "{table}");
+    }
+
+    #[test]
+    fn chinese_headers_stay_aligned() {
+        let rows = vec![SessionUsage {
+            session: "qq:群聊".into(),
+            calls: 3,
+            usage: Usage {
+                prompt_tokens: 2000,
+                cost: 0.5,
+                ..Usage::default()
+            },
+        }];
+        let table = report(&rows, Lang::Zh);
+        assert!(table.starts_with("会话"), "{table}");
+        assert!(table.contains("合计"), "{table}");
+        let widths: Vec<usize> = table.lines().map(width).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{table}");
+        crate::i18n::assert_complete(&HEADERS);
     }
 
     #[test]

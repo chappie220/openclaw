@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use toml_edit::{Array, DocumentMut, Item, Value};
 
 use crate::config::Config;
+pub use crate::i18n::Lang;
+use crate::i18n::{Tr, tr};
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -26,69 +28,6 @@ enum Kind {
         env: &'static str,
         generate: bool,
     },
-}
-
-/// Language of the editor's menus, prompts and help. Config values such as
-/// `allow` or `tls` stay as they are written in the file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum Lang {
-    En,
-    Zh,
-}
-
-impl Lang {
-    /// From the locale (`LC_ALL`, then `LC_MESSAGES`, then `LANG`): Chinese
-    /// for `zh*`, otherwise English.
-    pub fn detect() -> Self {
-        let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
-            .iter()
-            .filter_map(|name| std::env::var(name).ok())
-            .find(|value| !value.is_empty())
-            .unwrap_or_default();
-        Self::from_locale(&locale)
-    }
-
-    fn from_locale(locale: &str) -> Self {
-        if locale.to_ascii_lowercase().starts_with("zh") {
-            Lang::Zh
-        } else {
-            Lang::En
-        }
-    }
-}
-
-/// One text in every language.
-#[derive(Clone, Copy)]
-struct Tr {
-    en: &'static str,
-    zh: &'static str,
-}
-
-const fn tr(en: &'static str, zh: &'static str) -> Tr {
-    Tr { en, zh }
-}
-
-impl Tr {
-    fn get(self, lang: Lang) -> &'static str {
-        match lang {
-            Lang::En => self.en,
-            Lang::Zh => self.zh,
-        }
-    }
-
-    /// The text with each `{}` replaced by the next of `args`.
-    fn fill(self, lang: Lang, args: &[&str]) -> String {
-        let mut out = String::new();
-        let mut rest = self.get(lang);
-        for arg in args {
-            let Some(at) = rest.find("{}") else { break };
-            out.push_str(&rest[..at]);
-            out.push_str(arg);
-            rest = &rest[at + 2..];
-        }
-        out.push_str(rest);
-        out
-    }
 }
 
 const BROKEN: Tr = tr(
@@ -142,6 +81,18 @@ const PERMISSION: &[&str] = &["allow", "ask", "deny"];
 const SECURITY: &[&str] = &["tls", "starttls", "none"];
 
 const SECTIONS: &[Section] = &[
+    Section {
+        title: tr("Language", "语言"),
+        fields: &[Field {
+            path: &["language"],
+            label: tr("Language", "语言"),
+            help: tr(
+                "Language of CLI output, this editor and the program's own chat replies (/compact, /identity, errors). Reset (-) to follow the system locale. The Web UI follows the browser and has its own switch.",
+                "CLI 输出、本编辑器和程序自己的聊天回复（/compact、/identity、错误提示）的语言。输入 - 恢复为跟随系统语言。Web UI 跟随浏览器语言，并有自己的切换按钮。",
+            ),
+            kind: Kind::Choice(&["en", "zh"]),
+        }],
+    },
     Section {
         title: tr("Model and context", "模型与上下文"),
         fields: &[
@@ -805,6 +756,9 @@ fn set(doc: &mut DocumentMut, path: &[&str], mut value: Value) {
     }
     if let Some(old) = item.get(*key).and_then(Item::as_value) {
         *value.decor_mut() = old.decor().clone();
+    } else if tables.is_empty() {
+        // A new root key sits above the tables; keep a blank line between.
+        value.decor_mut().set_suffix("\n");
     }
     item[*key] = Item::Value(value);
 }
@@ -885,9 +839,9 @@ mod tests {
             "# my notes\n[model]\nmodel = \"x/old\"  # keep me\n\n[custom]\nthing = 1\n",
         )
         .unwrap();
-        // Model: new id, keep key, two fallbacks, keep retries, cache by number,
+        // Model (section 2): new id, keep key, two fallbacks, keep retries, cache by number,
         // a bad then a good budget, reset summary model, keep max steps.
-        let script = "1\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\ns\n";
+        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\ns\n";
         let out = drive(&path, script);
         assert!(out.contains("\"lots\" is not a whole number"), "{out}");
         assert!(out.contains("Saved"), "{out}");
@@ -914,7 +868,7 @@ mod tests {
             "[qq]\napp_secret = \"hunter2\"\nallow = [\"A\", \"B\"]\n",
         )
         .unwrap();
-        let out = drive(&path, "4\n?\n\n\n\n\nq\n");
+        let out = drive(&path, "5\n?\n\n\n\n\nq\n");
         assert!(out.contains("Enabled (y/n) [false]"), "{out}");
         assert!(out.contains("Connects to QQ over WebSocket"), "{out}");
         assert!(out.contains("Allowed openids [A, B]"), "{out}");
@@ -926,10 +880,10 @@ mod tests {
     fn quitting_or_running_out_of_input_saves_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let out = drive(&path, "3\n0.0.0.0:1\n+\nq\n");
+        let out = drive(&path, "4\n0.0.0.0:1\n+\nq\n");
         assert!(out.contains("Quit without saving."), "{out}");
         assert!(!path.exists());
-        drive(&path, "4\ny\n");
+        drive(&path, "5\ny\n");
         assert!(!path.exists());
     }
 
@@ -937,7 +891,7 @@ mod tests {
     fn generates_a_token_and_sets_nested_tables() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        drive(&path, "3\n\n+\n2\n\n\n\n\nopenrouter\ns\n");
+        drive(&path, "4\n\n+\n3\n\n\n\n\nopenrouter\ns\n");
         let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let token = config.gateway.token.unwrap();
         assert_eq!(token.len(), 48);
@@ -949,15 +903,27 @@ mod tests {
     }
 
     #[test]
+    fn a_new_root_key_goes_above_the_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[model]\nmodel = \"x/y\"\n").unwrap();
+        drive(&path, "1\nzh\ns\n");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("language = \"zh\"\n\n[model]"), "{text}");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.language, Some(Lang::Zh));
+    }
+
+    #[test]
     fn speaks_chinese() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let out = drive_in(
             Lang::Zh,
             &path,
-            "4\n?\n是\n\n\n\n9\n5\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
+            "5\n?\n是\n\n\n\n9\n6\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
         );
-        assert!(out.contains("1) 模型与上下文"), "{out}");
+        assert!(out.contains("2) 模型与上下文"), "{out}");
         assert!(out.contains("s) 保存并退出"), "{out}");
         assert!(out.contains("启用 (y/n，是/否) [false]"), "{out}");
         assert!(
@@ -974,37 +940,45 @@ mod tests {
 
     #[test]
     fn every_text_has_both_languages() {
+        let mut texts = vec![
+            BROKEN,
+            EDITING,
+            HOW,
+            SAVE,
+            QUIT,
+            PICK_MENU,
+            NO_CHANGES,
+            NOT_SAVED,
+            SAVED,
+            RESTART,
+            RESULT_INVALID,
+            CANNOT_RESET,
+            NOT_ACCEPTED,
+            NOT_NUMBER,
+            YES_NO,
+            PICK_ONE,
+            DEFAULT,
+            EMPTY,
+            NONE,
+            FROM_ENV,
+            IN_FILE,
+            NOT_SET,
+        ];
         for section in SECTIONS {
-            let texts = std::iter::once(section.title)
-                .chain(section.fields.iter().flat_map(|f| [f.label, f.help]));
-            for text in texts {
-                assert!(!text.en.is_empty() && !text.zh.is_empty(), "{}", text.en);
-                assert_eq!(
-                    text.en.matches("{}").count(),
-                    text.zh.matches("{}").count(),
-                    "{}",
-                    text.en
-                );
+            texts.push(section.title);
+            for field in section.fields {
+                texts.extend([field.label, field.help]);
             }
         }
+        crate::i18n::assert_complete(&texts);
         assert_eq!(SAVED.fill(Lang::Zh, &["a.toml"]), "已保存 a.toml。");
-        assert_eq!(FROM_ENV.fill(Lang::En, &["X"]), "from $X");
-    }
-
-    #[test]
-    fn picks_chinese_from_the_locale() {
-        assert_eq!(Lang::from_locale("zh_CN.UTF-8"), Lang::Zh);
-        assert_eq!(Lang::from_locale("zh_TW"), Lang::Zh);
-        assert_eq!(Lang::from_locale("en_US.UTF-8"), Lang::En);
-        assert_eq!(Lang::from_locale("C"), Lang::En);
-        assert_eq!(Lang::from_locale(""), Lang::En);
     }
 
     #[test]
     fn rejects_a_choice_outside_the_list() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let out = drive(&path, "2\nmaybe\n9\nask\n\n\n\n\ns\n");
+        let out = drive(&path, "3\nmaybe\n9\nask\n\n\n\n\ns\n");
         assert_eq!(
             out.matches("pick one of: allow, ask, deny").count(),
             2,

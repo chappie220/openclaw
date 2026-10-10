@@ -33,7 +33,7 @@ pub fn lookup_account(name: &str) -> Result<Account> {
     unsafe {
         let pw = libc::getpwnam(c_name.as_ptr());
         if pw.is_null() {
-            bail!("no account named {name:?}");
+            bail!(crate::cli_text::NO_ACCOUNT.with(&[&format!("{name:?}")]));
         }
         let home = CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
         Ok(Account {
@@ -107,12 +107,10 @@ pub fn render_conf(account: &Account, env: &[(String, String)]) -> String {
 fn require_root(action: &str) -> Result<()> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        bail!("{action} writes system files; run it with sudo or doas");
+        bail!(crate::cli_text::SERVICE_NEEDS_ROOT.with(&[action]));
     }
     if !Path::new("/sbin/openrc-run").exists() {
-        bail!(
-            "OpenRC is not installed (/sbin/openrc-run missing); on systemd hosts run `openclaw-rs serve` from a unit instead"
-        );
+        bail!(crate::cli_text::SERVICE_NO_OPENRC.now());
     }
     Ok(())
 }
@@ -151,27 +149,31 @@ pub fn install(user: &str) -> Result<()> {
         })
         .collect();
     if !env.iter().any(|(key, _)| key == "OPENROUTER_API_KEY") {
-        eprintln!(
-            "warning: OPENROUTER_API_KEY is not set; add it to {CONF_FILE} or the account's config.toml"
-        );
+        eprintln!("{}", crate::cli_text::SERVICE_NO_KEY.with(&[CONF_FILE]));
     }
     write_file(CONF_FILE, &render_conf(&account, &env), 0o600)?;
     write_file(INIT_SCRIPT, &render_init_script(&binary, &account), 0o755)?;
     run("rc-update", &["add", NAME, "default"])?;
     run("rc-service", &[NAME, "restart"])?;
     println!(
-        "installed {INIT_SCRIPT} (runs as {}, state in {}/.openclaw-rs)",
-        account.name,
-        account.home.display()
+        "{}",
+        crate::cli_text::SERVICE_INSTALLED.with(&[
+            INIT_SCRIPT,
+            &account.name,
+            &account.home.display().to_string()
+        ])
     );
-    println!("logs: {LOG_FILE} · status: rc-service {NAME} status");
+    println!("{}", crate::cli_text::SERVICE_LOGS.with(&[LOG_FILE, NAME]));
     Ok(())
 }
 
 pub fn uninstall() -> Result<()> {
     require_root("service uninstall")?;
     if !Path::new(INIT_SCRIPT).exists() {
-        println!("{INIT_SCRIPT} is not installed");
+        println!(
+            "{}",
+            crate::cli_text::SERVICE_NOT_INSTALLED.with(&[INIT_SCRIPT])
+        );
         return Ok(());
     }
     // Stop and runlevel removal fail harmlessly when already done.
@@ -184,7 +186,10 @@ pub fn uninstall() -> Result<()> {
             return Err(err).with_context(|| format!("cannot remove {path}"));
         }
     }
-    println!("removed {INIT_SCRIPT} and {CONF_FILE}; state and {LOG_FILE} were kept");
+    println!(
+        "{}",
+        crate::cli_text::SERVICE_REMOVED.with(&[INIT_SCRIPT, CONF_FILE, LOG_FILE])
+    );
     Ok(())
 }
 
