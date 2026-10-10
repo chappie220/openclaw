@@ -227,6 +227,11 @@ pub struct AgentConfig {
     /// Model that writes the context summary, e.g. a cheaper one; default:
     /// model.model.
     pub summary_model: Option<String>,
+    /// Saved memories looked up from each message and shown with it; 0 turns
+    /// recall off.
+    pub recall_limit: usize,
+    /// Token cap on the recalled memories of one turn.
+    pub recall_tokens: usize,
 }
 
 /// What a tool category may do without asking.
@@ -348,6 +353,8 @@ impl Default for AgentConfig {
             max_steps: 25,
             context_tokens: 64_000,
             summary_model: None,
+            recall_limit: 5,
+            recall_tokens: 800,
         }
     }
 }

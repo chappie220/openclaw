@@ -163,6 +163,15 @@ const SECTIONS: &[Section] = &[
                 kind: Kind::Text,
             },
             Field {
+                path: &["agent", "recall_limit"],
+                label: tr("Memories recalled per message", "每条消息自动召回的记忆数"),
+                help: tr(
+                    "Saved memories that share words with a message are shown to the model with it. 0 turns this off.",
+                    "与消息有相同词语的已保存记忆，会随消息一起交给模型。设为 0 关闭。",
+                ),
+                kind: Kind::Int,
+            },
+            Field {
                 path: &["agent", "max_steps"],
                 label: tr("Max model calls per turn", "每轮最多调用模型次数"),
                 help: tr("Stops a runaway tool loop.", "防止工具调用无限循环。"),
@@ -840,8 +849,8 @@ mod tests {
         )
         .unwrap();
         // Model (section 2): new id, keep key, two fallbacks, keep retries, cache by number,
-        // a bad then a good budget, reset summary model, keep max steps.
-        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\ns\n";
+        // a bad then a good budget, reset summary model, keep recall and max steps.
+        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\ns\n";
         let out = drive(&path, script);
         assert!(out.contains("\"lots\" is not a whole number"), "{out}");
         assert!(out.contains("Saved"), "{out}");

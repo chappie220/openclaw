@@ -371,6 +371,21 @@ text matches by substring without word segmentation. Space-separated terms
 match any; terms shorter than three characters fall back to `LIKE`. The model
 gets `memory_save`, `memory_search` and `memory_delete` tools.
 
+Memories are also recalled without the model asking: each message is broken
+into words and three-character CJK runs (skipping stopwords and runs with
+function characters such as 我、的、吧), and up to `agent.recall_limit`
+memories that share enough of them (two, when the message has more than
+three terms) are shown to the model with that message, within
+`agent.recall_tokens`. They go with the current turn only and are never
+stored in the history. Recall needs the `memory` capability, and a guest
+only recalls their own memories.
+
+```toml
+[agent]
+recall_limit = 5      # 0 turns recall off
+recall_tokens = 800
+```
+
 State lives in `~/.openclaw-rs` (override with `OPENCLAW_RS_HOME`):
 
 - `config.toml`: optional settings
