@@ -1,4 +1,5 @@
-//! `openclaw-rs config`: an interactive editor for config.toml.
+//! `openclaw-rs config`: an interactive editor for config.toml, in English
+//! or Chinese.
 //!
 //! Edits the file in place with `toml_edit`, so comments and keys it does not
 //! know survive. Every change is checked by parsing the whole file as a
@@ -27,15 +28,113 @@ enum Kind {
     },
 }
 
+/// Language of the editor's menus, prompts and help. Config values such as
+/// `allow` or `tls` stay as they are written in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Lang {
+    En,
+    Zh,
+}
+
+impl Lang {
+    /// From the locale (`LC_ALL`, then `LC_MESSAGES`, then `LANG`): Chinese
+    /// for `zh*`, otherwise English.
+    pub fn detect() -> Self {
+        let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|value| !value.is_empty())
+            .unwrap_or_default();
+        Self::from_locale(&locale)
+    }
+
+    fn from_locale(locale: &str) -> Self {
+        if locale.to_ascii_lowercase().starts_with("zh") {
+            Lang::Zh
+        } else {
+            Lang::En
+        }
+    }
+}
+
+/// One text in every language.
+#[derive(Clone, Copy)]
+struct Tr {
+    en: &'static str,
+    zh: &'static str,
+}
+
+const fn tr(en: &'static str, zh: &'static str) -> Tr {
+    Tr { en, zh }
+}
+
+impl Tr {
+    fn get(self, lang: Lang) -> &'static str {
+        match lang {
+            Lang::En => self.en,
+            Lang::Zh => self.zh,
+        }
+    }
+
+    /// The text with each `{}` replaced by the next of `args`.
+    fn fill(self, lang: Lang, args: &[&str]) -> String {
+        let mut out = String::new();
+        let mut rest = self.get(lang);
+        for arg in args {
+            let Some(at) = rest.find("{}") else { break };
+            out.push_str(&rest[..at]);
+            out.push_str(arg);
+            rest = &rest[at + 2..];
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
+const BROKEN: Tr = tr(
+    "warning: the current file does not load ({}); fix the field it names below",
+    "警告：当前配置文件无法加载（{}）；请在下面修改它指出的字段",
+);
+const EDITING: Tr = tr("Editing {}", "正在编辑 {}");
+const HOW: Tr = tr(
+    "In each field: Enter keeps the value, - resets it to the default, ? explains it.",
+    "每个字段：回车保持不变，- 恢复默认值，? 查看说明。",
+);
+const SAVE: Tr = tr("Save and exit", "保存并退出");
+const QUIT: Tr = tr("Quit without saving", "不保存退出");
+const PICK_MENU: Tr = tr("Pick a number, s or q.", "请输入编号、s 或 q。");
+const NO_CHANGES: Tr = tr("No changes.", "没有改动。");
+const NOT_SAVED: Tr = tr("Quit without saving.", "已退出，未保存。");
+const SAVED: Tr = tr("Saved {}.", "已保存 {}。");
+const RESTART: Tr = tr(
+    "Restart a running `serve` (rc-service openclaw-rs restart) to apply it.",
+    "如果 `serve` 正在运行，重启后生效（rc-service openclaw-rs restart）。",
+);
+const RESULT_INVALID: Tr = tr(
+    "not saved: the result does not load: {}",
+    "未保存：修改后的配置无法加载：{}",
+);
+const CANNOT_RESET: Tr = tr("cannot reset: {}", "无法恢复默认：{}");
+const NOT_ACCEPTED: Tr = tr("not accepted: {}", "不接受这个值：{}");
+const NOT_NUMBER: Tr = tr("{} is not a whole number", "{} 不是整数");
+const YES_NO: Tr = tr("answer y or n", "请回答 y 或 n");
+const PICK_ONE: Tr = tr("pick one of: {}", "请从这些中选一个：{}");
+const DEFAULT: Tr = tr("default", "默认");
+const EMPTY: Tr = tr("empty", "空");
+const NONE: Tr = tr("none", "无");
+const FROM_ENV: Tr = tr("from ${}", "来自 ${}");
+const IN_FILE: Tr = tr("set in this file", "已在本文件中设置");
+const NOT_SET: Tr = tr("not set", "未设置");
+
 struct Field {
     path: &'static [&'static str],
-    label: &'static str,
-    help: &'static str,
+    label: Tr,
+    help: Tr,
     kind: Kind,
 }
 
 struct Section {
-    title: &'static str,
+    title: Tr,
     fields: &'static [Field],
 }
 
@@ -44,18 +143,24 @@ const SECURITY: &[&str] = &["tls", "starttls", "none"];
 
 const SECTIONS: &[Section] = &[
     Section {
-        title: "Model and context",
+        title: tr("Model and context", "模型与上下文"),
         fields: &[
             Field {
                 path: &["model", "model"],
-                label: "Model",
-                help: "Any OpenRouter model id, e.g. anthropic/claude-sonnet-4.5 or openrouter/auto.",
+                label: tr("Model", "模型"),
+                help: tr(
+                    "Any OpenRouter model id, e.g. anthropic/claude-sonnet-4.5 or openrouter/auto.",
+                    "任意 OpenRouter 模型 id，例如 anthropic/claude-sonnet-4.5 或 openrouter/auto。",
+                ),
                 kind: Kind::Text,
             },
             Field {
                 path: &["model", "api_key"],
-                label: "OpenRouter API key",
-                help: "Stored in plain text in config.toml (mode 0600); OPENROUTER_API_KEY wins when set.",
+                label: tr("OpenRouter API key", "OpenRouter API key"),
+                help: tr(
+                    "Stored in plain text in config.toml (mode 0600); OPENROUTER_API_KEY wins when set.",
+                    "以明文存在 config.toml（权限 0600）；设了 OPENROUTER_API_KEY 时以环境变量为准。",
+                ),
                 kind: Kind::Secret {
                     env: "OPENROUTER_API_KEY",
                     generate: false,
@@ -63,90 +168,126 @@ const SECTIONS: &[Section] = &[
             },
             Field {
                 path: &["model", "fallbacks"],
-                label: "Fallback models",
-                help: "Comma-separated; OpenRouter tries them in order when the model fails.",
+                label: tr("Fallback models", "备用模型"),
+                help: tr(
+                    "Comma-separated; OpenRouter tries them in order when the model fails.",
+                    "用逗号分隔；主模型失败时 OpenRouter 按顺序尝试。",
+                ),
                 kind: Kind::List,
             },
             Field {
                 path: &["model", "max_retries"],
-                label: "Retries on transient errors",
-                help: "Connection errors, HTTP 408/429/5xx, and streams that fail before any text.",
+                label: tr("Retries on transient errors", "临时错误重试次数"),
+                help: tr(
+                    "Connection errors, HTTP 408/429/5xx, and streams that fail before any text.",
+                    "连接错误、HTTP 408/429/5xx，以及还没输出文字就失败的流。",
+                ),
                 kind: Kind::Int,
             },
             Field {
                 path: &["model", "prompt_cache"],
-                label: "Prompt cache breakpoints",
-                help: "auto: for anthropic/ and google/ models; on: always (e.g. openrouter/auto routing to Claude); off: never.",
+                label: tr("Prompt cache breakpoints", "Prompt 缓存标记"),
+                help: tr(
+                    "auto: for anthropic/ and google/ models; on: always (e.g. openrouter/auto routing to Claude); off: never.",
+                    "auto：只对 anthropic/ 和 google/ 模型加；on：总是加（例如 openrouter/auto 会路由到 Claude 时）；off：不加。",
+                ),
                 kind: Kind::Choice(&["auto", "on", "off"]),
             },
             Field {
                 path: &["agent", "context_tokens"],
-                label: "Context budget (tokens)",
-                help: "Per model call: system prompt, tools, summary and history. Keep it below the model's window.",
+                label: tr("Context budget (tokens)", "上下文预算（token）"),
+                help: tr(
+                    "Per model call: system prompt, tools, summary and history. Keep it below the model's window.",
+                    "每次调用模型的总预算：系统提示、工具、摘要和历史。要小于模型的上下文窗口。",
+                ),
                 kind: Kind::Int,
             },
             Field {
                 path: &["agent", "summary_model"],
-                label: "Summary model",
-                help: "Model that writes the context summary, e.g. a cheaper one. Reset (-) to use the main model.",
+                label: tr("Summary model", "摘要模型"),
+                help: tr(
+                    "Model that writes the context summary, e.g. a cheaper one. Reset (-) to use the main model.",
+                    "写上下文摘要的模型，例如更便宜的模型。输入 - 恢复为主模型。",
+                ),
                 kind: Kind::Text,
             },
             Field {
                 path: &["agent", "max_steps"],
-                label: "Max model calls per turn",
-                help: "Stops a runaway tool loop.",
+                label: tr("Max model calls per turn", "每轮最多调用模型次数"),
+                help: tr("Stops a runaway tool loop.", "防止工具调用无限循环。"),
                 kind: Kind::Int,
             },
         ],
     },
     Section {
-        title: "Tools",
+        title: tr("Tools", "工具"),
         fields: &[
             Field {
                 path: &["tools", "shell"],
-                label: "Shell commands",
-                help: "allow: run without asking; ask: a person approves each one; deny: no shell tool.",
+                label: tr("Shell commands", "Shell 命令"),
+                help: tr(
+                    "allow: run without asking; ask: a person approves each one; deny: no shell tool.",
+                    "allow：直接运行；ask：每条都要人批准；deny：不提供 shell 工具。",
+                ),
                 kind: Kind::Choice(PERMISSION),
             },
             Field {
                 path: &["tools", "write"],
-                label: "File writes and edits",
-                help: "Reads are always allowed inside the workspace.",
+                label: tr("File writes and edits", "写入和修改文件"),
+                help: tr(
+                    "Reads are always allowed inside the workspace.",
+                    "工作目录内的读取总是允许。",
+                ),
                 kind: Kind::Choice(PERMISSION),
             },
             Field {
                 path: &["tools", "identity"],
-                label: "Identity changes",
-                help: "deny removes identity_set; otherwise every draft needs a person's approval.",
+                label: tr("Identity changes", "修改身份"),
+                help: tr(
+                    "deny removes identity_set; otherwise every draft needs a person's approval.",
+                    "deny 会去掉 identity_set；否则每份草稿都要人批准。",
+                ),
                 kind: Kind::Choice(PERMISSION),
             },
             Field {
                 path: &["tools", "workspace"],
-                label: "Workspace directory",
-                help: "Where files and shell commands run. Reset (-) for <state dir>/workspace.",
+                label: tr("Workspace directory", "工作目录"),
+                help: tr(
+                    "Where files and shell commands run. Reset (-) for <state dir>/workspace.",
+                    "文件和 shell 命令所在目录。输入 - 恢复为 <状态目录>/workspace。",
+                ),
                 kind: Kind::Text,
             },
             Field {
                 path: &["tools", "review", "provider"],
-                label: "Shell command auto-review",
-                help: "A model rates each `ask` command; see README \"Command auto-review\".",
+                label: tr("Shell command auto-review", "Shell 命令自动审查"),
+                help: tr(
+                    "A model rates each `ask` command; see README \"Command auto-review\".",
+                    "由模型给每条需要批准的命令打分；见 README 的 \"Command auto-review\"。",
+                ),
                 kind: Kind::Choice(&["off", "openrouter", "openrouter-chat", "typesafe"]),
             },
         ],
     },
     Section {
-        title: "Gateway and Web UI",
+        title: tr("Gateway and Web UI", "Gateway 与 Web UI"),
         fields: &[
             Field {
                 path: &["gateway", "bind"],
-                label: "Listen address",
-                help: "e.g. 127.0.0.1:18789, or 0.0.0.0:18789 for the LAN (needs a token).",
+                label: tr("Listen address", "监听地址"),
+                help: tr(
+                    "e.g. 127.0.0.1:18789, or 0.0.0.0:18789 for the LAN (needs a token).",
+                    "例如 127.0.0.1:18789；局域网访问用 0.0.0.0:18789（需要 token）。",
+                ),
                 kind: Kind::Text,
             },
             Field {
                 path: &["gateway", "token"],
-                label: "Access token",
-                help: "Required unless bound to loopback; OPENCLAW_RS_TOKEN wins when set. Type + to generate one.",
+                label: tr("Access token", "访问 token"),
+                help: tr(
+                    "Required unless bound to loopback; OPENCLAW_RS_TOKEN wins when set. Type + to generate one.",
+                    "不是只监听本机时必须设置；设了 OPENCLAW_RS_TOKEN 时以环境变量为准。输入 + 自动生成。",
+                ),
                 kind: Kind::Secret {
                     env: "OPENCLAW_RS_TOKEN",
                     generate: true,
@@ -155,24 +296,33 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
-        title: "QQ bot",
+        title: tr("QQ bot", "QQ 机器人"),
         fields: &[
             Field {
                 path: &["qq", "enabled"],
-                label: "Enabled",
-                help: "Connects to QQ over WebSocket when `serve` runs.",
+                label: tr("Enabled", "启用"),
+                help: tr(
+                    "Connects to QQ over WebSocket when `serve` runs.",
+                    "运行 `serve` 时通过 WebSocket 连接 QQ。",
+                ),
                 kind: Kind::Bool,
             },
             Field {
                 path: &["qq", "app_id"],
-                label: "AppID",
-                help: "From the QQ Open Platform (q.qq.com).",
+                label: tr("AppID", "AppID"),
+                help: tr(
+                    "From the QQ Open Platform (q.qq.com).",
+                    "在 QQ 开放平台（q.qq.com）获取。",
+                ),
                 kind: Kind::Text,
             },
             Field {
                 path: &["qq", "app_secret"],
-                label: "AppSecret",
-                help: "QQ_APP_SECRET wins when set.",
+                label: tr("AppSecret", "AppSecret"),
+                help: tr(
+                    "QQ_APP_SECRET wins when set.",
+                    "设了 QQ_APP_SECRET 时以环境变量为准。",
+                ),
                 kind: Kind::Secret {
                     env: "QQ_APP_SECRET",
                     generate: false,
@@ -180,67 +330,85 @@ const SECTIONS: &[Section] = &[
             },
             Field {
                 path: &["qq", "allow"],
-                label: "Allowed openids",
-                help: "Comma-separated user or group openids; empty lets everyone chat. The log prints each sender's openid.",
+                label: tr("Allowed openids", "允许的 openid"),
+                help: tr(
+                    "Comma-separated user or group openids; empty lets everyone chat. The log prints each sender's openid.",
+                    "用逗号分隔的用户或群 openid；留空则所有人都能聊天。日志里会打印每个发送者的 openid。",
+                ),
                 kind: Kind::List,
             },
         ],
     },
     Section {
-        title: "Email",
+        title: tr("Email", "邮件"),
         fields: &[
             Field {
                 path: &["mail", "enabled"],
-                label: "Enabled",
-                help: "Polls IMAP and answers by SMTP when `serve` runs.",
+                label: tr("Enabled", "启用"),
+                help: tr(
+                    "Polls IMAP and answers by SMTP when `serve` runs.",
+                    "运行 `serve` 时轮询 IMAP，并通过 SMTP 回复。",
+                ),
                 kind: Kind::Bool,
             },
             Field {
                 path: &["mail", "imap_host"],
-                label: "IMAP host",
-                help: "e.g. imap.qq.com",
+                label: tr("IMAP host", "IMAP 服务器"),
+                help: tr("e.g. imap.qq.com", "例如 imap.qq.com"),
                 kind: Kind::Text,
             },
             Field {
                 path: &["mail", "imap_port"],
-                label: "IMAP port",
-                help: "993 for TLS.",
+                label: tr("IMAP port", "IMAP 端口"),
+                help: tr("993 for TLS.", "TLS 用 993。"),
                 kind: Kind::Int,
             },
             Field {
                 path: &["mail", "imap_security"],
-                label: "IMAP security",
-                help: "none is only accepted for loopback hosts.",
+                label: tr("IMAP security", "IMAP 加密方式"),
+                help: tr(
+                    "none is only accepted for loopback hosts.",
+                    "none 只能用于本机地址。",
+                ),
                 kind: Kind::Choice(SECURITY),
             },
             Field {
                 path: &["mail", "smtp_host"],
-                label: "SMTP host",
-                help: "e.g. smtp.qq.com",
+                label: tr("SMTP host", "SMTP 服务器"),
+                help: tr("e.g. smtp.qq.com", "例如 smtp.qq.com"),
                 kind: Kind::Text,
             },
             Field {
                 path: &["mail", "smtp_port"],
-                label: "SMTP port",
-                help: "465 for TLS, 587 for STARTTLS.",
+                label: tr("SMTP port", "SMTP 端口"),
+                help: tr(
+                    "465 for TLS, 587 for STARTTLS.",
+                    "TLS 用 465，STARTTLS 用 587。",
+                ),
                 kind: Kind::Int,
             },
             Field {
                 path: &["mail", "smtp_security"],
-                label: "SMTP security",
-                help: "none is only accepted for loopback hosts.",
+                label: tr("SMTP security", "SMTP 加密方式"),
+                help: tr(
+                    "none is only accepted for loopback hosts.",
+                    "none 只能用于本机地址。",
+                ),
                 kind: Kind::Choice(SECURITY),
             },
             Field {
                 path: &["mail", "username"],
-                label: "Username",
-                help: "Usually the full address.",
+                label: tr("Username", "用户名"),
+                help: tr("Usually the full address.", "通常是完整的邮箱地址。"),
                 kind: Kind::Text,
             },
             Field {
                 path: &["mail", "password"],
-                label: "Password",
-                help: "Many providers (QQ Mail, 163) need an app authorization code. MAIL_PASSWORD wins when set.",
+                label: tr("Password", "密码"),
+                help: tr(
+                    "Many providers (QQ Mail, 163) need an app authorization code. MAIL_PASSWORD wins when set.",
+                    "很多邮箱（QQ 邮箱、163）要填授权码。设了 MAIL_PASSWORD 时以环境变量为准。",
+                ),
                 kind: Kind::Secret {
                     env: "MAIL_PASSWORD",
                     generate: false,
@@ -248,47 +416,62 @@ const SECTIONS: &[Section] = &[
             },
             Field {
                 path: &["mail", "from"],
-                label: "Reply-from address",
-                help: "Reset (-) to use the username.",
+                label: tr("Reply-from address", "回复的发件地址"),
+                help: tr("Reset (-) to use the username.", "输入 - 恢复为用户名。"),
                 kind: Kind::Text,
             },
             Field {
                 path: &["mail", "allow"],
-                label: "Allowed senders",
-                help: "Comma-separated addresses or @domain; required.",
+                label: tr("Allowed senders", "允许的发件人"),
+                help: tr(
+                    "Comma-separated addresses or @domain; required.",
+                    "用逗号分隔的地址或 @域名；必填。",
+                ),
                 kind: Kind::List,
             },
         ],
     },
     Section {
-        title: "Web search",
+        title: tr("Web search", "网页搜索"),
         fields: &[
             Field {
                 path: &["search", "provider"],
-                label: "Provider",
-                help: "openrouter: billed per search with the OpenRouter key; searxng: your own instance; off: no web_search tool.",
+                label: tr("Provider", "搜索服务"),
+                help: tr(
+                    "openrouter: billed per search with the OpenRouter key; searxng: your own instance; off: no web_search tool.",
+                    "openrouter：用 OpenRouter key 按次计费；searxng：自己的实例；off：不提供 web_search 工具。",
+                ),
                 kind: Kind::Choice(&["openrouter", "searxng", "off"]),
             },
             Field {
                 path: &["search", "searxng_url"],
-                label: "SearXNG URL",
-                help: "e.g. http://127.0.0.1:8888, with the JSON format enabled.",
+                label: tr("SearXNG URL", "SearXNG 地址"),
+                help: tr(
+                    "e.g. http://127.0.0.1:8888, with the JSON format enabled.",
+                    "例如 http://127.0.0.1:8888，需要开启 JSON 格式。",
+                ),
                 kind: Kind::Text,
             },
             Field {
                 path: &["search", "model"],
-                label: "Search model",
-                help: "Model that runs OpenRouter searches. Reset (-) to use the main model.",
+                label: tr("Search model", "搜索模型"),
+                help: tr(
+                    "Model that runs OpenRouter searches. Reset (-) to use the main model.",
+                    "执行 OpenRouter 搜索的模型。输入 - 恢复为主模型。",
+                ),
                 kind: Kind::Text,
             },
         ],
     },
     Section {
-        title: "Access",
+        title: tr("Access", "权限"),
         fields: &[Field {
             path: &["access", "owners"],
-            label: "Owners",
-            help: "Comma-separated qq:<openid> or mail:<address> treated like the terminal: every tool, /compact, identity approval.",
+            label: tr("Owners", "Owner"),
+            help: tr(
+                "Comma-separated qq:<openid> or mail:<address> treated like the terminal: every tool, /compact, identity approval.",
+                "用逗号分隔的 qq:<openid> 或 mail:<地址>，和终端同等权限：所有工具、/compact、批准身份。",
+            ),
             kind: Kind::List,
         }],
     },
@@ -300,6 +483,7 @@ pub struct Term<R, W> {
     out: W,
     /// Turn echo off while a secret is typed; only for a real terminal.
     hide_secrets: bool,
+    lang: Lang,
 }
 
 impl<R: BufRead, W: Write> Term<R, W> {
@@ -327,6 +511,11 @@ impl<R: BufRead, W: Write> Term<R, W> {
     fn say(&mut self, text: &str) -> Result<()> {
         writeln!(self.out, "{text}")?;
         Ok(())
+    }
+
+    fn tell(&mut self, text: Tr, args: &[&str]) -> Result<()> {
+        let line = text.fill(self.lang, args);
+        self.say(&line)
     }
 }
 
@@ -361,13 +550,14 @@ impl Drop for EchoOff {
 }
 
 /// Runs the editor on `path` with the process's terminal.
-pub fn run(path: &Path) -> Result<()> {
+pub fn run(path: &Path, lang: Lang) -> Result<()> {
     let stdin = std::io::stdin();
     let hide = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
     let mut term = Term {
         input: stdin.lock(),
         out: std::io::stdout(),
         hide_secrets: hide,
+        lang,
     };
     edit(path, &mut term)
 }
@@ -390,20 +580,18 @@ fn parse(doc: &DocumentMut) -> Result<Config> {
 pub fn edit<R: BufRead, W: Write>(path: &Path, term: &mut Term<R, W>) -> Result<()> {
     let mut doc = load(path)?;
     if let Err(err) = parse(&doc) {
-        term.say(&format!(
-            "warning: the current file does not load ({err:#}); fix the field it names below"
-        ))?;
+        term.tell(BROKEN, &[&format!("{err:#}")])?;
     }
     let original = doc.to_string();
-    term.say(&format!("Editing {}", path.display()))?;
-    term.say("In each field: Enter keeps the value, - resets it to the default, ? explains it.")?;
+    term.tell(EDITING, &[&path.display().to_string()])?;
+    term.tell(HOW, &[])?;
     loop {
         term.say("")?;
         for (i, section) in SECTIONS.iter().enumerate() {
-            term.say(&format!("  {}) {}", i + 1, section.title))?;
+            term.say(&format!("  {}) {}", i + 1, section.title.get(term.lang)))?;
         }
-        term.say("  s) Save and exit")?;
-        term.say("  q) Quit without saving")?;
+        term.say(&format!("  s) {}", SAVE.get(term.lang)))?;
+        term.say(&format!("  q) {}", QUIT.get(term.lang)))?;
         let Some(choice) = term.ask("> ")? else {
             return finish(path, &doc, &original, term, false);
         };
@@ -420,7 +608,7 @@ pub fn edit<R: BufRead, W: Write>(path: &Path, term: &mut Term<R, W>) -> Result<
                         return finish(path, &doc, &original, term, false);
                     }
                 }
-                None => term.say("Pick a number, s or q.")?,
+                None => term.tell(PICK_MENU, &[])?,
             },
         }
     }
@@ -435,19 +623,22 @@ fn finish<R: BufRead, W: Write>(
 ) -> Result<()> {
     let text = doc.to_string();
     if !save || text == original {
-        term.say(if text == original {
-            "No changes."
-        } else {
-            "Quit without saving."
-        })?;
+        term.tell(
+            if text == original {
+                NO_CHANGES
+            } else {
+                NOT_SAVED
+            },
+            &[],
+        )?;
         return Ok(());
     }
     if let Err(err) = toml::from_str::<Config>(&text) {
-        bail!("not saved: the result does not load: {err:#}");
+        bail!(RESULT_INVALID.fill(term.lang, &[&format!("{err:#}")]));
     }
     write_private(path, &text)?;
-    term.say(&format!("Saved {}.", path.display()))?;
-    term.say("Restart a running `serve` (rc-service openclaw-rs restart) to apply it.")?;
+    term.tell(SAVED, &[&path.display().to_string()])?;
+    term.tell(RESTART, &[])?;
     Ok(())
 }
 
@@ -484,10 +675,10 @@ fn edit_section<R: BufRead, W: Write>(
     section: &Section,
     term: &mut Term<R, W>,
 ) -> Result<bool> {
-    term.say(&format!("\n[{}]", section.title))?;
+    term.say(&format!("\n[{}]", section.title.get(term.lang)))?;
     let mut index = 0;
     while let Some(field) = section.fields.get(index) {
-        let current = describe(doc, field);
+        let current = describe(doc, field, term.lang);
         let options = match field.kind {
             Kind::Choice(choices) => format!(
                 " ({})",
@@ -498,10 +689,13 @@ fn edit_section<R: BufRead, W: Write>(
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
-            Kind::Bool => " (y/n)".into(),
+            Kind::Bool => match term.lang {
+                Lang::En => " (y/n)".into(),
+                Lang::Zh => " (y/n，是/否)".into(),
+            },
             _ => String::new(),
         };
-        let prompt = format!("{}{options} [{current}]: ", field.label);
+        let prompt = format!("{}{options} [{current}]: ", field.label.get(term.lang));
         let input = match field.kind {
             Kind::Secret { .. } => term.secret(&prompt)?,
             _ => term.ask(&prompt)?,
@@ -512,7 +706,7 @@ fn edit_section<R: BufRead, W: Write>(
         match input.as_str() {
             "" => {}
             "?" => {
-                term.say(&format!("  {}", field.help))?;
+                term.say(&format!("  {}", field.help.get(term.lang)))?;
                 continue;
             }
             "-" => {
@@ -520,12 +714,12 @@ fn edit_section<R: BufRead, W: Write>(
                 remove(doc, field.path);
                 if let Err(err) = parse(doc) {
                     *doc = before;
-                    term.say(&format!("  cannot reset: {err:#}"))?;
+                    term.tell(CANNOT_RESET, &[&format!("{err:#}")])?;
                     continue;
                 }
             }
             text => {
-                let value = match value_for(field.kind, text) {
+                let value = match value_for(field.kind, text, term.lang) {
                     Ok(value) => value,
                     Err(err) => {
                         term.say(&format!("  {err:#}"))?;
@@ -536,7 +730,7 @@ fn edit_section<R: BufRead, W: Write>(
                 set(doc, field.path, value);
                 if let Err(err) = parse(doc) {
                     *doc = before;
-                    term.say(&format!("  not accepted: {err:#}"))?;
+                    term.tell(NOT_ACCEPTED, &[&format!("{err:#}")])?;
                     continue;
                 }
             }
@@ -546,20 +740,20 @@ fn edit_section<R: BufRead, W: Write>(
     Ok(true)
 }
 
-fn value_for(kind: Kind, text: &str) -> Result<Value> {
+fn value_for(kind: Kind, text: &str, lang: Lang) -> Result<Value> {
     Ok(match kind {
         Kind::Text => Value::from(text),
         Kind::Int => {
             let n: u32 = text
                 .replace('_', "")
                 .parse()
-                .with_context(|| format!("{text:?} is not a whole number"))?;
+                .with_context(|| NOT_NUMBER.fill(lang, &[&format!("{text:?}")]))?;
             Value::from(i64::from(n))
         }
         Kind::Bool => match text.to_ascii_lowercase().as_str() {
-            "y" | "yes" | "true" | "on" | "1" => Value::from(true),
-            "n" | "no" | "false" | "off" | "0" => Value::from(false),
-            _ => bail!("answer y or n"),
+            "y" | "yes" | "true" | "on" | "1" | "是" => Value::from(true),
+            "n" | "no" | "false" | "off" | "0" | "否" => Value::from(false),
+            _ => bail!(YES_NO.get(lang)),
         },
         Kind::Choice(choices) => {
             let pick = text
@@ -569,7 +763,7 @@ fn value_for(kind: Kind, text: &str) -> Result<Value> {
                 .or_else(|| choices.iter().find(|c| c.eq_ignore_ascii_case(text)));
             match pick {
                 Some(choice) => Value::from(*choice),
-                None => bail!("pick one of: {}", choices.join(", ")),
+                None => bail!(PICK_ONE.fill(lang, &[&choices.join(", ")])),
             }
         }
         Kind::List => {
@@ -630,7 +824,7 @@ fn remove(doc: &mut DocumentMut, path: &[&str]) {
 }
 
 /// The value in effect for `field`, defaults included; secrets are never shown.
-fn describe(doc: &DocumentMut, field: &Field) -> String {
+fn describe(doc: &DocumentMut, field: &Field, lang: Lang) -> String {
     let effective = parse(doc)
         .ok()
         .and_then(|config| toml::Value::try_from(&config).ok());
@@ -644,16 +838,16 @@ fn describe(doc: &DocumentMut, field: &Field) -> String {
             .and_then(toml::Value::as_str)
             .is_some_and(|v| !v.is_empty());
         return match (from_env, in_file) {
-            (true, _) => format!("from ${env}"),
-            (false, true) => "set in this file".into(),
-            (false, false) => "not set".into(),
+            (true, _) => FROM_ENV.fill(lang, &[env]),
+            (false, true) => IN_FILE.get(lang).into(),
+            (false, false) => NOT_SET.get(lang).into(),
         };
     }
     match value {
-        None => "default".into(),
-        Some(toml::Value::String(s)) if s.is_empty() => "empty".into(),
+        None => DEFAULT.get(lang).into(),
+        Some(toml::Value::String(s)) if s.is_empty() => EMPTY.get(lang).into(),
         Some(toml::Value::String(s)) => s.clone(),
-        Some(toml::Value::Array(items)) if items.is_empty() => "none".into(),
+        Some(toml::Value::Array(items)) if items.is_empty() => NONE.get(lang).into(),
         Some(toml::Value::Array(items)) => items
             .iter()
             .map(|i| i.as_str().map_or_else(|| i.to_string(), str::to_owned))
@@ -668,10 +862,15 @@ mod tests {
     use super::*;
 
     fn drive(path: &Path, script: &str) -> String {
+        drive_in(Lang::En, path, script)
+    }
+
+    fn drive_in(lang: Lang, path: &Path, script: &str) -> String {
         let mut term = Term {
             input: script.as_bytes(),
             out: Vec::new(),
             hide_secrets: false,
+            lang,
         };
         edit(path, &mut term).unwrap();
         String::from_utf8(term.out).unwrap()
@@ -747,6 +946,58 @@ mod tests {
             config.tools.review.provider,
             crate::config::ReviewProvider::Openrouter
         );
+    }
+
+    #[test]
+    fn speaks_chinese() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let out = drive_in(
+            Lang::Zh,
+            &path,
+            "4\n?\n是\n\n\n\n9\n5\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
+        );
+        assert!(out.contains("1) 模型与上下文"), "{out}");
+        assert!(out.contains("s) 保存并退出"), "{out}");
+        assert!(out.contains("启用 (y/n，是/否) [false]"), "{out}");
+        assert!(
+            out.contains("运行 `serve` 时通过 WebSocket 连接 QQ。"),
+            "{out}"
+        );
+        assert!(out.contains("AppSecret [未设置]"), "{out}");
+        assert!(out.contains("请输入编号、s 或 q。"), "{out}");
+        assert!(out.contains("\"abc\" 不是整数"), "{out}");
+        assert!(out.contains("已保存"), "{out}");
+        let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(config.qq.enabled);
+    }
+
+    #[test]
+    fn every_text_has_both_languages() {
+        for section in SECTIONS {
+            let texts = std::iter::once(section.title)
+                .chain(section.fields.iter().flat_map(|f| [f.label, f.help]));
+            for text in texts {
+                assert!(!text.en.is_empty() && !text.zh.is_empty(), "{}", text.en);
+                assert_eq!(
+                    text.en.matches("{}").count(),
+                    text.zh.matches("{}").count(),
+                    "{}",
+                    text.en
+                );
+            }
+        }
+        assert_eq!(SAVED.fill(Lang::Zh, &["a.toml"]), "已保存 a.toml。");
+        assert_eq!(FROM_ENV.fill(Lang::En, &["X"]), "from $X");
+    }
+
+    #[test]
+    fn picks_chinese_from_the_locale() {
+        assert_eq!(Lang::from_locale("zh_CN.UTF-8"), Lang::Zh);
+        assert_eq!(Lang::from_locale("zh_TW"), Lang::Zh);
+        assert_eq!(Lang::from_locale("en_US.UTF-8"), Lang::En);
+        assert_eq!(Lang::from_locale("C"), Lang::En);
+        assert_eq!(Lang::from_locale(""), Lang::En);
     }
 
     #[test]

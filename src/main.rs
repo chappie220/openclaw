@@ -87,7 +87,11 @@ enum Command {
         action: MemoryAction,
     },
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
-    Config,
+    Config {
+        /// Language of the editor (default: from LC_ALL / LC_MESSAGES / LANG).
+        #[arg(long, value_enum)]
+        lang: Option<setup::Lang>,
+    },
     /// Tokens and cost of model calls, per session.
     Usage {
         /// How many days back to count.
@@ -226,8 +230,8 @@ async fn run(cli: Cli) -> Result<()> {
     let state = config::state_dir()?;
     let config_path = cli.config.unwrap_or_else(|| state.join("config.toml"));
     // Before loading, so a file that does not load can still be repaired.
-    if let Command::Config = cli.command {
-        return setup::run(&config_path);
+    if let Command::Config { lang } = cli.command {
+        return setup::run(&config_path, lang.unwrap_or_else(setup::Lang::detect));
     }
     let config = Config::load(&config_path)?;
     let store = Store::open(&state)?;
@@ -267,7 +271,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
-        Command::Config => unreachable!("handled before the config is loaded"),
+        Command::Config { .. } => unreachable!("handled before the config is loaded"),
         Command::Serve { bind } => {
             if store.identity()?.is_none() {
                 eprintln!("{FIRST_START_HINT}");

@@ -51,7 +51,9 @@ default, `?` explains it. Secrets are typed without echo and the prompt says
 when an environment variable overrides them; `+` generates a Gateway token.
 Comments and keys the editor does not know are kept, every change is checked
 before it is accepted, and the file is saved with mode 0600. It also opens a
-file that currently fails to load, so it can be repaired. The full list of
+file that currently fails to load, so it can be repaired. Menus and help are
+in Chinese when the locale is `zh*` (`LC_ALL`, `LC_MESSAGES` or `LANG`) and in
+English otherwise; `--lang en|zh` overrides it. The full list of
 options is under [Memory](#memory) below.
 
 ## Gateway and Web UI
