@@ -26,6 +26,7 @@ pub struct Config {
     pub qq: QqConfig,
     pub mail: MailConfig,
     pub search: SearchConfig,
+    pub browser: BrowserConfig,
     pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
 }
@@ -109,6 +110,46 @@ impl Default for SearchConfig {
             model: None,
             searxng_url: None,
             max_results: 5,
+        }
+    }
+}
+
+/// `browser`: a Chromium-family browser installed on the host, driven over
+/// the DevTools protocol. Nothing is bundled; without one the tool is absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserConfig {
+    /// Off: no `browser` tool even when a browser is installed.
+    pub enabled: bool,
+    /// Browser to start; default: the first of chromium, chromium-browser,
+    /// google-chrome, microsoft-edge, brave on PATH (or in /Applications).
+    pub executable: Option<PathBuf>,
+    /// Use a browser that is already running with remote debugging instead
+    /// of starting one, e.g. `http://127.0.0.1:9222`.
+    pub cdp_url: Option<String>,
+    /// Without a window; `false` needs a display.
+    pub headless: bool,
+    /// Extra command-line flags, e.g. `--proxy-server=socks5://127.0.0.1:1080`.
+    pub args: Vec<String>,
+    /// Seconds one action (open, click, ...) may take.
+    pub timeout_secs: u64,
+    /// The browser is closed after this many seconds without use, freeing its memory.
+    pub idle_secs: u64,
+    /// Characters of page text returned per read.
+    pub max_chars: usize,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            executable: None,
+            cdp_url: None,
+            headless: true,
+            args: Vec::new(),
+            timeout_secs: 30,
+            idle_secs: 300,
+            max_chars: 8000,
         }
     }
 }

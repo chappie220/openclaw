@@ -3,6 +3,7 @@
 mod access;
 mod agent;
 mod attachments;
+mod browser;
 mod cli_text;
 mod completions;
 mod config;
@@ -516,6 +517,7 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         summarizer,
         tools: BuiltinTools::new(workspace.clone(), config.tools.clone(), store.clone())?
             .with_search(search)
+            .with_browser(browser::Browser::new(&config.browser, state, &workspace))
             .with_review(review),
         store,
         config: config::AgentConfig {

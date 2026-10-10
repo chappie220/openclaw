@@ -28,10 +28,12 @@ pub enum Capability {
     Identity,
     /// `web_search`, which spends the search provider's credits.
     WebSearch,
+    /// `browser`: opens any web page, including ones on the local network.
+    Browser,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 7] = [
+    pub const ALL: [Capability; 8] = [
         Capability::Shell,
         Capability::FilesRead,
         Capability::FilesWrite,
@@ -39,6 +41,7 @@ impl Capability {
         Capability::Cron,
         Capability::Identity,
         Capability::WebSearch,
+        Capability::Browser,
     ];
 
     /// The capability a built-in tool needs; `None` for tools anyone may call.
@@ -51,6 +54,7 @@ impl Capability {
             "cron_add" | "cron_list" | "cron_remove" => Capability::Cron,
             "identity_set" | "identity_propose" => Capability::Identity,
             "web_search" => Capability::WebSearch,
+            "browser" => Capability::Browser,
             _ => return None,
         })
     }

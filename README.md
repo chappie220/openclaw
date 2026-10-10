@@ -16,6 +16,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | QQ channel (official QQ Bot API) | phase 6 ✅ |
 | Email channel (IMAP in, SMTP out) | ✅ |
 | Identity setup on first start, web search | ✅ |
+| Browser, using the one installed on the host | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -45,7 +46,7 @@ cargo build --release
 ## Configuration
 
 `openclaw-rs config` edits `<state dir>/config.toml` interactively, section by
-section (model and context, tools, gateway, QQ, email, web search, access).
+section (model and context, tools, gateway, QQ, email, web search, browser, access).
 Each field shows the value in effect; Enter keeps it, `-` resets it to the
 default, `?` explains it. Secrets are typed without echo and the prompt says
 when an environment variable overrides them; `+` generates a Gateway token.
@@ -205,6 +206,54 @@ decision model sees the original request, the last step (the assistant's
 text and its tool calls and results, each cut to 600 characters) and the
 waiting messages.
 
+## Browser
+
+The `browser` tool lets the agent use real web pages: ones that need
+JavaScript, clicking through, or filling in a form. No browser is bundled
+and nothing is downloaded: it drives a Chromium-family browser already
+installed on the host over the DevTools protocol, so the binary stays the
+same size and a host without a browser simply has no `browser` tool.
+
+```sh
+apk add chromium              # Alpine / Raspberry Pi
+apt install chromium          # Debian, Raspberry Pi OS
+# macOS: Chrome, Edge, Brave or Chromium in /Applications is found as is
+```
+
+It looks for `chromium`, `chromium-browser`, `google-chrome(-stable)`,
+`microsoft-edge(-stable)` and `brave(-browser)` on `PATH`, then the macOS app
+bundles, once at startup (restart after installing one). The browser starts
+on first use, headless, with its own profile in `<state dir>/browser` (so it
+never touches your own browsing profile), and is closed again after
+`idle_secs` without use. If the Gateway dies the browser is ended with it.
+
+Each conversation has its own tab that keeps its page between calls. The
+model can `open` an http(s) address (`file:`, `chrome:` and script URLs are
+refused), `read` the page (title, URL, text paged by `max_chars`, and its
+links, buttons and fields numbered), `click` or `type` into an element by
+its number or a CSS selector (`submit` presses Enter), go `back`, and take a
+`screenshot`, saved as PNG under `screenshots/` in the workspace.
+
+```toml
+[browser]
+enabled = true
+# executable = "/usr/bin/chromium-browser"   # default: found on PATH
+# cdp_url = "http://127.0.0.1:9222"          # use a browser you started with --remote-debugging-port=9222
+headless = true
+args = []                                    # e.g. ["--proxy-server=socks5://127.0.0.1:1080"]
+timeout_secs = 30                            # per action
+idle_secs = 300
+max_chars = 8000
+```
+
+With `cdp_url` nothing is started: the agent opens its tabs in that browser,
+with its logins, and closes them again when idle. Only use that with a
+browser profile you are happy for the agent to act in.
+
+The browser can reach anything the host can, including pages on your local
+network, so it is the `browser` [capability](#access): the owner has it,
+guests do not unless granted.
+
 ## Scheduled jobs
 
 `serve` runs jobs on standard 5-field cron schedules in the host's local time.
@@ -360,7 +409,7 @@ guest = ["web_search"]               # what any other sender may use
 ```
 
 Capabilities: `shell`, `files_read` (`read_file`, `list_dir`), `files_write`,
-`memory`, `cron`, `identity`, `web_search`. `shell`, `files_write` and
+`memory`, `cron`, `identity`, `web_search`, `browser`. `shell`, `files_write` and
 `identity` still follow `tools.shell`, `tools.write` and `tools.identity`, and
 `ask` is still declined where nobody can approve.
 
@@ -560,7 +609,8 @@ drained while the command runs and only their first and last
 `max_output_bytes / 2` bytes are kept, so endless output cannot exhaust memory;
 the result says how many bytes were omitted. `ask` prompts on the controlling terminal; with no terminal
 the action is declined and the model is told so. Tools set to `deny` are not
-offered to the model at all.
+offered to the model at all. `browser` is offered when the host has a
+browser installed; see [Browser](#browser).
 
 ## Reliability, caching and cost
 

@@ -442,6 +442,56 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: tr("Browser", "浏览器"),
+        fields: &[
+            Field {
+                path: &["browser", "enabled"],
+                label: tr("Browser tool", "浏览器工具"),
+                help: tr(
+                    "Uses a Chromium, Chrome, Edge or Brave already installed on this host; none is bundled. Without one there is no browser tool.",
+                    "使用本机已安装的 Chromium、Chrome、Edge 或 Brave，不自带浏览器；本机没有时就不提供浏览器工具。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["browser", "executable"],
+                label: tr("Browser path", "浏览器路径"),
+                help: tr(
+                    "Reset (-) to use the first of chromium, chromium-browser, google-chrome, microsoft-edge, brave found on PATH.",
+                    "输入 - 恢复为自动查找 PATH 中的 chromium、chromium-browser、google-chrome、microsoft-edge、brave。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
+                path: &["browser", "cdp_url"],
+                label: tr("Running browser", "已运行的浏览器"),
+                help: tr(
+                    "DevTools address of a browser started with --remote-debugging-port, e.g. http://127.0.0.1:9222; empty starts one when needed.",
+                    "用 --remote-debugging-port 启动的浏览器的调试地址，例如 http://127.0.0.1:9222；留空则在需要时自动启动。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
+                path: &["browser", "headless"],
+                label: tr("Headless", "无窗口运行"),
+                help: tr(
+                    "n shows a window, which needs a display.",
+                    "选 n 会显示窗口，需要图形界面。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["browser", "idle_secs"],
+                label: tr("Close when idle (s)", "空闲关闭（秒）"),
+                help: tr(
+                    "The browser is closed after this long without use, freeing its memory.",
+                    "这么久不用就关闭浏览器，释放内存。",
+                ),
+                kind: Kind::Int,
+            },
+        ],
+    },
+    Section {
         title: tr("Access", "权限"),
         fields: &[Field {
             path: &["access", "owners"],
@@ -949,7 +999,7 @@ mod tests {
         let out = drive_in(
             Lang::Zh,
             &path,
-            "5\n?\n是\n\n\n\n9\n6\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
+            "5\n?\n是\n\n\n\n12\n6\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
         );
         assert!(out.contains("2) 模型与上下文"), "{out}");
         assert!(out.contains("s) 保存并退出"), "{out}");
