@@ -16,6 +16,7 @@ mod identity;
 mod llm;
 mod mail;
 mod memory;
+mod onboard;
 mod qq;
 mod review;
 mod search;
@@ -100,6 +101,8 @@ enum Command {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Guided first-time setup: language, OpenRouter key, model.
+    Init,
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
     Config,
     /// Print a shell completion script: bash, zsh, fish, elvish or powershell.
@@ -306,7 +309,23 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Config = cli.command {
         return setup::run(&config_path, i18n::current());
     }
-    let config = Config::load(&config_path)?;
+    if let Command::Init = cli.command {
+        onboard::run(&config_path, i18n::current()).await?;
+        return Ok(());
+    }
+    let mut config = Config::load(&config_path)?;
+    // A first run in a terminal is set up on the spot instead of failing.
+    if matches!(
+        cli.command,
+        Command::Chat { .. } | Command::Ask { .. } | Command::Serve { .. }
+    ) && onboard::needed(&config)
+        && onboard::interactive()
+        && let Some(lang) = onboard::run(&config_path, i18n::current()).await?
+    {
+        i18n::set(lang);
+        config = Config::load(&config_path)?;
+        println!();
+    }
     let store = Store::open(&state)?;
     match cli.command {
         Command::Memory { action } => memory(&store, action),
@@ -344,7 +363,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
-        Command::Config => unreachable!("handled before the config is loaded"),
+        Command::Config | Command::Init => unreachable!("handled before the config is loaded"),
         Command::Completions { .. } => unreachable!("handled before state is opened"),
         Command::Serve { bind } => {
             if store.identity()?.is_none() {

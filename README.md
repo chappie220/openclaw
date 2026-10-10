@@ -33,18 +33,34 @@ Or build on the Pi itself: `apk add cargo build-base && cargo build --release`.
 
 ## Usage
 
-There is no default model: choose one before the first run, in
-`<state dir>/config.toml` or with `openclaw-rs config`. Until then every
-command that talks to a model stops with a message saying so.
-
-```toml
-[model]
-model = "anthropic/claude-sonnet-4.5"   # any OpenRouter model id, required
+```sh
+cargo build --release
+./target/release/openclaw-rs init     # guided setup, about a minute
+./target/release/openclaw-rs chat
 ```
 
+`init` asks four things and saves `<state dir>/config.toml` (mode 0600):
+
+1. the language (中文 or English);
+2. your OpenRouter API key (from https://openrouter.ai/keys), checked with
+   OpenRouter before it is kept; `OPENROUTER_API_KEY`, when set, is used
+   and checked instead;
+3. the main model: search OpenRouter's live model list by name or maker
+   and pick a number. Each line shows the context size, the price per
+   million tokens and 🖼 for models that see images. Only models that can
+   call tools are listed, since the agent needs them; any other id can be
+   typed in full;
+4. if that model cannot see images, whether to pick an image model for
+   pictures people send and browser screenshots (`agent.vision_model`).
+
+It also says whether a browser was found. There is no default model and
+nothing is picked for you. Running `chat`, `ask` or `serve` in a terminal
+before setting up starts `init` on its own and then carries on; without a
+terminal (a service, a pipe) they stop with a message pointing to `init`.
+Run it again any time to change these; everything else is in
+`openclaw-rs config`, and settings already in the file are kept.
+
 ```sh
-export OPENROUTER_API_KEY=sk-or-...
-cargo build --release
 ./target/release/openclaw-rs ask "hello"
 ./target/release/openclaw-rs chat --session work
 ./target/release/openclaw-rs sessions
@@ -53,6 +69,8 @@ cargo build --release
 ```
 
 ## Configuration
+
+`openclaw-rs init` sets up what a first run needs (see [Usage](#usage)).
 
 `openclaw-rs config` edits `<state dir>/config.toml` interactively, section by
 section (model and context, tools, gateway, QQ, email, web search, browser, access).

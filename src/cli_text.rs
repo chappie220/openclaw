@@ -137,6 +137,13 @@ const COMMANDS: &[(&str, Tr)] = &[
         tr("Delete a fact by id", "按编号删除一条记忆"),
     ),
     (
+        "init",
+        tr(
+            "Guided first-time setup: language, OpenRouter key, model",
+            "首次使用引导设置：语言、OpenRouter key、模型",
+        ),
+    ),
+    (
         "config",
         tr(
             "Edit config.toml interactively: language, model, tools, gateway, QQ, email, search, access",
@@ -474,8 +481,8 @@ pub const MAIL_ENTRY: Tr = tr(
     "#{} {} {} 来自 {} 尝试={} 更新于 {}",
 );
 pub const NO_MODEL: Tr = tr(
-    "no model chosen: set model.model in config.toml to an OpenRouter model id (run `openclaw-rs config`, section \"Model and context\")",
-    "还没有选择模型：请在 config.toml 里把 model.model 设为一个 OpenRouter 模型 id（运行 `openclaw-rs config`，在“模型与上下文”里设置）",
+    "no model chosen: run `openclaw-rs init` for guided setup, or set model.model in config.toml to an OpenRouter model id",
+    "还没有选择模型：运行 `openclaw-rs init` 按引导设置，或在 config.toml 里把 model.model 设为一个 OpenRouter 模型 id",
 );
 pub const QQ_OPEN_TO_STRANGERS: Tr = tr(
     "access.guest or access.grants.\"qq:*\" lets any QQ user run commands or write files; list trusted openids in qq.allow (the log shows each sender's openid), or grant those capabilities to named senders only",

@@ -516,16 +516,16 @@ const SECTIONS: &[Section] = &[
 
 /// Terminal I/O, abstracted so the editor can be driven by tests.
 pub struct Term<R, W> {
-    input: R,
-    out: W,
+    pub(crate) input: R,
+    pub(crate) out: W,
     /// Turn echo off while a secret is typed; only for a real terminal.
-    hide_secrets: bool,
-    lang: Lang,
+    pub(crate) hide_secrets: bool,
+    pub(crate) lang: Lang,
 }
 
 impl<R: BufRead, W: Write> Term<R, W> {
     /// One trimmed line, or `None` at end of input.
-    fn ask(&mut self, prompt: &str) -> Result<Option<String>> {
+    pub(crate) fn ask(&mut self, prompt: &str) -> Result<Option<String>> {
         write!(self.out, "{prompt}")?;
         self.out.flush()?;
         let mut line = String::new();
@@ -535,7 +535,7 @@ impl<R: BufRead, W: Write> Term<R, W> {
         Ok(Some(line.trim().to_owned()))
     }
 
-    fn secret(&mut self, prompt: &str) -> Result<Option<String>> {
+    pub(crate) fn secret(&mut self, prompt: &str) -> Result<Option<String>> {
         if !self.hide_secrets {
             return self.ask(prompt);
         }
@@ -545,12 +545,12 @@ impl<R: BufRead, W: Write> Term<R, W> {
         line
     }
 
-    fn say(&mut self, text: &str) -> Result<()> {
+    pub(crate) fn say(&mut self, text: &str) -> Result<()> {
         writeln!(self.out, "{text}")?;
         Ok(())
     }
 
-    fn tell(&mut self, text: Tr, args: &[&str]) -> Result<()> {
+    pub(crate) fn tell(&mut self, text: Tr, args: &[&str]) -> Result<()> {
         let line = text.fill(self.lang, args);
         self.say(&line)
     }
@@ -586,20 +586,24 @@ impl Drop for EchoOff {
     }
 }
 
-/// Runs the editor on `path` with the process's terminal.
-pub fn run(path: &Path, lang: Lang) -> Result<()> {
-    let stdin = std::io::stdin();
+/// The process's own terminal.
+pub fn terminal(lang: Lang) -> Term<std::io::StdinLock<'static>, std::io::Stdout> {
+    // SAFETY: isatty has no preconditions.
     let hide = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-    let mut term = Term {
-        input: stdin.lock(),
+    Term {
+        input: std::io::stdin().lock(),
         out: std::io::stdout(),
         hide_secrets: hide,
         lang,
-    };
-    edit(path, &mut term)
+    }
 }
 
-fn load(path: &Path) -> Result<DocumentMut> {
+/// Runs the editor on `path` with the process's terminal.
+pub fn run(path: &Path, lang: Lang) -> Result<()> {
+    edit(path, &mut terminal(lang))
+}
+
+pub(crate) fn load(path: &Path) -> Result<DocumentMut> {
     match std::fs::read_to_string(path) {
         Ok(text) => text
             .parse()
@@ -609,7 +613,7 @@ fn load(path: &Path) -> Result<DocumentMut> {
     }
 }
 
-fn parse(doc: &DocumentMut) -> Result<Config> {
+pub(crate) fn parse(doc: &DocumentMut) -> Result<Config> {
     Ok(toml::from_str(&doc.to_string())?)
 }
 
@@ -680,7 +684,7 @@ fn finish<R: BufRead, W: Write>(
 }
 
 /// Writes atomically with mode 0600, since the file may hold secrets.
-fn write_private(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path
         .parent()
@@ -831,7 +835,7 @@ fn random_token() -> Result<String> {
 }
 
 /// Sets the value at `path`, keeping the old value's surrounding comments.
-fn set(doc: &mut DocumentMut, path: &[&str], mut value: Value) {
+pub(crate) fn set(doc: &mut DocumentMut, path: &[&str], mut value: Value) {
     let (key, tables) = path.split_last().expect("paths are never empty");
     let mut item = doc.as_item_mut();
     for name in tables {

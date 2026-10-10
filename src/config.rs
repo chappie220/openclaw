@@ -492,7 +492,7 @@ impl Config {
                     .filter(|key| !key.trim().is_empty())
             })
             .context(
-                "no OpenRouter API key: set OPENROUTER_API_KEY or model.api_key in config.toml",
+                "no OpenRouter API key: run `openclaw-rs init`, or set OPENROUTER_API_KEY or model.api_key in config.toml",
             )
     }
 }
