@@ -164,8 +164,10 @@ understood the message to add or change, and what it will do now. This reply
 is written fresh each time (by `agent.summary_model`, else the main model)
 from the turn so far, appears in the Web UI right below the message and is
 sent to the QQ chat. It is not stored in the history, so it never binds the
-model doing the work; if writing it fails or takes over 30 s, a short fixed
-note is sent instead. With `ack = false` QQ answers at once with a fixed
+model doing the work. If writing it fails or takes over 30 s, the reply says
+so with the error (for example `HTTP 402: insufficient credits`, or `no reply
+within 30 s`), so a broken reply model is easy to track down; the message was
+still added and the turn goes on. The error is also logged. With `ack = false` QQ answers at once with a fixed
 "got it" instead and the Web UI shows only the marks.
 
 The message waits in the turn's inbox. After each step (a model call and the

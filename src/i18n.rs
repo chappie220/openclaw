@@ -148,9 +148,9 @@ pub mod chat {
         "Got it. I'll add this to what I'm working on at a good moment.",
         "收到，我会在合适的时机把这条加入正在进行的对话。",
     );
-    pub const FOLLOW_UP_ADDED: Tr = tr(
-        "Got it, I'm taking that into account now.",
-        "收到，我现在把这条考虑进去。",
+    pub const ACK_FAILED: Tr = tr(
+        "Your message was added to the current turn, but the reply to it could not be written: {}",
+        "你的消息已加入当前这一轮，但给它的回应没能生成：{}",
     );
 
     #[cfg(test)]
@@ -173,7 +173,7 @@ pub mod chat {
         NOTHING_RUNNING,
         STOP_NOT_ALLOWED,
         FOLLOW_UP_QUEUED,
-        FOLLOW_UP_ADDED,
+        ACK_FAILED,
     ];
 }
 

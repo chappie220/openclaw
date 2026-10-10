@@ -114,6 +114,8 @@ enum ServerMsg {
     Ack {
         session: String,
         text: String,
+        /// The reply could not be written; `text` says why.
+        failed: bool,
     },
 }
 
@@ -295,25 +297,28 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         out: Option<&mpsc::UnboundedSender<ServerMsg>>,
     ) {
         while let Some(messages) = inserted.recv().await {
-            let text =
-                match tokio::time::timeout(ACK_TIMEOUT, self.agent.acknowledge(session, &messages))
-                    .await
-                {
-                    Ok(Ok(text)) => text,
-                    Ok(Err(err)) => {
-                        eprintln!("guide: cannot acknowledge in {session}: {err:#}");
-                        chat::FOLLOW_UP_ADDED.now().into()
-                    }
-                    Err(_) => {
-                        eprintln!("guide: acknowledgement in {session} timed out");
-                        chat::FOLLOW_UP_ADDED.now().into()
-                    }
-                };
+            let timed =
+                tokio::time::timeout(ACK_TIMEOUT, self.agent.acknowledge(session, &messages));
+            // On failure, say why, so a broken reply model can be tracked
+            // down; the message itself was added all the same.
+            let (text, failed) = match timed.await {
+                Ok(Ok(text)) => (text, false),
+                Ok(Err(err)) => {
+                    eprintln!("guide: cannot acknowledge in {session}: {err:#}");
+                    (chat::ACK_FAILED.with(&[&format!("{err:#}")]), true)
+                }
+                Err(_) => {
+                    let err = format!("no reply within {} s", ACK_TIMEOUT.as_secs());
+                    eprintln!("guide: cannot acknowledge in {session}: {err}");
+                    (chat::ACK_FAILED.with(&[&err]), true)
+                }
+            };
             match out {
                 Some(out) => {
                     let _ = out.send(ServerMsg::Ack {
                         session: session.to_owned(),
                         text,
+                        failed,
                     });
                 }
                 None => self.notify(session, &text).await,
@@ -1196,8 +1201,9 @@ mod tests {
         assert_eq!(store.identity().unwrap().unwrap().name, "Mallory");
     }
 
-    /// Holds its first call until `go` is notified; answers what it read last.
-    struct Gate(Arc<tokio::sync::Notify>, AtomicU64);
+    /// Holds its first call until `go` is notified; answers what it read
+    /// last, or with `.2` refuses to write acknowledgements.
+    struct Gate(Arc<tokio::sync::Notify>, AtomicU64, bool);
 
     #[async_trait]
     impl Model for Gate {
@@ -1211,6 +1217,9 @@ mod tests {
                 self.0.notified().await;
             }
             let last = messages.last().unwrap().content.clone().unwrap_or_default();
+            if self.2 && last.starts_with("The turn so far") {
+                bail!("model request failed with HTTP 402: insufficient credits");
+            }
             Ok(crate::llm::Completion {
                 text: format!("re: {}", guide::without_note(&last)),
                 ..Default::default()
@@ -1220,6 +1229,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_message_sent_during_a_turn_joins_it() {
+        let fail_ack = false;
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
         let tools = crate::tools::BuiltinTools::new(
@@ -1230,7 +1240,7 @@ mod tests {
         .unwrap();
         let go = Arc::new(tokio::sync::Notify::new());
         let agent = Arc::new(Agent {
-            model: Gate(go.clone(), AtomicU64::new(0)),
+            model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
             summarizer: None,
             tools,
             store: store.clone(),
@@ -1296,8 +1306,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn inserted_messages_get_a_reply_of_their_own() {
+    /// What the QQ chat receives besides the turn's reply, when a second
+    /// message joins the turn.
+    async fn acknowledgements(fail_ack: bool) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
         let tools = crate::tools::BuiltinTools::new(
@@ -1308,7 +1319,7 @@ mod tests {
         .unwrap();
         let go = Arc::new(tokio::sync::Notify::new());
         let agent = Arc::new(Agent {
-            model: Gate(go.clone(), AtomicU64::new(0)),
+            model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
             summarizer: None,
             tools,
             store,
@@ -1349,9 +1360,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reply, "re: first\n\nre: second");
-        let sent = sent.0.lock().unwrap();
+        sent.0.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn inserted_messages_get_a_reply_of_their_own() {
+        let sent = acknowledgements(false).await;
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert!(sent[0].ends_with("sent just now:\n\nsecond"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_acknowledgement_says_why() {
+        let sent = acknowledgements(true).await;
+        assert_eq!(
+            sent,
+            [
+                chat::ACK_FAILED
+                    .with(&["model request failed with HTTP 402: insufficient credits"])
+            ]
+        );
     }
 
     #[test]
