@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::access::{self, AccessConfig, Actor};
-use crate::agent::{Agent, AgentEvent, Model, Tools};
+use crate::agent::{Agent, AgentEvent, Cancel, Model, Tools};
+use crate::i18n::chat;
 use crate::llm::Role;
 use crate::tools::{Approver, with_approver};
 
@@ -32,9 +33,21 @@ const SCHEDULER_TICK: Duration = Duration::from_secs(20);
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
-    Send { session: String, text: String },
-    Approve { id: u64, allow: bool },
-    History { session: String },
+    Send {
+        session: String,
+        text: String,
+    },
+    /// Stops the session's running turn.
+    Stop {
+        session: String,
+    },
+    Approve {
+        id: u64,
+        allow: bool,
+    },
+    History {
+        session: String,
+    },
     Sessions,
 }
 
@@ -110,6 +123,48 @@ pub struct Gateway<M: Model, T: Tools> {
     updates: broadcast::Sender<ServerMsg>,
     /// One turn per session at a time; later sends queue behind it.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The turn running in each session, and the actor who started it.
+    running: Mutex<HashMap<String, (Cancel, String)>>,
+}
+
+/// What `/stop` found.
+#[derive(Debug, PartialEq)]
+pub enum StopOutcome {
+    Stopping,
+    NothingRunning,
+    NotAllowed,
+}
+
+impl StopOutcome {
+    fn reply(&self) -> String {
+        match self {
+            StopOutcome::Stopping => chat::STOPPING,
+            StopOutcome::NothingRunning => chat::NOTHING_RUNNING,
+            StopOutcome::NotAllowed => chat::STOP_NOT_ALLOWED,
+        }
+        .now()
+        .into()
+    }
+}
+
+/// `/stop` typed by a person; handled before the session's queue.
+fn is_stop_command(text: &str) -> bool {
+    text.trim() == "/stop"
+}
+
+/// Removes a turn from `running` when it ends, however it ends.
+struct RunningTurn<'a> {
+    running: &'a Mutex<HashMap<String, (Cancel, String)>>,
+    session: String,
+}
+
+impl Drop for RunningTurn<'_> {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.session);
+    }
 }
 
 type Shared<M, T> = Arc<Gateway<M, T>>;
@@ -127,7 +182,35 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
             updates: broadcast::channel(64).0,
             notifiers: Mutex::new(Vec::new()),
             session_locks: Mutex::new(HashMap::new()),
+            running: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Registers `session`'s turn, started by `actor`, until the guard drops.
+    fn start_turn(&self, session: &str, actor: &Actor) -> (Cancel, RunningTurn<'_>) {
+        let cancel = Cancel::default();
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session.to_owned(), (cancel.clone(), actor.id.clone()));
+        let guard = RunningTurn {
+            running: &self.running,
+            session: session.to_owned(),
+        };
+        (cancel, guard)
+    }
+
+    /// Stops `session`'s running turn if `actor` owns the host or started it.
+    pub fn stop(&self, session: &str, actor: &Actor) -> StopOutcome {
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        match running.get(session) {
+            None => StopOutcome::NothingRunning,
+            Some((cancel, started_by)) if actor.owner || *started_by == actor.id => {
+                cancel.cancel();
+                StopOutcome::Stopping
+            }
+            Some(_) => StopOutcome::NotAllowed,
+        }
     }
 
     pub fn router(self: &Shared<M, T>) -> Router {
@@ -179,14 +262,19 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         session: &str,
         prompt: &str,
     ) -> Result<String> {
+        // Before the queue, which the turn to stop is holding.
+        if is_stop_command(prompt) {
+            return Ok(self.stop(session, &actor).reply());
+        }
         if let Some(reply) = crate::identity::command(&self.agent.store, &actor, prompt) {
             return Ok(reply);
         }
         let lock = self.session_lock(session);
         let _turn = lock.lock().await;
+        let (cancel, _running) = self.start_turn(session, &actor);
         let mut result = self
             .agent
-            .run_turn(actor, session, prompt, &mut |_| {})
+            .run_turn_until(actor, session, prompt, &cancel, &mut |_| {})
             .await;
         // The person approves what the program shows them, not the model's
         // description of it.
@@ -426,6 +514,10 @@ async fn connection<M: Model + 'static, T: Tools + 'static>(
                     approver,
                 ));
             }
+            ClientMsg::Stop { session } => {
+                // The Web UI is the owner; the turn replies "stopped" itself.
+                gateway.stop(&session, &Actor::owner(access::WEB));
+            }
             ClientMsg::Approve { id, allow } => {
                 if let Some(tx) = pending
                     .lock()
@@ -480,8 +572,17 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         });
         return;
     }
+    if is_stop_command(&text) {
+        let reply = gateway.stop(&session, &actor).reply();
+        let _ = out.send(ServerMsg::Done {
+            session,
+            text: reply,
+        });
+        return;
+    }
     let lock = gateway.session_lock(&session);
     let _turn = lock.lock().await;
+    let (cancel, _running) = gateway.start_turn(&session, &actor);
     let events = out.clone();
     let name = session.clone();
     let mut on_event = move |event: AgentEvent| {
@@ -505,7 +606,7 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         // The connection presented the gateway token (or is loopback-only).
         gateway
             .agent
-            .run_turn(actor, &session, &text, &mut on_event),
+            .run_turn_until(actor, &session, &text, &cancel, &mut on_event),
     )
     .await;
     let _ = out.send(match result {
@@ -526,7 +627,7 @@ fn history<M: Model, T: Tools>(gateway: &Gateway<M, T>, session: String) -> Serv
             .history(id, 200)?
             .into_iter()
             .filter_map(|m| {
-                let text = m.content.filter(|c| !c.is_empty())?;
+                let text = crate::agent::for_people(&m.content.filter(|c| !c.is_empty())?);
                 let role = match m.role {
                     Role::User => "user",
                     Role::Assistant => "assistant",
@@ -606,6 +707,86 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// Streams a little text, then waits until the turn is stopped.
+    struct Hang;
+
+    #[async_trait]
+    impl Model for Hang {
+        async fn complete(
+            &self,
+            _messages: &[crate::llm::ChatMessage],
+            _tools: &[crate::llm::ToolSpec],
+            on_text: &mut (dyn for<'t> FnMut(&'t str) + Send),
+        ) -> Result<crate::llm::Completion> {
+            on_text("working");
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_reaches_a_running_turn_past_its_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let tools = crate::tools::BuiltinTools::new(
+            dir.path().to_owned(),
+            crate::config::ToolsConfig::default(),
+            store.clone(),
+        )
+        .unwrap();
+        let agent = Arc::new(Agent {
+            model: Hang,
+            summarizer: None,
+            tools,
+            store: store.clone(),
+            config: crate::config::AgentConfig::default(),
+        });
+        let access: AccessConfig = toml::from_str(r#"owners = ["qq:BOSS"]"#).unwrap();
+        let gateway = Gateway::new(agent, None, access);
+        let session = "qq:group:G1";
+        let alice = gateway.actor("qq:ALICE", session);
+        let turn = tokio::spawn({
+            let gateway = gateway.clone();
+            let alice = alice.clone();
+            async move { gateway.run_unattended(alice, session, "do it").await }
+        });
+        while !gateway.running.lock().unwrap().contains_key(session) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let bob = gateway.actor("qq:BOB", session);
+        assert_eq!(
+            gateway.run_unattended(bob, session, "/stop").await.unwrap(),
+            chat::STOP_NOT_ALLOWED.now()
+        );
+        assert_eq!(
+            gateway
+                .run_unattended(alice, session, " /stop ")
+                .await
+                .unwrap(),
+            chat::STOPPING.now()
+        );
+        let reply = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .expect("the turn ends once stopped")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, chat::STOPPED.now());
+        assert!(gateway.running.lock().unwrap().is_empty());
+        let boss = gateway.actor("qq:BOSS", session);
+        assert_eq!(
+            gateway
+                .run_unattended(boss, session, "/stop")
+                .await
+                .unwrap(),
+            chat::NOTHING_RUNNING.now()
+        );
+        let id = store.session_id(session).unwrap();
+        let history = store.history(id, 10).unwrap();
+        assert_eq!(
+            history.last().unwrap().content.as_deref(),
+            Some("working\n\n[Stopped by the user before finishing.]")
+        );
     }
 
     #[tokio::test]

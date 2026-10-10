@@ -412,7 +412,14 @@ async fn run(cli: Cli) -> Result<()> {
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             loop {
                 eprint!("> ");
-                let Some(line) = lines.next_line().await? else {
+                // Once a turn has handled Ctrl-C, it no longer ends the
+                // program by itself, so the prompt does.
+                let line = tokio::select! {
+                    line = lines.next_line() => line?,
+                    _ = tokio::signal::ctrl_c() => None,
+                };
+                let Some(line) = line else {
+                    eprintln!();
                     break;
                 };
                 if line.trim().is_empty() {
@@ -505,14 +512,31 @@ async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
             );
         }
     };
-    let run = agent.run_turn(
+    let cancel = agent::Cancel::default();
+    let run = agent.run_turn_until(
         access::Actor::owner(access::CLI),
         session,
         input,
+        &cancel,
         &mut on_event,
     );
-    with_approver(Arc::new(TerminalApprover), run).await?;
+    let run = with_approver(Arc::new(TerminalApprover), run);
+    tokio::pin!(run);
+    // Ctrl-C stops this turn, not the program.
+    let mut stopped = false;
+    let reply = loop {
+        tokio::select! {
+            reply = &mut run => break reply?,
+            _ = tokio::signal::ctrl_c(), if !stopped => {
+                stopped = true;
+                cancel.cancel();
+            }
+        }
+    };
     println!();
+    if stopped {
+        eprintln!("{reply}");
+    }
     Ok(())
 }
 

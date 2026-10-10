@@ -1,5 +1,7 @@
 //! One user turn: model call, tool execution, repeat until the model answers.
 
+use std::sync::Arc;
+
 use anyhow::{Result, bail};
 
 use crate::access::{self, Actor};
@@ -24,6 +26,52 @@ pub async fn with_session<F: std::future::Future>(session: String, fut: F) -> F:
 /// The session whose turn is running on this task, for tools that act on it.
 pub fn current_session() -> Option<String> {
     CURRENT_SESSION.try_with(Clone::clone).ok()
+}
+
+/// Stops a running turn from outside it: the model call or tool in progress
+/// is dropped (a shell command's process group is killed) and the turn ends
+/// with what it has so far.
+#[derive(Clone)]
+pub struct Cancel(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for Cancel {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::channel(false).0))
+    }
+}
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+
+    async fn cancelled(&self) {
+        let mut rx = self.0.subscribe();
+        // The sender lives as long as `self`, so this only returns on cancel.
+        let _ = rx.wait_for(|stopped| *stopped).await;
+    }
+
+    /// `fut`'s output, or `None` once cancelled.
+    async fn until<F: std::future::Future>(&self, fut: F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => None,
+            out = fut => Some(out),
+        }
+    }
+}
+
+/// Sent to the model in place of the rest of a stopped answer.
+pub const STOPPED_NOTE: &str = "[Stopped by the user before finishing.]";
+
+/// A stored reply as a person reads it: the model's stop note becomes the
+/// "stopped" text in the person's language.
+pub fn for_people(text: &str) -> String {
+    match text.strip_suffix(STOPPED_NOTE) {
+        Some(rest) if rest.trim().is_empty() => chat::STOPPED.now().into(),
+        Some(rest) => format!("{}\n\n{}", rest.trim_end(), chat::STOPPED.now()),
+        None => text.to_owned(),
+    }
 }
 
 /// What the agent reports while a turn runs; front ends render these.
@@ -77,6 +125,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
     /// Runs one turn and returns the final assistant text. Every message is
     /// persisted as it is produced, so an interrupted turn keeps its progress.
     /// Tools run with `actor`'s permissions.
+    #[cfg(test)]
     pub async fn run_turn(
         &self,
         actor: Actor,
@@ -84,7 +133,24 @@ impl<M: Model, T: Tools> Agent<M, T> {
         input: &str,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<String> {
-        let turn = CURRENT_SESSION.scope(session.to_owned(), self.turn(session, input, on_event));
+        self.run_turn_until(actor, session, input, &Cancel::default(), on_event)
+            .await
+    }
+
+    /// Like `run_turn`, ending early with a "stopped" reply once `cancel`
+    /// fires. What was said so far is kept, with a note that it was cut off.
+    pub async fn run_turn_until(
+        &self,
+        actor: Actor,
+        session: &str,
+        input: &str,
+        cancel: &Cancel,
+        on_event: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<String> {
+        let turn = CURRENT_SESSION.scope(
+            session.to_owned(),
+            self.turn(session, input, cancel, on_event),
+        );
         access::with_actor(actor, turn).await
     }
 
@@ -92,6 +158,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
         &self,
         session: &str,
         input: &str,
+        cancel: &Cancel,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<String> {
         let session_id = self.store.session_id(session)?;
@@ -118,12 +185,17 @@ impl<M: Model, T: Tools> Agent<M, T> {
                     .await?,
             );
             let estimated = context::estimate_messages(&messages) + context::estimate(&tool_json);
-            let completion = self
-                .model
-                .complete(&messages, &specs, &mut |text| {
+            let mut shown = String::new();
+            let completion = cancel
+                .until(self.model.complete(&messages, &specs, &mut |text| {
+                    shown.push_str(text);
                     on_event(AgentEvent::Text(text.to_owned()))
-                })
-                .await?;
+                }))
+                .await;
+            let Some(completion) = completion else {
+                return self.stopped(session_id, &shown);
+            };
+            let completion = completion?;
             self.record(session, "turn", &completion);
             if let Some(usage) = completion.usage
                 && let Err(err) =
@@ -147,7 +219,9 @@ impl<M: Model, T: Tools> Agent<M, T> {
                     name: call.function.name.clone(),
                     arguments: call.function.arguments.clone(),
                 });
-                let output = self.tools.call(call).await;
+                let Some(output) = cancel.until(self.tools.call(call)).await else {
+                    return self.stopped(session_id, "");
+                };
                 on_event(AgentEvent::ToolEnd {
                     name: call.function.name.clone(),
                     output: output.clone(),
@@ -205,6 +279,19 @@ impl<M: Model, T: Tools> Agent<M, T> {
         {
             eprintln!("usage: cannot record a model call: {err:#}");
         }
+    }
+
+    /// Ends a cancelled turn: keeps the text already shown, with a note for
+    /// the model that the user stopped it.
+    fn stopped(&self, session_id: i64, shown: &str) -> Result<String> {
+        let note = if shown.trim().is_empty() {
+            STOPPED_NOTE.to_owned()
+        } else {
+            format!("{shown}\n\n{STOPPED_NOTE}")
+        };
+        self.store
+            .append(session_id, &ChatMessage::assistant(note))?;
+        Ok(chat::STOPPED.now().into())
     }
 
     fn summarizer(&self) -> &M {
@@ -636,6 +723,74 @@ mod tests {
             !text.contains("主人"),
             "only the guest's own memories: {text}"
         );
+    }
+
+    /// A tool that never finishes on its own.
+    struct Stuck;
+
+    #[async_trait::async_trait]
+    impl Tools for Stuck {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Echo.specs()
+        }
+        async fn call(&self, _call: &ToolCall) -> String {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_inside_a_tool_keeps_the_turn_so_far() {
+        let call = ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "echo".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let agent = Agent {
+            model: Scripted(Mutex::new(vec![Completion {
+                text: "checking".into(),
+                tool_calls: vec![call],
+                ..Default::default()
+            }])),
+            summarizer: None,
+            tools: Stuck,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig::default(),
+        };
+        let cancel = Cancel::default();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            stopper.cancel();
+        });
+        let reply = agent
+            .run_turn_until(Actor::owner(access::CLI), "s", "go", &cancel, &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(reply, chat::STOPPED.now());
+        let id = agent.store.session_id("s").unwrap();
+        let history = agent.store.history(id, 10).unwrap();
+        use crate::llm::Role::*;
+        assert_eq!(
+            history.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![User, Assistant, Assistant]
+        );
+        assert_eq!(history[2].content.as_deref(), Some(STOPPED_NOTE));
+        // A cancel that comes after the turn changes nothing.
+        cancel.cancel();
+    }
+
+    #[test]
+    fn people_see_the_stop_note_in_their_language() {
+        let stopped = chat::STOPPED.now();
+        assert_eq!(for_people(STOPPED_NOTE), stopped);
+        assert_eq!(
+            for_people(&format!("half an answer\n\n{STOPPED_NOTE}")),
+            format!("half an answer\n\n{stopped}")
+        );
+        assert_eq!(for_people("a normal reply"), "a normal reply");
     }
 
     #[tokio::test]

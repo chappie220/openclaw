@@ -134,6 +134,16 @@ pub mod chat {
         "回复“/identity approve {} {}”保存，或回复“/identity reject {}”拒绝。",
     );
     pub const DRAFT_TITLE: Tr = tr("Identity draft #{} (code {})", "身份草稿 #{}（验证码 {}）");
+    pub const STOPPED: Tr = tr("Stopped.", "已停止。");
+    pub const STOPPING: Tr = tr("Stopping the current turn.", "正在停止当前这一轮。");
+    pub const NOTHING_RUNNING: Tr = tr(
+        "Nothing is running in this conversation.",
+        "这段对话里没有正在运行的任务。",
+    );
+    pub const STOP_NOT_ALLOWED: Tr = tr(
+        "Only the owner or whoever started it can stop this turn.",
+        "只有 owner 或发起这一轮的人能停止它。",
+    );
 
     #[cfg(test)]
     pub const ALL: &[Tr] = &[
@@ -150,6 +160,10 @@ pub mod chat {
         IDENTITY_USAGE,
         APPROVAL_HINT,
         DRAFT_TITLE,
+        STOPPED,
+        STOPPING,
+        NOTHING_RUNNING,
+        STOP_NOT_ALLOWED,
     ];
 }
 

@@ -113,6 +113,21 @@ bind = "127.0.0.1:18789"
 # token = "..."   # prefer OPENCLAW_RS_TOKEN
 ```
 
+## Stopping a turn
+
+A turn that runs too long can be stopped without losing what it did:
+
+- CLI (`chat`, `ask`): Ctrl-C stops the current turn; at the `>` prompt it
+  still quits.
+- Web UI: while a turn runs, the Send button becomes Stop.
+- QQ and email: send `/stop`. Only the owner or whoever started the turn can
+  stop it; it is handled ahead of the queue the running turn holds.
+
+The model call or tool in progress is dropped (a shell command's whole
+process group is killed), the text shown so far is kept with a note telling
+the model it was cut off, and the turn replies "Stopped". Messages saved
+before that point stay in the history.
+
 ## Scheduled jobs
 
 `serve` runs jobs on standard 5-field cron schedules in the host's local time.
