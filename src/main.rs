@@ -499,6 +499,7 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         .workspace
         .clone()
         .unwrap_or_else(|| state.join("workspace"));
+    config.model_id()?;
     let api_key = config.api_key()?;
     let search = search::Searcher::new(&config.search, &config.model, &api_key)?;
     let review = review::Reviewer::from_config(&config.tools.review, &config.model, &api_key)?;

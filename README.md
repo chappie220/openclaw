@@ -33,6 +33,15 @@ Or build on the Pi itself: `apk add cargo build-base && cargo build --release`.
 
 ## Usage
 
+There is no default model: choose one before the first run, in
+`<state dir>/config.toml` or with `openclaw-rs config`. Until then every
+command that talks to a model stops with a message saying so.
+
+```toml
+[model]
+model = "anthropic/claude-sonnet-4.5"   # any OpenRouter model id, required
+```
+
 ```sh
 export OPENROUTER_API_KEY=sk-or-...
 cargo build --release
@@ -591,7 +600,7 @@ and nothing is touched.
 
 ```toml
 [model]
-model = "openrouter/auto"            # any OpenRouter model id
+model = "..."                        # required: any OpenRouter model id
 base_url = "https://openrouter.ai/api/v1"
 request_timeout_secs = 300
 # fallbacks = ["openai/gpt-x"]       # OpenRouter tries these when `model` fails

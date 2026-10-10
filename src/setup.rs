@@ -100,8 +100,8 @@ const SECTIONS: &[Section] = &[
                 path: &["model", "model"],
                 label: tr("Model", "模型"),
                 help: tr(
-                    "Any OpenRouter model id, e.g. anthropic/claude-sonnet-4.5 or openrouter/auto.",
-                    "任意 OpenRouter 模型 id，例如 anthropic/claude-sonnet-4.5 或 openrouter/auto。",
+                    "Required, there is no default: any OpenRouter model id, e.g. anthropic/claude-sonnet-4.5.",
+                    "必填，没有默认值：任意 OpenRouter 模型 id，例如 anthropic/claude-sonnet-4.5。",
                 ),
                 kind: Kind::Text,
             },

@@ -7,8 +7,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
-/// OpenRouter's router picks a model when the operator has not chosen one.
-pub const DEFAULT_MODEL: &str = "openrouter/auto";
 /// Leaves the name to the identity chosen on first start.
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful personal assistant running on OpenClaw.";
 
@@ -281,6 +279,7 @@ impl GatewayConfig {
 #[serde(default)]
 pub struct ModelConfig {
     pub base_url: String,
+    /// Required: there is no default model, so the operator always chooses.
     pub model: String,
     /// Prefer `OPENROUTER_API_KEY`; a key here is stored in plain text.
     pub api_key: Option<String>,
@@ -436,7 +435,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.into(),
-            model: DEFAULT_MODEL.into(),
+            model: String::new(),
             api_key: None,
             request_timeout_secs: 300,
             fallbacks: Vec::new(),
@@ -470,6 +469,15 @@ impl Config {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err).with_context(|| format!("cannot read {}", path.display())),
         }
+    }
+
+    /// The main model; there is none until the operator sets one.
+    pub fn model_id(&self) -> Result<&str> {
+        let model = self.model.model.trim();
+        if model.is_empty() {
+            anyhow::bail!(crate::cli_text::NO_MODEL.now());
+        }
+        Ok(model)
     }
 
     /// Environment wins so secrets never need to live in the config file.
@@ -510,5 +518,20 @@ mod tests {
         assert_eq!(config.model.model, "x/y");
         assert_eq!(config.model.base_url, DEFAULT_BASE_URL);
         assert_eq!(config.agent.max_steps, 25);
+    }
+
+    #[test]
+    fn the_model_must_be_chosen() {
+        let config = Config::default();
+        assert!(config.model.model.is_empty());
+        assert!(
+            config
+                .model_id()
+                .unwrap_err()
+                .to_string()
+                .contains("model.model")
+        );
+        let config: Config = toml::from_str("[model]\nmodel = \" x/y \"\n").unwrap();
+        assert_eq!(config.model_id().unwrap(), "x/y");
     }
 }

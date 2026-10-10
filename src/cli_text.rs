@@ -473,6 +473,10 @@ pub const MAIL_ENTRY: Tr = tr(
     "#{} {} {} from {} attempts={} updated {}",
     "#{} {} {} 来自 {} 尝试={} 更新于 {}",
 );
+pub const NO_MODEL: Tr = tr(
+    "no model chosen: set model.model in config.toml to an OpenRouter model id (run `openclaw-rs config`, section \"Model and context\")",
+    "还没有选择模型：请在 config.toml 里把 model.model 设为一个 OpenRouter 模型 id（运行 `openclaw-rs config`，在“模型与上下文”里设置）",
+);
 pub const QQ_OPEN_TO_STRANGERS: Tr = tr(
     "access.guest or access.grants.\"qq:*\" lets any QQ user run commands or write files; list trusted openids in qq.allow (the log shows each sender's openid), or grant those capabilities to named senders only",
     "access.guest 或 access.grants.\"qq:*\" 让任何 QQ 用户都能运行命令或写文件；请在 qq.allow 里列出可信的 openid（日志会显示每个发送者的 openid），或只把这些权限授予指定的发送者",
@@ -552,6 +556,7 @@ mod tests {
         MAIL_CHECK_FAILED,
         NO_MAIL,
         MAIL_ENTRY,
+        NO_MODEL,
         QQ_OPEN_TO_STRANGERS,
         NO_OWNERS,
         NEVER,
