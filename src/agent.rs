@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 
 use crate::access::{self, Actor};
+use crate::attachments::{Attachment, Upload};
 use crate::config::AgentConfig;
 use crate::context;
 use crate::i18n::chat;
@@ -133,31 +134,40 @@ impl<M: Model, T: Tools> Agent<M, T> {
         input: &str,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<String> {
-        self.run_turn_until(actor, session, input, &Cancel::default(), on_event)
+        self.run_turn_until(actor, session, input, &[], &Cancel::default(), on_event)
             .await
     }
 
-    /// Like `run_turn`, ending early with a "stopped" reply once `cancel`
-    /// fires. What was said so far is kept, with a note that it was cut off.
+    /// Like `run_turn`, with files sent along (saved by `save_uploads`), and
+    /// ending early with a "stopped" reply once `cancel` fires. What was said
+    /// so far is kept, with a note that it was cut off.
     pub async fn run_turn_until(
         &self,
         actor: Actor,
         session: &str,
         input: &str,
+        files: &[Attachment],
         cancel: &Cancel,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<String> {
         let turn = CURRENT_SESSION.scope(
             session.to_owned(),
-            self.turn(session, input, cancel, on_event),
+            self.turn(session, input, files, cancel, on_event),
         );
         access::with_actor(actor, turn).await
+    }
+
+    /// Saves files that came with a message into the workspace; the notes
+    /// say which could not be kept, for the message text.
+    pub fn save_uploads(&self, uploads: &[Upload]) -> (Vec<Attachment>, Vec<String>) {
+        crate::attachments::save_all(&self.config.workspace, uploads)
     }
 
     async fn turn(
         &self,
         session: &str,
         input: &str,
+        files: &[Attachment],
         cancel: &Cancel,
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<String> {
@@ -168,7 +178,11 @@ impl<M: Model, T: Tools> Agent<M, T> {
             }
             return self.compact(session, session_id).await;
         }
-        self.store.append(session_id, &ChatMessage::user(input))?;
+        let mut message = ChatMessage::user(input);
+        message.attachments = files.to_vec();
+        self.store.append(session_id, &message)?;
+        // Turned off for the rest of the turn if the model rejects images.
+        let mut send_images = true;
         // Looked up once, so every call of this turn sends the same prefix.
         let recall = self.recall(input);
         let specs = self.tools.specs();
@@ -181,8 +195,15 @@ impl<M: Model, T: Tools> Agent<M, T> {
                 identity::system_prompt(&self.config.system_prompt, identity.as_ref(), can_set);
             let mut messages = vec![ChatMessage::system(&system)];
             messages.extend(
-                self.window(session, session_id, &system, &tool_json, recall.as_deref())
-                    .await?,
+                self.window(
+                    session,
+                    session_id,
+                    &system,
+                    &tool_json,
+                    recall.as_deref(),
+                    send_images,
+                )
+                .await?,
             );
             let estimated = context::estimate_messages(&messages) + context::estimate(&tool_json);
             let mut shown = String::new();
@@ -195,7 +216,21 @@ impl<M: Model, T: Tools> Agent<M, T> {
             let Some(completion) = completion else {
                 return self.stopped(session_id, &shown);
             };
-            let completion = completion?;
+            let completion = match completion {
+                // Models without image input refuse the whole request; try
+                // again with the files only listed.
+                Err(err)
+                    if send_images
+                        && shown.is_empty()
+                        && messages.iter().any(|m| !m.images.is_empty())
+                        && format!("{err:#}").to_lowercase().contains("image") =>
+                {
+                    eprintln!("model: no image input ({err:#}); sending the files as a list");
+                    send_images = false;
+                    continue;
+                }
+                other => other?,
+            };
             self.record(session, "turn", &completion);
             if let Some(usage) = completion.usage
                 && let Err(err) =
@@ -338,15 +373,23 @@ impl<M: Model, T: Tools> Agent<M, T> {
         system: &str,
         tool_json: &str,
         recall: Option<&str>,
+        send_images: bool,
     ) -> Result<Vec<ChatMessage>> {
         let ctx = self.store.context(session_id)?;
         let ratio = ctx.token_ratio.unwrap_or(1.0).clamp(MIN_RATIO, MAX_RATIO);
         let budget = (self.config.context_tokens as f64 / ratio) as usize;
         let summary_limit = budget / 16;
         let summary_tokens = ctx.summary.as_deref().map_or(0, context::estimate);
+        let current_files = ctx
+            .messages
+            .iter()
+            .rev()
+            .find(|(_, m)| m.role == Role::User)
+            .map_or(0, |(_, m)| crate::attachments::show_tokens(&m.attachments));
         let overhead = context::estimate(system)
             + context::estimate(tool_json)
             + recall.map_or(0, context::estimate)
+            + current_files
             + summary_tokens.max(summary_limit);
         let fitted = context::fit(ctx.messages, ctx.marks, overhead, budget);
         let mut summary = ctx.summary;
@@ -378,8 +421,24 @@ impl<M: Model, T: Tools> Agent<M, T> {
         let mut messages = fitted.messages;
         // The current turn's message is the last from the user; it is never
         // left out of the window.
+        let current = messages.iter().rposition(|m| m.role == Role::User);
+        for (index, message) in messages.iter_mut().enumerate() {
+            if message.attachments.is_empty() {
+                continue;
+            }
+            let now = Some(index) == current;
+            let shown = crate::attachments::show(&self.config.workspace, &message.attachments, now);
+            let text = message.content.get_or_insert_with(String::new);
+            text.push_str("\n\n");
+            text.push_str(&shown.note);
+            if now && send_images {
+                message.images = shown.images;
+            } else if now && !shown.images.is_empty() {
+                text.push_str("\n[This model cannot see images; they are only listed.]");
+            }
+        }
         if let Some(recall) = recall
-            && let Some(current) = messages.iter_mut().rev().find(|m| m.role == Role::User)
+            && let Some(current) = current.and_then(|i| messages.get_mut(i))
         {
             let text = current.content.get_or_insert_with(String::new);
             text.push_str("\n\n");
@@ -766,7 +825,14 @@ mod tests {
             stopper.cancel();
         });
         let reply = agent
-            .run_turn_until(Actor::owner(access::CLI), "s", "go", &cancel, &mut |_| {})
+            .run_turn_until(
+                Actor::owner(access::CLI),
+                "s",
+                "go",
+                &[],
+                &cancel,
+                &mut |_| {},
+            )
             .await
             .unwrap();
         assert_eq!(reply, chat::STOPPED.now());
@@ -791,6 +857,132 @@ mod tests {
             format!("half an answer\n\n{stopped}")
         );
         assert_eq!(for_people("a normal reply"), "a normal reply");
+    }
+
+    /// Refuses requests with images, as models without image input do;
+    /// otherwise answers "ok" and keeps what it was sent.
+    struct Blind(Mutex<Vec<Vec<ChatMessage>>>);
+
+    #[async_trait::async_trait]
+    impl Model for Blind {
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[ToolSpec],
+            _on_text: &mut (dyn for<'t> FnMut(&'t str) + Send),
+        ) -> Result<Completion> {
+            if messages.iter().any(|m| !m.images.is_empty()) {
+                bail!(
+                    "model request failed with HTTP 404: No endpoints found that support image input"
+                );
+            }
+            self.0.lock().unwrap().push(messages.to_vec());
+            Ok(Completion {
+                text: "ok".into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn files_agent<M: Model>(model: M, workspace: &std::path::Path) -> Agent<M, Echo> {
+        Agent {
+            model,
+            summarizer: None,
+            tools: Echo,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig {
+                workspace: workspace.to_owned(),
+                ..AgentConfig::default()
+            },
+        }
+    }
+
+    fn uploads() -> Vec<Upload> {
+        vec![
+            Upload {
+                name: "cat.png".into(),
+                mime: None,
+                data: b"\x89PNG".to_vec(),
+            },
+            Upload {
+                name: "notes.txt".into(),
+                mime: None,
+                data: b"buy milk".to_vec(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn files_are_shown_in_their_turn_and_listed_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = files_agent(
+            Recorder {
+                summary: None,
+                seen: Mutex::new(Vec::new()),
+            },
+            dir.path(),
+        );
+        let (files, problems) = agent.save_uploads(&uploads());
+        assert!(problems.is_empty());
+        let actor = || Actor::owner(access::CLI);
+        let cancel = Cancel::default();
+        agent
+            .run_turn_until(actor(), "s", "what is this", &files, &cancel, &mut |_| {})
+            .await
+            .unwrap();
+        agent
+            .run_turn(actor(), "s", "thanks", &mut |_| {})
+            .await
+            .unwrap();
+        let seen = agent.model.seen.lock().unwrap();
+        let first = seen[0].last().unwrap();
+        assert_eq!(first.images, ["data:image/png;base64,iVBORw=="]);
+        let text = first.content.as_deref().unwrap();
+        assert!(
+            text.starts_with("what is this\n\n[Files sent with this message"),
+            "{text}"
+        );
+        assert!(text.contains("```\nbuy milk\n```"), "{text}");
+        let later = seen[1]
+            .iter()
+            .find(|m| {
+                m.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .starts_with("what is this")
+            })
+            .unwrap();
+        assert!(later.images.is_empty());
+        let text = later.content.as_deref().unwrap();
+        assert!(text.contains("-cat.png (image/png, 4 B)"), "{text}");
+        assert!(!text.contains("buy milk"), "{text}");
+        // Stored with the message, as typed.
+        let id = agent.store.session_id("s").unwrap();
+        let stored = &agent.store.history(id, 10).unwrap()[0];
+        assert_eq!(stored.content.as_deref(), Some("what is this"));
+        assert_eq!(stored.attachments, files);
+    }
+
+    #[tokio::test]
+    async fn a_model_without_image_input_gets_the_files_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = files_agent(Blind(Mutex::new(Vec::new())), dir.path());
+        let (files, _) = agent.save_uploads(&uploads());
+        let reply = agent
+            .run_turn_until(
+                Actor::owner(access::CLI),
+                "s",
+                "look",
+                &files,
+                &Cancel::default(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, "ok");
+        let seen = agent.model.0.lock().unwrap();
+        let text = seen[0].last().unwrap().content.clone().unwrap();
+        assert!(text.contains("cannot see images"), "{text}");
     }
 
     #[tokio::test]

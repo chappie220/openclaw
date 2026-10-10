@@ -20,6 +20,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::access::{self, AccessConfig, Actor};
 use crate::agent::{Agent, AgentEvent, Cancel, Model, Tools};
+use crate::attachments::Upload;
 use crate::i18n::chat;
 use crate::llm::Role;
 use crate::tools::{Approver, with_approver};
@@ -36,6 +37,8 @@ enum ClientMsg {
     Send {
         session: String,
         text: String,
+        #[serde(default)]
+        files: Vec<WebFile>,
     },
     /// Stops the session's running turn.
     Stop {
@@ -99,6 +102,32 @@ enum ServerMsg {
 struct HistoryItem {
     role: &'static str,
     text: String,
+    /// Names of files sent with the message.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files: Vec<String>,
+}
+
+/// A file from the Web UI, base64-encoded.
+#[derive(Deserialize)]
+struct WebFile {
+    name: String,
+    #[serde(default)]
+    mime: Option<String>,
+    data: String,
+}
+
+impl WebFile {
+    fn decode(self) -> Result<Upload> {
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(self.data.trim())
+            .with_context(|| format!("{} is not valid base64", self.name))?;
+        Ok(Upload {
+            name: self.name,
+            mime: self.mime,
+            data,
+        })
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -262,6 +291,17 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         session: &str,
         prompt: &str,
     ) -> Result<String> {
+        self.run_unattended_with(actor, session, prompt, &[]).await
+    }
+
+    /// Like `run_unattended`, with files that came with the message.
+    pub async fn run_unattended_with(
+        &self,
+        actor: Actor,
+        session: &str,
+        prompt: &str,
+        uploads: &[Upload],
+    ) -> Result<String> {
         // Before the queue, which the turn to stop is holding.
         if is_stop_command(prompt) {
             return Ok(self.stop(session, &actor).reply());
@@ -269,12 +309,14 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         if let Some(reply) = crate::identity::command(&self.agent.store, &actor, prompt) {
             return Ok(reply);
         }
+        let (files, problems) = self.agent.save_uploads(uploads);
+        let prompt = crate::attachments::with_problems(prompt, &problems);
         let lock = self.session_lock(session);
         let _turn = lock.lock().await;
         let (cancel, _running) = self.start_turn(session, &actor);
         let mut result = self
             .agent
-            .run_turn_until(actor, session, prompt, &cancel, &mut |_| {})
+            .run_turn_until(actor, session, &prompt, &files, &cancel, &mut |_| {})
             .await;
         // The person approves what the program shows them, not the model's
         // description of it.
@@ -491,7 +533,11 @@ async fn connection<M: Model + 'static, T: Tools + 'static>(
             }
         };
         match msg {
-            ClientMsg::Send { session, text } => {
+            ClientMsg::Send {
+                session,
+                text,
+                files,
+            } => {
                 if let Err(message) = validate_session(&session) {
                     let _ = out.send(ServerMsg::Error {
                         session: Some(session),
@@ -499,6 +545,16 @@ async fn connection<M: Model + 'static, T: Tools + 'static>(
                     });
                     continue;
                 }
+                let uploads = match files.into_iter().map(WebFile::decode).collect() {
+                    Ok(uploads) => uploads,
+                    Err(err) => {
+                        let _ = out.send(ServerMsg::Error {
+                            session: Some(session),
+                            message: format!("{err:#}"),
+                        });
+                        continue;
+                    }
+                };
                 let approver = SocketApprover {
                     session: session.clone(),
                     out: out.clone(),
@@ -510,6 +566,7 @@ async fn connection<M: Model + 'static, T: Tools + 'static>(
                     gateway.clone(),
                     session,
                     text,
+                    uploads,
                     out.clone(),
                     approver,
                 ));
@@ -561,6 +618,7 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
     gateway: Shared<M, T>,
     session: String,
     text: String,
+    uploads: Vec<Upload>,
     out: mpsc::UnboundedSender<ServerMsg>,
     approver: SocketApprover,
 ) {
@@ -580,6 +638,8 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         });
         return;
     }
+    let (files, problems) = gateway.agent.save_uploads(&uploads);
+    let text = crate::attachments::with_problems(&text, &problems);
     let lock = gateway.session_lock(&session);
     let _turn = lock.lock().await;
     let (cancel, _running) = gateway.start_turn(&session, &actor);
@@ -606,7 +666,7 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         // The connection presented the gateway token (or is loopback-only).
         gateway
             .agent
-            .run_turn_until(actor, &session, &text, &cancel, &mut on_event),
+            .run_turn_until(actor, &session, &text, &files, &cancel, &mut on_event),
     )
     .await;
     let _ = out.send(match result {
@@ -627,13 +687,17 @@ fn history<M: Model, T: Tools>(gateway: &Gateway<M, T>, session: String) -> Serv
             .history(id, 200)?
             .into_iter()
             .filter_map(|m| {
-                let text = crate::agent::for_people(&m.content.filter(|c| !c.is_empty())?);
+                let files: Vec<String> = m.attachments.iter().map(|a| a.name.clone()).collect();
+                let text = crate::agent::for_people(m.content.as_deref().unwrap_or(""));
+                if text.is_empty() && files.is_empty() {
+                    return None;
+                }
                 let role = match m.role {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                     Role::Tool | Role::System => return None,
                 };
-                Some(HistoryItem { role, text })
+                Some(HistoryItem { role, text, files })
             })
             .collect())
     })();

@@ -52,6 +52,12 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Files sent with a user message; stored with it, never sent as JSON.
+    #[serde(skip)]
+    pub attachments: Vec<crate::attachments::Attachment>,
+    /// `data:` URLs of images to send with this message in this call.
+    #[serde(skip)]
+    pub images: Vec<String>,
 }
 
 impl ChatMessage {
@@ -61,6 +67,8 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            attachments: Vec::new(),
+            images: Vec::new(),
         }
     }
     pub fn system(content: impl Into<String>) -> Self {
@@ -78,6 +86,8 @@ impl ChatMessage {
             content,
             tool_calls: Some(calls),
             tool_call_id: None,
+            attachments: Vec::new(),
+            images: Vec::new(),
         }
     }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -86,6 +96,8 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
+            attachments: Vec::new(),
+            images: Vec::new(),
         }
     }
 }
@@ -255,6 +267,23 @@ fn wire_messages(messages: &[ChatMessage], cache: bool) -> Result<Vec<Value>> {
         .iter()
         .map(serde_json::to_value)
         .collect::<serde_json::Result<Vec<_>>>()?;
+    // Images go as content parts after the text.
+    for (message, value) in messages.iter().zip(out.iter_mut()) {
+        if message.images.is_empty() {
+            continue;
+        }
+        let mut parts = vec![serde_json::json!({
+            "type": "text",
+            "text": message.content.as_deref().unwrap_or(""),
+        })];
+        parts.extend(
+            message
+                .images
+                .iter()
+                .map(|url| serde_json::json!({"type": "image_url", "image_url": {"url": url}})),
+        );
+        value["content"] = Value::Array(parts);
+    }
     if !cache {
         return Ok(out);
     }
@@ -269,6 +298,13 @@ fn wire_messages(messages: &[ChatMessage], cache: bool) -> Result<Vec<Value>> {
             continue;
         };
         if messages[index].role == Role::Tool {
+            continue;
+        }
+        if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
+            // Already parts (text and images): mark the last one.
+            if let Some(last) = parts.last_mut() {
+                last["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
             continue;
         }
         let Some(text) = message
@@ -671,6 +707,28 @@ mod tests {
         assert_eq!(marked, [0, 1, 3]);
         assert_eq!(wired[3]["content"][0]["text"], "q");
         assert_eq!(wired[5]["content"], "out");
+    }
+
+    #[test]
+    fn images_go_as_parts_after_the_text() {
+        let mut user = ChatMessage::user("what is this");
+        user.images = vec!["data:image/png;base64,AA==".into()];
+        let messages = vec![ChatMessage::system("sys"), user];
+        let plain = wire_messages(&messages, false).unwrap();
+        assert_eq!(
+            plain[1]["content"],
+            serde_json::json!([
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+            ])
+        );
+        assert!(plain[1].get("images").is_none() && plain[1].get("attachments").is_none());
+        let cached = wire_messages(&messages, true).unwrap();
+        assert_eq!(
+            cached[1]["content"][1]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert!(cached[1]["content"][0].get("cache_control").is_none());
     }
 
     #[test]

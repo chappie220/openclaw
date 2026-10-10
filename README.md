@@ -113,6 +113,27 @@ bind = "127.0.0.1:18789"
 # token = "..."   # prefer OPENCLAW_RS_TOKEN
 ```
 
+## Images and files
+
+Files sent with a message are saved in the workspace as
+`inbox/<content hash>-<name>` (names are sanitized; the same file sent twice,
+such as a retried email, lands on the same path) and recorded with the
+message:
+
+- QQ: image and file attachments, downloaded only over https from QQ's own
+  media hosts.
+- Email: every attachment except attached emails; an email may be just an
+  attachment.
+- Web UI: the 📎 button, or paste an image into the message box.
+- CLI: `openclaw-rs ask -a photo.jpg -a notes.txt "what is this?"`, or
+  `/attach <path>` in `chat` for the next message.
+
+During that message's turn the model sees the images (PNG, JPEG, GIF, WebP up
+to 5 MB, four per message), text files up to 16 KB inline, and a list of
+every file with its workspace path, so tools can open the rest. Later turns
+only get the list. A model without image input is retried once with the
+files only listed. Limits: 20 MB per file, ten files per message.
+
 ## Stopping a turn
 
 A turn that runs too long can be stopped without losing what it did:

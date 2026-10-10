@@ -218,6 +218,9 @@ fn render(message: &ChatMessage, max_chars: usize) -> String {
             clip(&call.function.arguments)
         ));
     }
+    for file in &message.attachments {
+        out.push_str(&format!("{role} sent file {}\n", file.describe()));
+    }
     out
 }
 

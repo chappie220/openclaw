@@ -2,6 +2,7 @@
 
 mod access;
 mod agent;
+mod attachments;
 mod cli_text;
 mod completions;
 mod config;
@@ -61,6 +62,9 @@ enum Command {
     Ask {
         #[arg(short, long, default_value = "main")]
         session: String,
+        /// A file to send with the message; repeat for more.
+        #[arg(short, long, value_hint = clap::ValueHint::FilePath)]
+        attach: Vec<PathBuf>,
         message: Vec<String>,
     },
     /// Run the Gateway: Web UI and WebSocket API.
@@ -387,13 +391,21 @@ async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Command::Ask { session, message } => {
+        Command::Ask {
+            session,
+            attach,
+            message,
+        } => {
             let message = message.join(" ");
-            if message.trim().is_empty() {
+            if message.trim().is_empty() && attach.is_empty() {
                 bail!(text::NOTHING_TO_SEND.now());
             }
+            let uploads = attach
+                .iter()
+                .map(|path| read_upload(path))
+                .collect::<Result<Vec<_>>>()?;
             let agent = build_agent(&config, &state, store)?;
-            turn(&agent, &session, &message).await
+            turn(&agent, &session, &message, &uploads).await
         }
         Command::Chat { session } => {
             let name = store.identity()?.map(|i| i.name);
@@ -410,6 +422,8 @@ async fn run(cli: Cli) -> Result<()> {
                 eprintln!("{}", text::FIRST_START.now());
             }
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
+            // Files from `/attach`, sent with the next message.
+            let mut pending = Vec::new();
             loop {
                 eprint!("> ");
                 // Once a turn has handled Ctrl-C, it no longer ends the
@@ -425,7 +439,18 @@ async fn run(cli: Cli) -> Result<()> {
                 if line.trim().is_empty() {
                     break;
                 }
-                if let Err(err) = turn(&agent, &session, &line).await {
+                if let Some(path) = line.trim().strip_prefix("/attach ") {
+                    match read_upload(Path::new(path.trim())) {
+                        Ok(upload) => {
+                            eprintln!("{}", text::ATTACHED.with(&[&upload.name]));
+                            pending.push(upload);
+                        }
+                        Err(err) => eprintln!("{}", text::ERROR.with(&[&format!("{err:#}")])),
+                    }
+                    continue;
+                }
+                let uploads = std::mem::take(&mut pending);
+                if let Err(err) = turn(&agent, &session, &line, &uploads).await {
                     eprintln!("{}", text::ERROR.with(&[&format!("{err:#}")]));
                 }
             }
@@ -483,19 +508,47 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
     Ok(Agent {
         model: llm::Client::new(&config.model, api_key)?,
         summarizer,
-        tools: BuiltinTools::new(workspace, config.tools.clone(), store.clone())?
+        tools: BuiltinTools::new(workspace.clone(), config.tools.clone(), store.clone())?
             .with_search(search)
             .with_review(review),
         store,
-        config: config.agent.clone(),
+        config: config::AgentConfig {
+            workspace,
+            ..config.agent.clone()
+        },
     })
 }
 
-async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
+/// A file named on the command line, to send with a message.
+fn read_upload(path: &Path) -> Result<attachments::Upload> {
+    let data = std::fs::read(path)
+        .with_context(|| text::CANNOT_READ.with(&[&path.display().to_string()]))?;
+    let name = path
+        .file_name()
+        .map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    Ok(attachments::Upload {
+        name,
+        mime: None,
+        data,
+    })
+}
+
+async fn turn(
+    agent: &CliAgent,
+    session: &str,
+    input: &str,
+    uploads: &[attachments::Upload],
+) -> Result<()> {
     if input.trim_start().starts_with("/identity") {
         owner_command(&agent.store, input);
         return Ok(());
     }
+    let (files, problems) = agent.save_uploads(uploads);
+    for problem in &problems {
+        eprintln!("{}", text::ERROR.with(&[problem]));
+    }
+    let input = attachments::with_problems(input, &problems);
+    let input = input.as_str();
     let mut stdout = std::io::stdout();
     let mut on_event = |event| match event {
         AgentEvent::Text(text) => {
@@ -517,6 +570,7 @@ async fn turn(agent: &CliAgent, session: &str, input: &str) -> Result<()> {
         access::Actor::owner(access::CLI),
         session,
         input,
+        &files,
         &cancel,
         &mut on_event,
     );

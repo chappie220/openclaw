@@ -232,6 +232,10 @@ pub struct AgentConfig {
     pub recall_limit: usize,
     /// Token cap on the recalled memories of one turn.
     pub recall_tokens: usize,
+    /// Where files sent with messages are saved (under `inbox/`); set at
+    /// startup from `tools.workspace`, never read from the file.
+    #[serde(skip)]
+    pub workspace: PathBuf,
 }
 
 /// What a tool category may do without asking.
@@ -355,6 +359,7 @@ impl Default for AgentConfig {
             summary_model: None,
             recall_limit: 5,
             recall_tokens: 800,
+            workspace: PathBuf::new(),
         }
     }
 }

@@ -13,12 +13,13 @@ use futures_util::TryStreamExt;
 use lettre::message::header::{ContentType, Header, HeaderName, HeaderValue};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message as Email, Tokio1Executor};
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, MimeHeaders};
 use rusqlite::params;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::agent::{Model, Tools};
+use crate::attachments::Upload;
 use crate::config::{MailConfig, MailSecurity};
 use crate::gateway::{Gateway, Notifier};
 use crate::store::{Store, now};
@@ -36,6 +37,8 @@ pub struct Incoming {
     pub subject: String,
     pub text: String,
     pub references: Vec<String>,
+    /// Attached files, except attached emails.
+    pub files: Vec<Upload>,
 }
 
 /// Why an email is not answered; logged so the operator can adjust `mail.allow`.
@@ -263,8 +266,24 @@ impl MailBot {
             .body_text(0)
             .map(|t| strip_quoted(&t))
             .unwrap_or_default();
+        let files: Vec<Upload> = message
+            .attachments()
+            .filter(|part| !part.is_message())
+            .map(|part| {
+                let mime = part.content_type().map(|ct| match ct.subtype() {
+                    Some(sub) => format!("{}/{sub}", ct.ctype()),
+                    None => ct.ctype().to_owned(),
+                });
+                Upload {
+                    name: part.attachment_name().unwrap_or("attachment").to_owned(),
+                    mime,
+                    data: part.contents().to_vec(),
+                }
+            })
+            .collect();
         let text = match (subject.is_empty(), body.is_empty()) {
-            (true, true) => return Err(Skip::Empty),
+            (true, true) if files.is_empty() => return Err(Skip::Empty),
+            (true, true) => String::new(),
             (true, false) => body,
             (false, true) => subject.clone(),
             (false, false) => format!("{subject}\n\n{body}"),
@@ -294,6 +313,7 @@ impl MailBot {
             subject,
             text,
             references,
+            files,
         })
     }
 
@@ -890,7 +910,11 @@ async fn advance<M: Model + 'static, T: Tools + 'static>(
         };
         // `classify` checked the From address against mail.allow.
         let actor = gateway.actor(&session, &session);
-        let reply = match gateway.run_unattended(actor, &session, &prompt).await {
+        // Saved by content, so a retried turn reuses the same files.
+        let reply = match gateway
+            .run_unattended_with(actor, &session, &prompt, &incoming.files)
+            .await
+        {
             Ok(text) => text,
             Err(err) if item.attempts < MAX_TURN_ATTEMPTS => {
                 let state = store.mail_retry(&item, &format!("{err:#}"))?;
@@ -1060,6 +1084,37 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn keeps_attachments_and_mail_that_is_only_an_attachment() {
+        let bot = bot();
+        let raw = b"From: me@example.org\r\nTo: bot@example.org\r\nSubject: scan\r\n\
+Message-ID: <a2@example.org>\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n\
+--b\r\nContent-Type: application/pdf; name=\"r.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"r.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n\
+JVBERi0=\r\n--b--\r\n";
+        let incoming = bot.classify(raw).unwrap();
+        assert_eq!(incoming.text, "scan\n\nsee attached");
+        assert_eq!(
+            incoming.files,
+            [Upload {
+                name: "r.pdf".into(),
+                mime: Some("application/pdf".into()),
+                data: b"%PDF-".to_vec(),
+            }]
+        );
+        let only = b"From: me@example.org\r\nTo: bot@example.org\r\n\
+Message-ID: <a3@example.org>\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: image/png\r\nContent-Disposition: attachment; filename=\"p.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\niVBORw==\r\n--b--\r\n";
+        let incoming = bot.classify(only).unwrap();
+        assert_eq!(incoming.text, "");
+        assert_eq!(incoming.files[0].name, "p.png");
+        assert_eq!(incoming.files[0].data, b"\x89PNG");
     }
 
     #[test]

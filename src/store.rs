@@ -126,6 +126,11 @@ ALTER TABLE sessions ADD COLUMN context_summary TEXT;
 -- smoothed; scales the context budget. NULL until a call reports usage.
 ALTER TABLE sessions ADD COLUMN token_ratio REAL;
 "#,
+        r#"
+-- Files sent with a user message: JSON list of {name, mime, path, bytes},
+-- paths relative to the workspace.
+ALTER TABLE messages ADD COLUMN attachments TEXT;
+"#,
     ],
     legacy: &[
         ("sessions", "id, name, created_at, updated_at"),
@@ -717,17 +722,24 @@ impl Store {
             Some(calls) if !calls.is_empty() => Some(serde_json::to_string(calls)?),
             _ => None,
         };
+        let attachments = if message.attachments.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&message.attachments)?)
+        };
         let conn = self.chats();
         let ts = now();
         conn.execute(
-            "INSERT INTO messages(session_id, role, content, tool_calls, tool_call_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages(session_id, role, content, tool_calls, tool_call_id,
+               attachments, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session_id,
                 message.role.as_str(),
                 message.content,
                 tool_calls,
                 message.tool_call_id,
+                attachments,
                 ts
             ],
         )?;
@@ -742,8 +754,8 @@ impl Store {
     pub fn history(&self, session_id: i64, limit: usize) -> Result<Vec<ChatMessage>> {
         let conn = self.chats();
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, tool_calls, tool_call_id FROM (
-               SELECT id, role, content, tool_calls, tool_call_id FROM messages
+            "SELECT id, role, content, tool_calls, tool_call_id, attachments FROM (
+               SELECT id, role, content, tool_calls, tool_call_id, attachments FROM messages
                WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2
              ) ORDER BY id ASC",
         )?;
@@ -773,7 +785,7 @@ impl Store {
             },
         )?;
         let mut stmt = conn.prepare(
-            "SELECT id, role, content, tool_calls, tool_call_id FROM messages
+            "SELECT id, role, content, tool_calls, tool_call_id, attachments FROM messages
              WHERE session_id = ?1 AND id >= ?2 ORDER BY id ASC",
         )?;
         let messages = read_messages(&mut stmt, params![session_id, marks.start])?;
@@ -817,7 +829,7 @@ impl Store {
     }
 }
 
-/// Rows of `id, role, content, tool_calls, tool_call_id`.
+/// Rows of `id, role, content, tool_calls, tool_call_id, attachments`.
 fn read_messages(
     stmt: &mut rusqlite::Statement<'_>,
     params: impl rusqlite::Params,
@@ -829,14 +841,19 @@ fn read_messages(
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut messages = Vec::new();
     for row in rows {
-        let (id, role, content, tool_calls, tool_call_id) = row?;
+        let (id, role, content, tool_calls, tool_call_id, attachments) = row?;
         let tool_calls: Option<Vec<ToolCall>> = tool_calls
             .map(|json| serde_json::from_str(&json))
             .transpose()?;
+        let attachments = attachments
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?
+            .unwrap_or_default();
         messages.push((
             id,
             ChatMessage {
@@ -844,6 +861,8 @@ fn read_messages(
                 content,
                 tool_calls,
                 tool_call_id,
+                attachments,
+                images: Vec::new(),
             },
         ));
     }

@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::agent::{Model, Tools};
+use crate::attachments::Upload;
 use crate::config::QqConfig;
 use crate::gateway::{Gateway, Notifier};
 
@@ -81,6 +82,35 @@ struct Incoming {
     target: Target,
     sender: String,
     text: String,
+    files: Vec<QqFile>,
+}
+
+/// A file attached to a QQ message, still on QQ's servers.
+#[derive(Debug, Clone, PartialEq)]
+struct QqFile {
+    name: String,
+    mime: Option<String>,
+    url: String,
+}
+
+/// Whether a file `url` from a QQ event may be downloaded: https on QQ's own
+/// media hosts, so an event cannot make the bot fetch arbitrary addresses.
+/// The API host is allowed too, which lets tests serve files locally.
+fn download_allowed(url: &reqwest::Url, api_base: &str) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let api = reqwest::Url::parse(api_base).ok();
+    if api
+        .as_ref()
+        .is_some_and(|api| api.host_str() == Some(host) && api.scheme() == url.scheme())
+    {
+        return true;
+    }
+    url.scheme() == "https"
+        && ["qq.com", "qq.com.cn", "qpic.cn"]
+            .iter()
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
 }
 
 impl QqBot {
@@ -133,6 +163,40 @@ impl QqBot {
             .unwrap_or(7200);
         *cached = Some((token.clone(), Instant::now() + Duration::from_secs(ttl)));
         Ok(token)
+    }
+
+    /// Downloads a message's file, up to the attachment size limit.
+    async fn download(&self, file: &QqFile) -> Result<Upload> {
+        // QQ sometimes sends attachment URLs without a scheme.
+        let raw = if file.url.contains("://") {
+            file.url.clone()
+        } else {
+            format!("https://{}", file.url.trim_start_matches('/'))
+        };
+        let url =
+            reqwest::Url::parse(&raw).with_context(|| format!("bad file URL for {}", file.name))?;
+        if !download_allowed(&url, &self.config.api_base) {
+            bail!("{} is not on a QQ media host", file.name);
+        }
+        let mut response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .with_context(|| format!("cannot download {}", file.name))?;
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            data.extend_from_slice(&chunk);
+            if data.len() > crate::attachments::MAX_FILE_BYTES {
+                bail!("{} is larger than the attachment limit", file.name);
+            }
+        }
+        Ok(Upload {
+            name: file.name.clone(),
+            mime: file.mime.clone(),
+            data,
+        })
     }
 
     async fn api(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
@@ -265,7 +329,28 @@ fn parse_incoming(event: &str, d: &Value) -> Option<Incoming> {
         }
         _ => return None,
     };
-    if text.is_empty() {
+    let files: Vec<QqFile> = d["attachments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            let url = a["url"].as_str().filter(|u| !u.is_empty())?.to_owned();
+            let mime = a["content_type"].as_str().map(str::to_owned);
+            let name = a["filename"]
+                .as_str()
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    let ext = mime
+                        .as_deref()
+                        .and_then(|m| m.split('/').nth(1))
+                        .unwrap_or("bin");
+                    format!("qq-file.{ext}")
+                });
+            Some(QqFile { name, mime, url })
+        })
+        .collect();
+    if text.is_empty() && files.is_empty() {
         return None;
     }
     Some(Incoming {
@@ -273,6 +358,7 @@ fn parse_incoming(event: &str, d: &Value) -> Option<Incoming> {
         target,
         sender,
         text,
+        files,
     })
 }
 
@@ -464,8 +550,17 @@ fn handle<M: Model + 'static, T: Tools + 'static>(
     tokio::spawn(async move {
         let session = incoming.target.session();
         let actor = gateway.actor(&format!("qq:{}", incoming.sender), &session);
+        let mut uploads = Vec::new();
+        let mut problems = Vec::new();
+        for file in &incoming.files {
+            match bot.download(file).await {
+                Ok(upload) => uploads.push(upload),
+                Err(err) => problems.push(format!("{err:#}")),
+            }
+        }
+        let text = crate::attachments::with_problems(&incoming.text, &problems);
         let reply = match gateway
-            .run_unattended(actor, &session, &incoming.text)
+            .run_unattended_with(actor, &session, &text, &uploads)
             .await
         {
             Ok(text) => text,
@@ -679,6 +774,85 @@ mod tests {
     }
 
     #[test]
+    fn parses_attachments_even_without_text() {
+        let image = json!({"id": "m4", "author": {"user_openid": "U"}, "content": "",
+        "attachments": [
+            {"content_type": "image/jpeg", "filename": "cat.jpg", "url": "multimedia.nt.qq.com.cn/download?id=1"},
+            {"content_type": "image/png", "url": "https://gchat.qpic.cn/x"},
+            {"content_type": "image/png", "url": ""}
+        ]});
+        let parsed = parse_incoming("C2C_MESSAGE_CREATE", &image).unwrap();
+        assert_eq!(parsed.text, "");
+        assert_eq!(
+            parsed.files,
+            [
+                QqFile {
+                    name: "cat.jpg".into(),
+                    mime: Some("image/jpeg".into()),
+                    url: "multimedia.nt.qq.com.cn/download?id=1".into(),
+                },
+                QqFile {
+                    name: "qq-file.png".into(),
+                    mime: Some("image/png".into()),
+                    url: "https://gchat.qpic.cn/x".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn downloads_only_from_qq_media_hosts() {
+        let api = "https://api.bot.qq.com";
+        let ok = |u: &str| download_allowed(&reqwest::Url::parse(u).unwrap(), api);
+        assert!(ok("https://multimedia.nt.qq.com.cn/download?x"));
+        assert!(ok("https://gchat.qpic.cn/a.jpg"));
+        assert!(ok("https://api.bot.qq.com/file"));
+        assert!(!ok("http://multimedia.nt.qq.com.cn/download"), "https only");
+        assert!(!ok("https://evilqq.com/x"));
+        assert!(!ok("https://qq.com.evil.example/x"));
+        assert!(!ok("https://169.254.169.254/latest/meta-data"));
+        assert!(download_allowed(
+            &reqwest::Url::parse("http://127.0.0.1:9/f").unwrap(),
+            "http://127.0.0.1:9"
+        ));
+    }
+
+    #[tokio::test]
+    async fn downloads_a_file_within_the_size_limit() {
+        let app = axum::Router::new()
+            .route("/small", axum::routing::get(|| async { "hello" }))
+            .route(
+                "/huge",
+                axum::routing::get(|| async { vec![0u8; crate::attachments::MAX_FILE_BYTES + 1] }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let bot = QqBot::new(QqConfig {
+            app_id: "1".into(),
+            app_secret: Some("s".into()),
+            api_base: base.clone(),
+            ..QqConfig::default()
+        })
+        .unwrap();
+        let file = |path: &str| QqFile {
+            name: "f.txt".into(),
+            mime: Some("text/plain".into()),
+            url: format!("{base}{path}"),
+        };
+        let upload = bot.download(&file("/small")).await.unwrap();
+        assert_eq!(upload.data, b"hello");
+        assert_eq!(upload.mime.as_deref(), Some("text/plain"));
+        let err = bot.download(&file("/huge")).await.unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+        let elsewhere = QqFile {
+            url: "http://example.com/x".into(),
+            ..file("/small")
+        };
+        assert!(bot.download(&elsewhere).await.is_err());
+    }
+
+    #[test]
     fn parses_private_and_group_events() {
         let c2c = json!({"id": "m1", "author": {"user_openid": "U1"}, "content": " 你好 "});
         assert_eq!(
@@ -687,7 +861,8 @@ mod tests {
                 id: "m1".into(),
                 target: Target::User("U1".into()),
                 sender: "U1".into(),
-                text: "你好".into()
+                text: "你好".into(),
+                files: Vec::new(),
             })
         );
         let group = json!({"id": "m2", "group_openid": "G1", "author": {"member_openid": "M1"}, "content": " /天气 "});

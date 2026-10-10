@@ -203,6 +203,14 @@ const ARGS: &[(&str, &str, Tr)] = &[
     ("*", "session", tr("Session name", "会话名")),
     ("ask", "message", tr("Message to send", "要发送的消息")),
     (
+        "ask",
+        "attach",
+        tr(
+            "A file to send with the message; repeat for more",
+            "随消息发送的文件；可以重复使用",
+        ),
+    ),
+    (
         "serve",
         "bind",
         tr(
@@ -444,6 +452,10 @@ pub const CHAT_BANNER: Tr = tr(
     "{} · 会话 {} · 模型 {} · 空行或 Ctrl-D 退出",
 );
 pub const NOTHING_TO_SEND: Tr = tr("nothing to send", "没有要发送的内容");
+pub const ATTACHED: Tr = tr(
+    "attached {}; it goes with your next message",
+    "已附加 {}，会随下一条消息发送",
+);
 pub const TOOL_START: Tr = tr("[tool {} {}]", "[工具 {} {}]");
 pub const TOOL_END: Tr = tr("[tool {} → {} bytes]", "[工具 {} → {} 字节]");
 pub const ALLOW_TOOL: Tr = tr("Allow {}?", "允许 {}？");
@@ -531,6 +543,7 @@ mod tests {
         FIRST_START,
         CHAT_BANNER,
         NOTHING_TO_SEND,
+        ATTACHED,
         TOOL_START,
         TOOL_END,
         ALLOW_TOOL,
