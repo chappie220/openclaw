@@ -45,6 +45,144 @@ pub trait Judge: Send + Sync {
     async fn assess(&self, command: &str, cwd: &Path) -> Result<Assessment>;
 }
 
+/// One yes/no question for a decision model about a JSON `state`.
+pub struct Question<'a> {
+    /// Names the question on the wire (System One question id).
+    pub id: &'a str,
+    /// Who is asking, for chat models: "You review shell commands …".
+    pub role: &'a str,
+    pub instructions: &'a str,
+    pub yes: &'a str,
+    pub no: &'a str,
+}
+
+/// Answers a `Question`: the probability (0 to 1) that the answer is yes,
+/// as the `danger` of the returned assessment.
+#[async_trait]
+pub trait Decider: Send + Sync {
+    async fn decide(&self, state: &Value, question: &Question<'_>) -> Result<Assessment>;
+}
+
+/// Where a decision model runs: the fields shared by `[tools.review]` and `[guide]`.
+pub struct DeciderSettings<'a> {
+    /// Names the config section in errors, e.g. "tools.review".
+    pub section: &'a str,
+    pub provider: ReviewProvider,
+    pub model: Option<&'a str>,
+    /// TypeSafe key, for the hosted TypeSafe API only.
+    pub typesafe_key: Option<String>,
+    pub base_url: Option<&'a str>,
+    pub timeout_secs: u64,
+}
+
+/// The decider for `settings` and its label, e.g. "openrouter/typesafe/jev-1.13";
+/// `None` when the provider is off.
+pub fn decider(
+    settings: &DeciderSettings<'_>,
+    chat: &ModelConfig,
+    openrouter_key: &str,
+) -> Result<Option<(Box<dyn Decider>, String)>> {
+    let section = settings.section;
+    if settings.provider == ReviewProvider::Off {
+        return Ok(None);
+    }
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(settings.timeout_secs.max(1)))
+        // A redirect could carry the key to another host.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .with_context(|| format!("cannot build HTTP client for {section}"))?;
+    let pick = |default: &str| {
+        settings
+            .model
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(default)
+            .to_owned()
+    };
+    Ok(Some(match settings.provider {
+        ReviewProvider::Off => unreachable!("handled above"),
+        ReviewProvider::Typesafe => {
+            let (endpoint, api_key, model) = match settings.base_url {
+                Some(base) if !base.trim().is_empty() => (
+                    format!("{}/v1/systemone", loopback_origin(base, section)?),
+                    None,
+                    pick("kev-latest"),
+                ),
+                _ => (
+                    TYPESAFE_ENDPOINT.to_owned(),
+                    Some(settings.typesafe_key.clone().with_context(|| {
+                        format!(
+                            "{section}.provider is \"typesafe\" but no key is set: \
+                             set TYPESAFE_API_KEY or {section}.api_key, or base_url for a local Kev server"
+                        )
+                    })?),
+                    pick("jev-latest"),
+                ),
+            };
+            let label = format!("typesafe/{model}");
+            (
+                Box::new(SystemOne {
+                    service: "TypeSafe",
+                    http,
+                    endpoint,
+                    api_key,
+                    model,
+                }) as Box<dyn Decider>,
+                label,
+            )
+        }
+        ReviewProvider::Openrouter => {
+            let model = pick(DEFAULT_OPENROUTER_DECIDER);
+            let label = format!("openrouter/{model}");
+            (
+                Box::new(SystemOne {
+                    service: "OpenRouter decisions",
+                    http,
+                    // https://openrouter.ai/api/v1 -> https://openrouter.ai/api/alpha/decisions
+                    endpoint: format!(
+                        "{}/alpha/decisions",
+                        chat.base_url.trim_end_matches('/').trim_end_matches("/v1")
+                    ),
+                    api_key: Some(openrouter_key.to_owned()),
+                    model,
+                }),
+                label,
+            )
+        }
+        ReviewProvider::OpenrouterChat => {
+            let model = pick(&chat.model);
+            let label = format!("openrouter/{model}");
+            (
+                Box::new(OpenRouter {
+                    http,
+                    base_url: chat.base_url.trim_end_matches('/').to_owned(),
+                    api_key: openrouter_key.to_owned(),
+                    model,
+                }),
+                label,
+            )
+        }
+    }))
+}
+
+/// The command question, put to any decider.
+struct Commands(Box<dyn Decider>);
+
+#[async_trait]
+impl Judge for Commands {
+    async fn assess(&self, command: &str, cwd: &Path) -> Result<Assessment> {
+        let question = Question {
+            id: "dangerous",
+            role: "You review shell commands for an AI assistant before they run.",
+            instructions: QUESTION,
+            yes: DANGEROUS,
+            no: SAFE,
+        };
+        self.0.decide(&state(command, cwd), &question).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     Allow(String),
@@ -80,82 +218,18 @@ impl Reviewer {
                 config.deny_at
             );
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(config.timeout_secs.max(1)))
-            // A redirect could carry the key to another host.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("cannot build HTTP client for tools.review")?;
-        let pick = |default: &str| {
-            config
-                .model
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| default.to_owned())
+        let settings = DeciderSettings {
+            section: "tools.review",
+            provider: config.provider,
+            model: config.model.as_deref(),
+            typesafe_key: config.api_key(),
+            base_url: config.base_url.as_deref(),
+            timeout_secs: config.timeout_secs,
         };
-        let (judge, label): (Box<dyn Judge>, String) = match config.provider {
-            ReviewProvider::Off => unreachable!("handled above"),
-            ReviewProvider::Typesafe => {
-                let (endpoint, api_key, model) = match config.base_url.as_deref() {
-                    Some(base) if !base.trim().is_empty() => (
-                        format!("{}/v1/systemone", loopback_origin(base)?),
-                        None,
-                        pick("kev-latest"),
-                    ),
-                    _ => (
-                        TYPESAFE_ENDPOINT.to_owned(),
-                        Some(config.api_key().context(
-                            "tools.review.provider is \"typesafe\" but no key is set: \
-                             set TYPESAFE_API_KEY or tools.review.api_key, or base_url for a local Kev server",
-                        )?),
-                        pick("jev-latest"),
-                    ),
-                };
-                let label = format!("typesafe/{model}");
-                (
-                    Box::new(SystemOne {
-                        service: "TypeSafe",
-                        http,
-                        endpoint,
-                        api_key,
-                        model,
-                    }),
-                    label,
-                )
-            }
-            ReviewProvider::Openrouter => {
-                let model = pick(DEFAULT_OPENROUTER_DECIDER);
-                let label = format!("openrouter/{model}");
-                (
-                    Box::new(SystemOne {
-                        service: "OpenRouter decisions",
-                        http,
-                        // https://openrouter.ai/api/v1 -> https://openrouter.ai/api/alpha/decisions
-                        endpoint: format!(
-                            "{}/alpha/decisions",
-                            chat.base_url.trim_end_matches('/').trim_end_matches("/v1")
-                        ),
-                        api_key: Some(openrouter_key.to_owned()),
-                        model,
-                    }),
-                    label,
-                )
-            }
-            ReviewProvider::OpenrouterChat => {
-                let model = pick(&chat.model);
-                let label = format!("openrouter/{model}");
-                (
-                    Box::new(OpenRouter {
-                        http,
-                        base_url: chat.base_url.trim_end_matches('/').to_owned(),
-                        api_key: openrouter_key.to_owned(),
-                        model,
-                    }),
-                    label,
-                )
-            }
+        let Some((decider, label)) = decider(&settings, chat, openrouter_key)? else {
+            return Ok(None);
         };
+        let judge: Box<dyn Judge> = Box::new(Commands(decider));
         Ok(Some(Self::new(
             judge,
             label,
@@ -203,8 +277,9 @@ impl Reviewer {
 }
 
 /// Accepts only an http(s) loopback origin, so a keyless local server stays local.
-fn loopback_origin(base: &str) -> Result<String> {
-    let url = reqwest::Url::parse(base.trim()).context("invalid tools.review.base_url")?;
+fn loopback_origin(base: &str, section: &str) -> Result<String> {
+    let url =
+        reqwest::Url::parse(base.trim()).with_context(|| format!("invalid {section}.base_url"))?;
     let loopback = url.host_str().is_some_and(|host| {
         host.eq_ignore_ascii_case("localhost")
             || host
@@ -222,7 +297,7 @@ fn loopback_origin(base: &str) -> Result<String> {
         || url.fragment().is_some()
     {
         bail!(
-            "tools.review.base_url must be a loopback origin such as http://127.0.0.1:8009, without a path"
+            "{section}.base_url must be a loopback origin such as http://127.0.0.1:8009, without a path"
         );
     }
     Ok(url.origin().ascii_serialization())
@@ -253,7 +328,7 @@ fn state(command: &str, cwd: &Path) -> Value {
 }
 
 /// System One wire format (TypeSafe, and OpenRouter's decisions API): one Noul
-/// (yes/no probability) question per command.
+/// (yes/no probability) question per call.
 struct SystemOne {
     service: &'static str,
     http: reqwest::Client,
@@ -263,15 +338,15 @@ struct SystemOne {
 }
 
 #[async_trait]
-impl Judge for SystemOne {
-    async fn assess(&self, command: &str, cwd: &Path) -> Result<Assessment> {
+impl Decider for SystemOne {
+    async fn decide(&self, state: &Value, question: &Question<'_>) -> Result<Assessment> {
         let body = json!({
             "model": self.model,
-            "state": state(command, cwd),
-            "questions": {"dangerous": {
+            "state": state,
+            "questions": {(question.id): {
                 "type": "noul",
-                "instructions": QUESTION,
-                "criteria": {"true": DANGEROUS, "false": SAFE},
+                "instructions": question.instructions,
+                "criteria": {"true": question.yes, "false": question.no},
             }},
         });
         let mut request = self
@@ -288,7 +363,7 @@ impl Judge for SystemOne {
             .with_context(|| format!("{} request failed", self.service))?;
         let value = json_body(response, self.service).await?;
         let danger = value
-            .pointer("/answers/dangerous")
+            .pointer(&format!("/answers/{}", question.id))
             .filter(|a| a.get("type").and_then(Value::as_str) == Some("noul"))
             .and_then(|a| a.get("noul"))
             .and_then(Value::as_f64)
@@ -309,19 +384,25 @@ struct OpenRouter {
 }
 
 #[async_trait]
-impl Judge for OpenRouter {
-    async fn assess(&self, command: &str, cwd: &Path) -> Result<Assessment> {
+impl Decider for OpenRouter {
+    async fn decide(&self, state: &Value, question: &Question<'_>) -> Result<Assessment> {
+        let Question {
+            id,
+            role,
+            instructions,
+            yes,
+            no,
+        } = question;
         let system = format!(
-            "You review shell commands for an AI assistant before they run. {QUESTION}\n\n\
-             {DANGEROUS}\n\n{SAFE}\n\n\
-             Reply with only a JSON object: {{\"danger\": <probability from 0 to 1 that the \
-             command is dangerous>, \"reason\": \"<one short sentence>\"}}"
+            "{role} {instructions}\n\nYes ({id}): {yes}\n\nNo: {no}\n\n\
+             Reply with only a JSON object: {{\"probability\": <probability from 0 to 1 that \
+             the answer is yes>, \"reason\": \"<one short sentence>\"}}"
         );
         let body = json!({
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": state(command, cwd).to_string()},
+                {"role": "user", "content": state.to_string()},
             ],
             "temperature": 0,
             "stream": false,
@@ -334,12 +415,12 @@ impl Judge for OpenRouter {
             .json(&body)
             .send()
             .await
-            .context("review model request failed")?;
-        let value = json_body(response, "review model").await?;
+            .context("decision model request failed")?;
+        let value = json_body(response, "decision model").await?;
         let text = value
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .context("review model returned no text")?;
+            .context("decision model returned no text")?;
         parse_rating(text)
     }
 }
@@ -348,17 +429,18 @@ impl Judge for OpenRouter {
 fn parse_rating(text: &str) -> Result<Assessment> {
     #[derive(Deserialize)]
     struct Rating {
-        danger: f64,
+        #[serde(alias = "danger")]
+        probability: f64,
         #[serde(default)]
         reason: Option<String>,
     }
     let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
-        bail!("review model did not reply with JSON");
+        bail!("decision model did not reply with JSON");
     };
     let rating: Rating = serde_json::from_str(text.get(start..=end).unwrap_or_default())
-        .context("review model reply has no danger rating")?;
+        .context("decision model reply has no probability")?;
     Ok(Assessment {
-        danger: rating.danger,
+        danger: rating.probability,
         reason: rating.reason,
     })
 }
@@ -445,7 +527,10 @@ pub mod tests {
             api_key: Some("synthetic-key".into()),
             model: "jev-latest".into(),
         };
-        let rating = judge.assess("rm -rf ~", Path::new("/w")).await.unwrap();
+        let rating = Commands(Box::new(judge))
+            .assess("rm -rf ~", Path::new("/w"))
+            .await
+            .unwrap();
         assert_eq!(rating.danger, 0.97);
         let (auth, body) = seen.lock().unwrap().take().unwrap();
         assert_eq!(auth.as_deref(), Some("Bearer synthetic-key"));
@@ -466,13 +551,13 @@ pub mod tests {
     #[test]
     fn local_servers_must_be_loopback_origins() {
         assert_eq!(
-            loopback_origin("http://127.0.0.1:8009/").unwrap(),
+            loopback_origin("http://127.0.0.1:8009/", "s").unwrap(),
             "http://127.0.0.1:8009"
         );
-        assert!(loopback_origin("http://[::1]:8009").is_ok());
-        assert!(loopback_origin("http://localhost:8009").is_ok());
-        assert!(loopback_origin("http://192.168.1.5:8009").is_err());
-        assert!(loopback_origin("http://127.0.0.1:8009/v1").is_err());
+        assert!(loopback_origin("http://[::1]:8009", "s").is_ok());
+        assert!(loopback_origin("http://localhost:8009", "s").is_ok());
+        assert!(loopback_origin("http://192.168.1.5:8009", "s").is_err());
+        assert!(loopback_origin("http://127.0.0.1:8009/v1", "s").is_err());
     }
 
     #[test]

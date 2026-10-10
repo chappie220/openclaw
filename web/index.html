@@ -50,6 +50,8 @@
   .chip { font-size: 12px; padding: 3px 8px; border-radius: 12px; background: var(--tool); border: 1px solid var(--line); cursor: pointer; }
   #attach { padding: 0 12px; }
   .msg .file { display: block; font-size: 12px; color: var(--muted); }
+  .ack { background: var(--panel); border: 1px dashed var(--line); color: var(--muted); }
+  .msg .state { display: block; font-size: 12px; color: var(--muted); margin-top: 4px; }
   textarea { flex: 1; resize: none; min-height: 44px; max-height: 200px; font: inherit; }
   input, textarea { padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
   button { padding: 0 16px; border: 0; border-radius: 8px; background: var(--accent); color: var(--accent-text); font: inherit; cursor: pointer; min-height: 36px; }
@@ -76,7 +78,8 @@
     <input id="picker" type="file" multiple hidden>
     <button id="attach" type="button" class="secondary">📎</button>
     <textarea id="input" rows="1" data-i18n-placeholder="input"></textarea>
-    <button id="send"></button>
+    <button id="stop" type="button" class="secondary" data-i18n="stop" hidden></button>
+    <button id="send" data-i18n="send"></button>
   </form>
 </main>
 <script>
@@ -91,6 +94,7 @@ const STRINGS = {
     tooBig: "Files can be at most 20 MB per message.", removeFile: "Remove {name}", connecting: "Connecting…", connected: "Connected", reconnecting: "Disconnected, retrying in 3 s",
     token: "Access token needed (OPENCLAW_RS_TOKEN):", allowTool: "Allow {tool}?", allow: "Allow", deny: "Deny",
     allowed: "Allowed {tool}", denied: "Denied {tool}", switchTo: "中文",
+    waiting: "⏳ Waiting for a good moment to add this", added: "✓ Added to the conversation", nextTurn: "↪ Answered next",
   },
   zh: {
     newName: "新会话名称", create: "新建", input: "输入消息，Enter 发送，Shift+Enter 换行",
@@ -98,6 +102,7 @@ const STRINGS = {
     tooBig: "每条消息的文件最多 20 MB。", removeFile: "移除 {name}", connecting: "连接中…", connected: "已连接", reconnecting: "连接断开，3 秒后重试",
     token: "需要访问令牌（OPENCLAW_RS_TOKEN）：", allowTool: "允许执行 {tool}？", allow: "允许", deny: "拒绝",
     allowed: "已允许 {tool}", denied: "已拒绝 {tool}", switchTo: "EN",
+    waiting: "⏳ 等待合适的时机插入", added: "✓ 已插入对话", nextTurn: "↪ 接着单独回答",
   },
 };
 const LANG_KEY = "openclaw.lang";
@@ -121,6 +126,7 @@ function applyLang() {
   $("attach").title = t("attach");
   renderFiles();
   $("status").textContent = t(statusKey);
+  for (const el of document.querySelectorAll(".state")) el.textContent = t(el.dataset.key);
   updateComposer();
 }
 $("lang").onclick = () => {
@@ -132,6 +138,10 @@ const log = $("log"), input = $("input");
 let ws, current = localStorage.getItem("openclaw.session") || "main";
 let streaming = null; // assistant bubble receiving deltas for the current session
 const busy = new Set();
+// Bubbles of messages sent while the current session's turn runs, oldest first.
+let waiting = [];
+// Last bubble of each inserted batch, where its acknowledgement goes.
+let ackAnchors = [];
 
 function token() {
   const fromHash = new URLSearchParams(location.hash.slice(1)).get("token");
@@ -176,17 +186,22 @@ function open(name) {
   current = name;
   localStorage.setItem("openclaw.session", name);
   streaming = null;
+  waiting = []; ackAnchors = [];
   log.textContent = "";
   for (const li of $("sessions").children) li.classList.toggle("active", li.dataset.name === name);
   send({ type: "history", session: name });
   updateComposer();
 }
 
-// While the session's turn runs, the button stops it instead of sending.
+// While the session's turn runs, Stop appears; Send adds to the running turn.
 function updateComposer() {
-  const running = busy.has(current);
-  $("send").textContent = t(running ? "stop" : "send");
-  $("send").classList.toggle("secondary", running);
+  $("stop").hidden = !busy.has(current);
+}
+function markState(div, key) {
+  let line = div.querySelector(".state");
+  if (!line) { line = document.createElement("span"); line.className = "state"; div.appendChild(line); }
+  line.dataset.key = key;
+  line.textContent = t(key);
 }
 
 function renderSessions(list) {
@@ -255,9 +270,32 @@ function handle(m) {
       card.append(title, code, yes, no);
       break;
     }
+    case "queued": {
+      const div = waiting.find((d) => !d.querySelector(".state"));
+      if (div) markState(div, "waiting");
+      break;
+    }
+    case "follow_up":
+      // The reply goes on in a new bubble below the inserted messages.
+      streaming = null;
+      {
+        const batch = waiting.splice(0, m.count);
+        for (const div of batch) markState(div, m.new_turn ? "nextTurn" : "added");
+        if (!m.new_turn && batch.length) ackAnchors.push(batch[batch.length - 1]);
+      }
+      if (m.new_turn) { busy.add(m.session); updateComposer(); }
+      break;
+    case "ack": {
+      // Right below the messages it answers, ahead of the reply that goes on.
+      const div = bubble(m.failed ? "ack error" : "ack", m.text);
+      const anchor = ackAnchors.shift();
+      if (anchor && anchor.isConnected) anchor.after(div);
+      break;
+    }
     case "done":
-      // A stopped turn ends with a note that differs from what streamed.
-      if (m.text && (!streaming || streaming.textContent !== m.text)) bubble("assistant", m.text);
+      // A stopped turn ends with a note that differs from what streamed; a
+      // turn that took in later messages returns every answer it gave.
+      if (m.text && (!streaming || !m.text.endsWith(streaming.textContent))) bubble("assistant", m.text);
       streaming = null; busy.delete(m.session); updateComposer(); send({ type: "sessions" });
       break;
     case "error":
@@ -303,16 +341,17 @@ input.addEventListener("paste", (e) => {
   if (images.length) { e.preventDefault(); addFiles(images); }
 });
 
+$("stop").onclick = () => send({ type: "stop", session: current });
 $("composer").onsubmit = async (e) => {
   e.preventDefault();
-  if (busy.has(current)) { send({ type: "stop", session: current }); return; }
   const text = input.value.trim();
   if (!text && !pending.length) return;
   const sending = pending;
   pending = []; renderFiles();
-  bubble("user", text, sending.map((f) => f.name));
-  streaming = null;
-  busy.add(current); updateComposer();
+  const div = bubble("user", text, sending.map((f) => f.name));
+  // Sent during a turn: it joins that turn when the server finds a good moment.
+  if (busy.has(current)) waiting.push(div);
+  else { streaming = null; busy.add(current); updateComposer(); }
   input.value = ""; input.style.height = "";
   const files = await Promise.all(sending.map(async (f) => ({ name: f.name || "pasted.png", mime: f.type || null, data: await readBase64(f) })));
   send({ type: "send", session: current, text, files });

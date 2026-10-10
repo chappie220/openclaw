@@ -119,11 +119,12 @@ impl Entry {
 }
 
 /// Id of the user message that started the turn now running.
+/// Messages the user sent while that turn ran are part of it.
 fn current_turn(entries: &[Entry]) -> i64 {
     entries
         .iter()
         .rev()
-        .find(|e| e.message.role == Role::User)
+        .find(|e| e.message.role == Role::User && !crate::guide::is_follow_up(&e.message))
         .map_or(i64::MIN, |e| e.id)
 }
 
@@ -193,7 +194,7 @@ pub fn summary_message(summary: &str) -> ChatMessage {
 
 /// One message as the summary model reads it. Tool output is passed whole,
 /// cut only at `max_chars` so a single message still fits one request.
-fn render(message: &ChatMessage, max_chars: usize) -> String {
+pub fn render(message: &ChatMessage, max_chars: usize) -> String {
     let clip = |text: &str| -> String {
         if text.chars().count() <= max_chars {
             return text.to_owned();
@@ -288,7 +289,7 @@ fn compact(
     let target = budget / 2;
     let users: Vec<i64> = entries
         .iter()
-        .filter(|e| e.message.role == Role::User && e.id >= marks.start)
+        .filter(|e| e.message.role == Role::User && e.id >= marks.start && e.id <= current)
         .map(|e| e.id)
         .collect();
     if users.is_empty() {

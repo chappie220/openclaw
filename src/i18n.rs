@@ -144,6 +144,14 @@ pub mod chat {
         "Only the owner or whoever started it can stop this turn.",
         "只有 owner 或发起这一轮的人能停止它。",
     );
+    pub const FOLLOW_UP_QUEUED: Tr = tr(
+        "Got it. I'll add this to what I'm working on at a good moment.",
+        "收到，我会在合适的时机把这条加入正在进行的对话。",
+    );
+    pub const ACK_FAILED: Tr = tr(
+        "Your message was added to the current turn, but the reply to it could not be written: {}",
+        "你的消息已加入当前这一轮，但给它的回应没能生成：{}",
+    );
 
     #[cfg(test)]
     pub const ALL: &[Tr] = &[
@@ -164,6 +172,8 @@ pub mod chat {
         STOPPING,
         NOTHING_RUNNING,
         STOP_NOT_ALLOWED,
+        FOLLOW_UP_QUEUED,
+        ACK_FAILED,
     ];
 }
 

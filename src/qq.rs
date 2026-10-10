@@ -560,12 +560,16 @@ fn handle<M: Model + 'static, T: Tools + 'static>(
         }
         let text = crate::attachments::with_problems(&incoming.text, &problems);
         let reply = match gateway
-            .run_unattended_with(actor, &session, &text, &uploads)
+            .chat_unattended_with(actor, &session, &text, &uploads)
             .await
         {
             Ok(text) => text,
             Err(err) => crate::i18n::chat::FAILED.with(&[&format!("{err:#}")]),
         };
+        // A message that joined a running turn is answered when it goes in.
+        if reply.is_empty() {
+            return;
+        }
         if let Err(err) = bot.send(&incoming.target, &reply, Some(&incoming.id)).await {
             eprintln!("qq: cannot reply in {session}: {err:#}");
         }

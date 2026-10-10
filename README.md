@@ -149,6 +149,62 @@ process group is killed), the text shown so far is kept with a note telling
 the model it was cut off, and the turn replies "Stopped". Messages saved
 before that point stay in the history.
 
+## Guided conversation
+
+You can keep writing while a reply is still being worked on. Instead of
+waiting for the turn to end, the new message joins it:
+
+- Web UI: Send stays available during a turn (Stop sits next to it). A
+  message sent then is marked "⏳ waiting for a good moment", then "✓ added".
+- QQ: the turn's reply answers it as well.
+
+When a message goes in, the agent replies to it at once in its own voice,
+for example "明白了，原来是要导出成 CSV，我先把剩下的数据查完再一起导出。": what it
+understood the message to add or change, and what it will do now. This reply
+is written fresh each time (by `agent.summary_model`, else the main model)
+from the turn so far, appears in the Web UI right below the message and is
+sent to the QQ chat. It is not stored in the history, so it never binds the
+model doing the work. If writing it fails or takes over 30 s, the reply says
+so with the error (for example `HTTP 402: insufficient credits`, or `no reply
+within 30 s`), so a broken reply model is easy to track down; the message was
+still added and the turn goes on. The error is also logged. With `ack = false` QQ answers at once with a fixed
+"got it" instead and the Web UI shows only the marks.
+
+The message waits in the turn's inbox. After each step (a model call and the
+tools it ran) TypeSafe's **Jev** decision model is asked whether this is a
+good moment for the agent to read it: now if it corrects, cancels or
+redirects the work, answers a question, supplies something the next steps
+need, or the agent has just finished a part of the task; later if it is an
+independent request that the work in progress does not depend on. It is
+then inserted into the conversation before the next model call, marked for
+the model as sent mid-turn. A message is held back for at most
+`max_wait_steps` steps, and one still waiting when the agent answers goes in
+then, so the agent answers it in the same turn; the reply holds both
+answers. If Jev fails or times out the message goes in at once.
+
+Only messages from whoever started the turn join it, so nobody steers a turn
+running with someone else's permissions; in a QQ group, other members'
+messages wait for their own turn. `/stop`, `/compact` and `/identity` are
+never inserted. Messages the turn never took (it was stopped, failed or ran
+out of `max_steps`) run right after it as one message. Email and scheduled
+jobs are not affected, and the terminal reads no input while a turn runs.
+
+```toml
+[guide]
+enabled = true                  # false: messages wait and run as their own turn
+provider = "openrouter"         # off (insert at the next step) | openrouter | openrouter-chat | typesafe
+model = "typesafe/jev-1.13"     # default for openrouter
+insert_at = 0.5                 # Jev's "read it now" probability at or above which it goes in
+max_wait_steps = 3
+timeout_secs = 10
+ack = true                      # reply to each message as it goes in
+```
+
+The providers work as in [Command auto-review](#command-auto-review). The
+decision model sees the original request, the last step (the assistant's
+text and its tool calls and results, each cut to 600 characters) and the
+waiting messages.
+
 ## Scheduled jobs
 
 `serve` runs jobs on standard 5-field cron schedules in the host's local time.

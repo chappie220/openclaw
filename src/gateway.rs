@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::access::{self, AccessConfig, Actor};
 use crate::agent::{Agent, AgentEvent, Cancel, Model, Tools};
 use crate::attachments::Upload;
+use crate::guide::{self, FollowUp, Guide, Guided, Inbox};
 use crate::i18n::chat;
 use crate::llm::Role;
 use crate::tools::{Approver, with_approver};
@@ -30,6 +31,8 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_SESSION_NAME: usize = 64;
 const SCHEDULER_TICK: Duration = Duration::from_secs(20);
+/// An acknowledgement that takes longer is dropped; the turn goes on regardless.
+const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -96,6 +99,24 @@ enum ServerMsg {
     Updated {
         session: String,
     },
+    /// The message joined the session's running turn and waits for a good moment.
+    Queued {
+        session: String,
+    },
+    /// `count` waiting messages were inserted into the running turn, or,
+    /// with `new_turn`, start a turn of their own after it.
+    FollowUp {
+        session: String,
+        count: usize,
+        new_turn: bool,
+    },
+    /// The agent's short reply to messages just inserted into its turn.
+    Ack {
+        session: String,
+        text: String,
+        /// The reply could not be written; `text` says why.
+        failed: bool,
+    },
 }
 
 #[derive(Serialize, Clone)]
@@ -152,8 +173,19 @@ pub struct Gateway<M: Model, T: Tools> {
     updates: broadcast::Sender<ServerMsg>,
     /// One turn per session at a time; later sends queue behind it.
     session_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// The turn running in each session, and the actor who started it.
-    running: Mutex<HashMap<String, (Cancel, String)>>,
+    /// The turn running in each session.
+    running: Mutex<HashMap<String, Running>>,
+    /// Lets messages sent during a person's turn join it; unset, they queue.
+    guide: OnceLock<Arc<Guide>>,
+}
+
+/// A running turn.
+struct Running {
+    cancel: Cancel,
+    /// The actor who started it.
+    started_by: String,
+    /// Messages its starter sent since.
+    inbox: Inbox,
 }
 
 /// What `/stop` found.
@@ -183,7 +215,7 @@ fn is_stop_command(text: &str) -> bool {
 
 /// Removes a turn from `running` when it ends, however it ends.
 struct RunningTurn<'a> {
-    running: &'a Mutex<HashMap<String, (Cancel, String)>>,
+    running: &'a Mutex<HashMap<String, Running>>,
     session: String,
 }
 
@@ -212,21 +244,100 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
             notifiers: Mutex::new(Vec::new()),
             session_locks: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
+            guide: OnceLock::new(),
         })
     }
 
+    /// Lets people add to their running turn (`[guide]`); set once at startup.
+    pub fn set_guide(&self, guide: Guide) {
+        let _ = self.guide.set(Arc::new(guide));
+    }
+
     /// Registers `session`'s turn, started by `actor`, until the guard drops.
-    fn start_turn(&self, session: &str, actor: &Actor) -> (Cancel, RunningTurn<'_>) {
+    fn start_turn(&self, session: &str, actor: &Actor) -> (Cancel, Inbox, RunningTurn<'_>) {
         let cancel = Cancel::default();
+        let inbox = Inbox::default();
         self.running
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(session.to_owned(), (cancel.clone(), actor.id.clone()));
+            .insert(
+                session.to_owned(),
+                Running {
+                    cancel: cancel.clone(),
+                    started_by: actor.id.clone(),
+                    inbox: inbox.clone(),
+                },
+            );
         let guard = RunningTurn {
             running: &self.running,
             session: session.to_owned(),
         };
-        (cancel, guard)
+        (cancel, inbox, guard)
+    }
+
+    fn guided(&self, inbox: &Inbox) -> Option<Guided> {
+        self.guide.get().map(|guide| Guided {
+            inbox: inbox.clone(),
+            guide: guide.clone(),
+        })
+    }
+
+    /// Whether messages inserted into a turn get an acknowledgement.
+    fn acks(&self) -> bool {
+        self.guide.get().is_some_and(|g| g.ack)
+    }
+
+    /// Replies to each batch of messages inserted into `session`'s running
+    /// turn as it arrives on `inserted`, until the turn ends: on the Web UI
+    /// socket `out`, else through the channel that owns the session.
+    async fn acknowledge_all(
+        &self,
+        session: &str,
+        mut inserted: mpsc::UnboundedReceiver<Vec<String>>,
+        out: Option<&mpsc::UnboundedSender<ServerMsg>>,
+    ) {
+        while let Some(messages) = inserted.recv().await {
+            let timed =
+                tokio::time::timeout(ACK_TIMEOUT, self.agent.acknowledge(session, &messages));
+            // On failure, say why, so a broken reply model can be tracked
+            // down; the message itself was added all the same.
+            let (text, failed) = match timed.await {
+                Ok(Ok(text)) => (text, false),
+                Ok(Err(err)) => {
+                    eprintln!("guide: cannot acknowledge in {session}: {err:#}");
+                    (chat::ACK_FAILED.with(&[&format!("{err:#}")]), true)
+                }
+                Err(_) => {
+                    let err = format!("no reply within {} s", ACK_TIMEOUT.as_secs());
+                    eprintln!("guide: cannot acknowledge in {session}: {err}");
+                    (chat::ACK_FAILED.with(&[&err]), true)
+                }
+            };
+            match out {
+                Some(out) => {
+                    let _ = out.send(ServerMsg::Ack {
+                        session: session.to_owned(),
+                        text,
+                        failed,
+                    });
+                }
+                None => self.notify(session, &text).await,
+            }
+        }
+    }
+
+    /// Adds `item` to `session`'s running turn if `actor` started it, so a
+    /// sender never steers a turn running with someone else's permissions.
+    /// Hands it back to run as a turn of its own otherwise.
+    fn follow_up(&self, session: &str, actor: &Actor, item: FollowUp) -> Result<(), FollowUp> {
+        if self.guide.get().is_none() || crate::agent::is_compact_command(&item.text) {
+            return Err(item);
+        }
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        match running.get(session) {
+            Some(turn) if turn.started_by == actor.id => turn.inbox.push(item),
+            _ => Err(item),
+        }
     }
 
     /// Stops `session`'s running turn if `actor` owns the host or started it.
@@ -234,8 +345,8 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
         match running.get(session) {
             None => StopOutcome::NothingRunning,
-            Some((cancel, started_by)) if actor.owner || *started_by == actor.id => {
-                cancel.cancel();
+            Some(turn) if actor.owner || turn.started_by == actor.id => {
+                turn.cancel.cancel();
                 StopOutcome::Stopping
             }
             Some(_) => StopOutcome::NotAllowed,
@@ -302,6 +413,31 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         prompt: &str,
         uploads: &[Upload],
     ) -> Result<String> {
+        self.unattended(actor, session, prompt, uploads, false)
+            .await
+    }
+
+    /// For a person chatting in a channel: a message sent while their own
+    /// turn runs joins that turn (see `guide`), and is acknowledged at once;
+    /// the turn's reply answers it too.
+    pub async fn chat_unattended_with(
+        &self,
+        actor: Actor,
+        session: &str,
+        prompt: &str,
+        uploads: &[Upload],
+    ) -> Result<String> {
+        self.unattended(actor, session, prompt, uploads, true).await
+    }
+
+    async fn unattended(
+        &self,
+        actor: Actor,
+        session: &str,
+        prompt: &str,
+        uploads: &[Upload],
+        chatting: bool,
+    ) -> Result<String> {
         // Before the queue, which the turn to stop is holding.
         if is_stop_command(prompt) {
             return Ok(self.stop(session, &actor).reply());
@@ -310,29 +446,79 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
             return Ok(reply);
         }
         let (files, problems) = self.agent.save_uploads(uploads);
-        let prompt = crate::attachments::with_problems(prompt, &problems);
+        let mut next = FollowUp {
+            text: crate::attachments::with_problems(prompt, &problems),
+            files,
+        };
+        if chatting {
+            match self.follow_up(session, &actor, next) {
+                // With acknowledgements on, the reply comes once it goes in.
+                Ok(()) if self.acks() => return Ok(String::new()),
+                Ok(()) => return Ok(chat::FOLLOW_UP_QUEUED.now().into()),
+                Err(item) => next = item,
+            }
+        }
         let lock = self.session_lock(session);
         let _turn = lock.lock().await;
-        let (cancel, _running) = self.start_turn(session, &actor);
-        let mut result = self
-            .agent
-            .run_turn_until(actor, session, &prompt, &files, &cancel, &mut |_| {})
-            .await;
-        // The person approves what the program shows them, not the model's
-        // description of it.
-        if let Ok(text) = &mut result
-            && let Some(draft) = self.agent.store.identity_draft_to_announce(session)?
-        {
-            text.push_str(&format!(
-                "\n\n---\n{}\n\n{}",
-                draft.render(),
-                crate::identity::approval_hint(&draft)
-            ));
+        let mut replies = Vec::new();
+        loop {
+            let (result, leftovers) = {
+                let (cancel, inbox, _running) = self.start_turn(session, &actor);
+                let guided = if chatting { self.guided(&inbox) } else { None };
+                let (inserted, acks) = mpsc::unbounded_channel();
+                let ack = self.acks();
+                let mut on_event = move |event: AgentEvent| {
+                    if let AgentEvent::FollowUp(messages) = event
+                        && ack
+                    {
+                        let _ = inserted.send(messages);
+                    }
+                };
+                let (agent, actor, next, cancel, guided) =
+                    (&self.agent, actor.clone(), &next, &cancel, guided.as_ref());
+                // Owns `on_event`, so the acknowledgements end with the turn.
+                let run = async move {
+                    agent
+                        .run_turn_guided(
+                            actor,
+                            session,
+                            &next.text,
+                            &next.files,
+                            cancel,
+                            guided,
+                            &mut on_event,
+                        )
+                        .await
+                };
+                let (result, ()) = tokio::join!(run, self.acknowledge_all(session, acks, None));
+                (result, inbox.close())
+            };
+            let _ = self.updates.send(ServerMsg::Updated {
+                session: session.to_owned(),
+            });
+            match result {
+                Ok(mut text) => {
+                    // The person approves what the program shows them, not
+                    // the model's description of it.
+                    if let Some(draft) = self.agent.store.identity_draft_to_announce(session)? {
+                        text.push_str(&format!(
+                            "\n\n---\n{}\n\n{}",
+                            draft.render(),
+                            crate::identity::approval_hint(&draft)
+                        ));
+                    }
+                    replies.push(text);
+                }
+                Err(err) if replies.is_empty() && leftovers.is_empty() => return Err(err),
+                Err(err) => replies.push(chat::FAILED.with(&[&format!("{err:#}")])),
+            }
+            // Sent during the turn but never taken in (it was stopped, failed
+            // or ran out of steps): they run next, as one message.
+            if leftovers.is_empty() {
+                return Ok(replies.join("\n\n"));
+            }
+            next = guide::merge(leftovers);
         }
-        let _ = self.updates.send(ServerMsg::Updated {
-            session: session.to_owned(),
-        });
-        result
     }
 
     /// Runs due cron jobs; jobs added by the CLI or tools are picked up on the next tick.
@@ -639,43 +825,103 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         return;
     }
     let (files, problems) = gateway.agent.save_uploads(&uploads);
-    let text = crate::attachments::with_problems(&text, &problems);
+    let mut next = FollowUp {
+        text: crate::attachments::with_problems(&text, &problems),
+        files,
+    };
+    match gateway.follow_up(&session, &actor, next) {
+        Ok(()) => {
+            let _ = out.send(ServerMsg::Queued { session });
+            return;
+        }
+        Err(item) => next = item,
+    }
     let lock = gateway.session_lock(&session);
     let _turn = lock.lock().await;
-    let (cancel, _running) = gateway.start_turn(&session, &actor);
-    let events = out.clone();
-    let name = session.clone();
-    let mut on_event = move |event: AgentEvent| {
-        let session = name.clone();
-        let _ = events.send(match event {
-            AgentEvent::Text(delta) => ServerMsg::Text { session, delta },
-            AgentEvent::ToolStart { name, arguments } => ServerMsg::ToolStart {
-                session,
-                name,
-                arguments,
+    let approver: Arc<dyn crate::tools::Approver> = Arc::new(approver);
+    loop {
+        let (result, leftovers) = {
+            let (cancel, inbox, _running) = gateway.start_turn(&session, &actor);
+            let guided = gateway.guided(&inbox);
+            let events = out.clone();
+            let name = session.clone();
+            let (inserted, acks) = mpsc::unbounded_channel();
+            let ack = gateway.acks();
+            let mut on_event = move |event: AgentEvent| {
+                let session = name.clone();
+                if let AgentEvent::FollowUp(messages) = &event
+                    && ack
+                {
+                    let _ = inserted.send(messages.clone());
+                }
+                let _ = events.send(match event {
+                    AgentEvent::Text(delta) => ServerMsg::Text { session, delta },
+                    AgentEvent::ToolStart { name, arguments } => ServerMsg::ToolStart {
+                        session,
+                        name,
+                        arguments,
+                    },
+                    AgentEvent::ToolEnd { name, output } => ServerMsg::ToolEnd {
+                        session,
+                        name,
+                        output,
+                    },
+                    AgentEvent::FollowUp(messages) => ServerMsg::FollowUp {
+                        session,
+                        count: messages.len(),
+                        new_turn: false,
+                    },
+                });
+            };
+            let (agent, turn_actor, name, next, cancel, guided) = (
+                &gateway.agent,
+                actor.clone(),
+                &session,
+                &next,
+                &cancel,
+                guided.as_ref(),
+            );
+            // Owns `on_event`, so the acknowledgements end with the turn.
+            let run = with_approver(approver.clone(), async move {
+                // The connection presented the gateway token (or is loopback-only).
+                agent
+                    .run_turn_guided(
+                        turn_actor,
+                        name,
+                        &next.text,
+                        &next.files,
+                        cancel,
+                        guided,
+                        &mut on_event,
+                    )
+                    .await
+            });
+            let (result, ()) =
+                tokio::join!(run, gateway.acknowledge_all(&session, acks, Some(&out)));
+            (result, inbox.close())
+        };
+        let _ = out.send(match result {
+            Ok(text) => ServerMsg::Done {
+                session: session.clone(),
+                text,
             },
-            AgentEvent::ToolEnd { name, output } => ServerMsg::ToolEnd {
-                session,
-                name,
-                output,
+            Err(err) => ServerMsg::Error {
+                session: Some(session.clone()),
+                message: format!("{err:#}"),
             },
         });
-    };
-    let result = with_approver(
-        Arc::new(approver),
-        // The connection presented the gateway token (or is loopback-only).
-        gateway
-            .agent
-            .run_turn_until(actor, &session, &text, &files, &cancel, &mut on_event),
-    )
-    .await;
-    let _ = out.send(match result {
-        Ok(text) => ServerMsg::Done { session, text },
-        Err(err) => ServerMsg::Error {
-            session: Some(session),
-            message: format!("{err:#}"),
-        },
-    });
+        // Sent during the turn but never taken in (it was stopped, failed or
+        // ran out of steps): they run next, as one message.
+        if leftovers.is_empty() {
+            return;
+        }
+        let _ = out.send(ServerMsg::FollowUp {
+            session: session.clone(),
+            count: leftovers.len(),
+            new_turn: true,
+        });
+        next = guide::merge(leftovers);
+    }
 }
 
 fn history<M: Model, T: Tools>(gateway: &Gateway<M, T>, session: String) -> ServerMsg {
@@ -953,6 +1199,187 @@ mod tests {
             .unwrap();
         assert!(reply.contains("approved"), "{reply}");
         assert_eq!(store.identity().unwrap().unwrap().name, "Mallory");
+    }
+
+    /// Holds its first call until `go` is notified; answers what it read
+    /// last, or with `.2` refuses to write acknowledgements.
+    struct Gate(Arc<tokio::sync::Notify>, AtomicU64, bool);
+
+    #[async_trait]
+    impl Model for Gate {
+        async fn complete(
+            &self,
+            messages: &[crate::llm::ChatMessage],
+            _tools: &[crate::llm::ToolSpec],
+            _on_text: &mut (dyn for<'t> FnMut(&'t str) + Send),
+        ) -> Result<crate::llm::Completion> {
+            if self.1.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.0.notified().await;
+            }
+            let last = messages.last().unwrap().content.clone().unwrap_or_default();
+            if self.2 && last.starts_with("The turn so far") {
+                bail!("model request failed with HTTP 402: insufficient credits");
+            }
+            Ok(crate::llm::Completion {
+                text: format!("re: {}", guide::without_note(&last)),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_sent_during_a_turn_joins_it() {
+        let fail_ack = false;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let tools = crate::tools::BuiltinTools::new(
+            dir.path().to_owned(),
+            crate::config::ToolsConfig::default(),
+            store.clone(),
+        )
+        .unwrap();
+        let go = Arc::new(tokio::sync::Notify::new());
+        let agent = Arc::new(Agent {
+            model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
+            summarizer: None,
+            tools,
+            store: store.clone(),
+            config: crate::config::AgentConfig::default(),
+        });
+        let access: AccessConfig = toml::from_str(r#"owners = ["qq:BOSS"]"#).unwrap();
+        let gateway = Gateway::new(agent, None, access);
+        gateway.set_guide(Guide::new(None, "off".into(), 0.5, 3));
+        let session = "qq:group:G1";
+        let alice = gateway.actor("qq:ALICE", session);
+        let turn = tokio::spawn({
+            let gateway = gateway.clone();
+            let alice = alice.clone();
+            async move {
+                gateway
+                    .chat_unattended_with(alice, session, "first", &[])
+                    .await
+            }
+        });
+        while !gateway.running.lock().unwrap().contains_key(session) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            gateway
+                .chat_unattended_with(alice, session, "second", &[])
+                .await
+                .unwrap(),
+            chat::FOLLOW_UP_QUEUED.now()
+        );
+        // Someone else's message never steers Alice's turn: it waits its own.
+        let bob = tokio::spawn({
+            let gateway = gateway.clone();
+            let bob = gateway.actor("qq:BOB", session);
+            async move { gateway.chat_unattended_with(bob, session, "bob", &[]).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        go.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, "re: first\n\nre: second");
+        let bob = tokio::time::timeout(Duration::from_secs(5), bob)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(bob, "re: bob");
+    }
+
+    /// Keeps what was sent to the sessions it handles.
+    struct Recording(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Notifier for Recording {
+        fn handles(&self, session: &str) -> bool {
+            session.starts_with("qq:")
+        }
+        async fn notify(&self, _session: &str, text: &str) -> Result<()> {
+            self.0.lock().unwrap().push(text.to_owned());
+            Ok(())
+        }
+    }
+
+    /// What the QQ chat receives besides the turn's reply, when a second
+    /// message joins the turn.
+    async fn acknowledgements(fail_ack: bool) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let tools = crate::tools::BuiltinTools::new(
+            dir.path().to_owned(),
+            crate::config::ToolsConfig::default(),
+            store.clone(),
+        )
+        .unwrap();
+        let go = Arc::new(tokio::sync::Notify::new());
+        let agent = Arc::new(Agent {
+            model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
+            summarizer: None,
+            tools,
+            store,
+            config: crate::config::AgentConfig::default(),
+        });
+        let gateway = Gateway::new(agent, None, AccessConfig::default());
+        let mut guide = Guide::new(None, "off".into(), 0.5, 3);
+        guide.ack = true;
+        gateway.set_guide(guide);
+        let sent = Arc::new(Recording(Mutex::new(Vec::new())));
+        gateway.add_notifier(sent.clone());
+        let session = "qq:c2c:A";
+        let alice = gateway.actor("qq:A", session);
+        let turn = tokio::spawn({
+            let gateway = gateway.clone();
+            let alice = alice.clone();
+            async move {
+                gateway
+                    .chat_unattended_with(alice, session, "first", &[])
+                    .await
+            }
+        });
+        while !gateway.running.lock().unwrap().contains_key(session) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let queued = gateway
+            .chat_unattended_with(alice, session, "second", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            queued, "",
+            "answered once it goes in, not with a stock reply"
+        );
+        go.notify_one();
+        let reply = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, "re: first\n\nre: second");
+        sent.0.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn inserted_messages_get_a_reply_of_their_own() {
+        let sent = acknowledgements(false).await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].ends_with("sent just now:\n\nsecond"), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_acknowledgement_says_why() {
+        let sent = acknowledgements(true).await;
+        assert_eq!(
+            sent,
+            [
+                chat::ACK_FAILED
+                    .with(&["model request failed with HTTP 402: insufficient credits"])
+            ]
+        );
     }
 
     #[test]

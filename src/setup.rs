@@ -177,6 +177,24 @@ const SECTIONS: &[Section] = &[
                 help: tr("Stops a runaway tool loop.", "防止工具调用无限循环。"),
                 kind: Kind::Int,
             },
+            Field {
+                path: &["guide", "enabled"],
+                label: tr("Add messages to a running turn", "对话中插入补充消息"),
+                help: tr(
+                    "Messages sent while a turn runs join it at a good moment instead of waiting; see README \"Guided conversation\".",
+                    "回复进行中发来的消息会在合适的时机加入当前这一轮，而不是排队等待；见 README 的 \"Guided conversation\"。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["guide", "provider"],
+                label: tr("Model that picks the moment", "判断插入时机的模型"),
+                help: tr(
+                    "openrouter: TypeSafe's Jev decision model with your OpenRouter key; off: insert at the next step.",
+                    "openrouter：通过 OpenRouter 密钥使用 TypeSafe 的 Jev 决策模型；off：在下一步直接插入。",
+                ),
+                kind: Kind::Choice(&["off", "openrouter", "openrouter-chat", "typesafe"]),
+            },
         ],
     },
     Section {
@@ -849,8 +867,9 @@ mod tests {
         )
         .unwrap();
         // Model (section 2): new id, keep key, two fallbacks, keep retries, cache by number,
-        // a bad then a good budget, reset summary model, keep recall and max steps.
-        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\ns\n";
+        // a bad then a good budget, reset summary model, keep recall, max steps
+        // and both guide fields.
+        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\ns\n";
         let out = drive(&path, script);
         assert!(out.contains("\"lots\" is not a whole number"), "{out}");
         assert!(out.contains("Saved"), "{out}");
