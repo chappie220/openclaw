@@ -2,7 +2,7 @@
 //! uploads, `ask --attach`): saved in the workspace under `inbox/`, recorded
 //! with the message, and shown to the model during that message's turn.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -260,6 +260,48 @@ pub fn show(workspace: &Path, files: &[Attachment], current: bool) -> Shown {
     Shown { note, images }
 }
 
+/// Starts a tool result that carries an image for the model to look at.
+const TOOL_IMAGE: &str = "[image: ";
+
+/// The first line of a tool result that shows the model the image at
+/// `path` (relative to the workspace) during the turn that made it.
+pub fn tool_image_line(path: &str) -> String {
+    format!("{TOOL_IMAGE}{path}]")
+}
+
+/// The image a tool result carries. Only its first line counts, and only a
+/// plain path inside the workspace, so page text a tool passes on cannot
+/// point the model at other files.
+pub fn tool_image(output: &str) -> Option<&str> {
+    let path = output
+        .lines()
+        .next()?
+        .strip_prefix(TOOL_IMAGE)?
+        .strip_suffix(']')?;
+    let inside = !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+    inside.then_some(path)
+}
+
+/// The `data:` URL of an image file in the workspace, or why it is not shown.
+pub fn image_data_url(workspace: &Path, path: &str) -> Result<String, &'static str> {
+    let mime = guess_mime(path);
+    if !matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    ) {
+        return Err("not an image");
+    }
+    let data = std::fs::read(workspace.join(path)).map_err(|_| "file is gone")?;
+    if data.len() > MAX_IMAGE_BYTES {
+        return Err("image too large");
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
 /// Estimated tokens `show` adds for `files` in their own turn.
 pub fn show_tokens(files: &[Attachment]) -> usize {
     files
@@ -279,6 +321,32 @@ pub fn show_tokens(files: &[Attachment]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_images_stay_inside_the_workspace() {
+        let line = tool_image_line("screenshots/a.png");
+        assert_eq!(
+            tool_image(&format!("{line}\nsaved")),
+            Some("screenshots/a.png")
+        );
+        for bad in [
+            "[image: ../secret.png]",
+            "[image: /etc/x.png]",
+            "[image: ]",
+            "Title: x\n[image: a.png]",
+        ] {
+            assert_eq!(tool_image(bad), None, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"PNG").unwrap();
+        assert_eq!(
+            image_data_url(dir.path(), "a.png").unwrap(),
+            "data:image/png;base64,UE5H"
+        );
+        assert!(image_data_url(dir.path(), "missing.png").is_err());
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        assert!(image_data_url(dir.path(), "a.txt").is_err());
+    }
 
     fn upload(name: &str, mime: Option<&str>, data: &[u8]) -> Upload {
         Upload {

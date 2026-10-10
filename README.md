@@ -16,6 +16,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | QQ channel (official QQ Bot API) | phase 6 ✅ |
 | Email channel (IMAP in, SMTP out) | ✅ |
 | Identity setup on first start, web search | ✅ |
+| Browser, using the one installed on the host | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -33,8 +34,33 @@ Or build on the Pi itself: `apk add cargo build-base && cargo build --release`.
 ## Usage
 
 ```sh
-export OPENROUTER_API_KEY=sk-or-...
 cargo build --release
+./target/release/openclaw-rs init     # guided setup, about a minute
+./target/release/openclaw-rs chat
+```
+
+`init` asks four things and saves `<state dir>/config.toml` (mode 0600):
+
+1. the language (中文 or English);
+2. your OpenRouter API key (from https://openrouter.ai/keys), checked with
+   OpenRouter before it is kept; `OPENROUTER_API_KEY`, when set, is used
+   and checked instead;
+3. the main model: search OpenRouter's live model list by name or maker
+   and pick a number. Each line shows the context size, the price per
+   million tokens and 🖼 for models that see images. Only models that can
+   call tools are listed, since the agent needs them; any other id can be
+   typed in full;
+4. if that model cannot see images, whether to pick an image model for
+   pictures people send and browser screenshots (`agent.vision_model`).
+
+It also says whether a browser was found. There is no default model and
+nothing is picked for you. Running `chat`, `ask` or `serve` in a terminal
+before setting up starts `init` on its own and then carries on; without a
+terminal (a service, a pipe) they stop with a message pointing to `init`.
+Run it again any time to change these; everything else is in
+`openclaw-rs config`, and settings already in the file are kept.
+
+```sh
 ./target/release/openclaw-rs ask "hello"
 ./target/release/openclaw-rs chat --session work
 ./target/release/openclaw-rs sessions
@@ -44,8 +70,10 @@ cargo build --release
 
 ## Configuration
 
+`openclaw-rs init` sets up what a first run needs (see [Usage](#usage)).
+
 `openclaw-rs config` edits `<state dir>/config.toml` interactively, section by
-section (model and context, tools, gateway, QQ, email, web search, access).
+section (model and context, tools, gateway, QQ, email, web search, browser, access).
 Each field shows the value in effect; Enter keeps it, `-` resets it to the
 default, `?` explains it. Secrets are typed without echo and the prompt says
 when an environment variable overrides them; `+` generates a Gateway token.
@@ -131,8 +159,22 @@ message:
 During that message's turn the model sees the images (PNG, JPEG, GIF, WebP up
 to 5 MB, four per message), text files up to 16 KB inline, and a list of
 every file with its workspace path, so tools can open the rest. Later turns
-only get the list. A model without image input is retried once with the
-files only listed. Limits: 20 MB per file, ten files per message.
+only get the list. Limits: 20 MB per file, ten files per message.
+
+Images are looked at by the main model (`model.model`). If it has no image
+input, set an image model yourself; nothing picks one for you:
+
+```toml
+[agent]
+vision_model = "..."   # any OpenRouter model with image input; default: the main model
+```
+
+Only the model calls that carry images (the turn a file arrives in, and
+browser screenshots) go to `vision_model`; everything else stays on the main
+model. When the model given the images refuses them, the call is retried
+once with the files only listed, and the reply ends with a note in your
+language saying the images were not looked at and to set (or change)
+`agent.vision_model`.
 
 ## Stopping a turn
 
@@ -204,6 +246,63 @@ The providers work as in [Command auto-review](#command-auto-review). The
 decision model sees the original request, the last step (the assistant's
 text and its tool calls and results, each cut to 600 characters) and the
 waiting messages.
+
+## Browser
+
+The `browser` tool lets the agent use real web pages: ones that need
+JavaScript, clicking through, or filling in a form. No browser is bundled
+and nothing is downloaded: it drives a Chromium-family browser already
+installed on the host over the DevTools protocol, so the binary stays the
+same size and a host without a browser simply has no `browser` tool.
+
+```sh
+apk add chromium              # Alpine / Raspberry Pi
+apt install chromium          # Debian, Raspberry Pi OS
+# macOS: Chrome, Edge, Brave or Chromium in /Applications is found as is
+```
+
+It looks for `chromium`, `chromium-browser`, `google-chrome(-stable)`,
+`microsoft-edge(-stable)` and `brave(-browser)` on `PATH`, then the macOS app
+bundles, once at startup (restart after installing one). The browser starts
+on first use, headless, with its own profile in `<state dir>/browser` (so it
+never touches your own browsing profile), and is closed again after
+`idle_secs` without use. If the Gateway dies the browser is ended with it.
+
+Each conversation has its own tab that keeps its page between calls. The
+model can `open` an http(s) address (`file:`, `chrome:` and script URLs are
+refused), `read` the page (title, URL, text paged by `max_chars`, and its
+links, buttons and fields numbered), `click` or `type` into an element by
+its number or a CSS selector (`submit` presses Enter), go `back`, and take a
+`screenshot`, saved under `screenshots/` in the workspace (PNG, or JPEG for
+`full_page`, up to 8000 px tall).
+
+The model looks at its screenshots, so it can read layouts, charts and
+pictures the page text does not carry. During the turn that took them, the
+latest two are sent as images, each right after the tool result that saved
+it, in a note marked as automatic rather than from the user; it is not
+stored, and later turns only see the path. They go to `agent.vision_model` when it is
+set, and a model without image input gets them only listed, as with
+[images sent by people](#images-and-files).
+
+```toml
+[browser]
+enabled = true
+# executable = "/usr/bin/chromium-browser"   # default: found on PATH
+# cdp_url = "http://127.0.0.1:9222"          # use a browser you started with --remote-debugging-port=9222
+headless = true
+args = []                                    # e.g. ["--proxy-server=socks5://127.0.0.1:1080"]
+timeout_secs = 30                            # per action
+idle_secs = 300
+max_chars = 8000
+```
+
+With `cdp_url` nothing is started: the agent opens its tabs in that browser,
+with its logins, and closes them again when idle. Only use that with a
+browser profile you are happy for the agent to act in.
+
+The browser can reach anything the host can, including pages on your local
+network, so it is the `browser` [capability](#access): the owner has it,
+guests do not unless granted.
 
 ## Scheduled jobs
 
@@ -360,7 +459,7 @@ guest = ["web_search"]               # what any other sender may use
 ```
 
 Capabilities: `shell`, `files_read` (`read_file`, `list_dir`), `files_write`,
-`memory`, `cron`, `identity`, `web_search`. `shell`, `files_write` and
+`memory`, `cron`, `identity`, `web_search`, `browser`. `shell`, `files_write` and
 `identity` still follow `tools.shell`, `tools.write` and `tools.identity`, and
 `ask` is still declined where nobody can approve.
 
@@ -519,7 +618,7 @@ and nothing is touched.
 
 ```toml
 [model]
-model = "openrouter/auto"            # any OpenRouter model id
+model = "..."                        # required: any OpenRouter model id
 base_url = "https://openrouter.ai/api/v1"
 request_timeout_secs = 300
 # fallbacks = ["openai/gpt-x"]       # OpenRouter tries these when `model` fails
@@ -531,6 +630,7 @@ system_prompt = "You are a helpful personal assistant running on OpenClaw."
 max_steps = 25       # model calls per turn before giving up
 context_tokens = 64000  # token budget per model call; keep below the model's window
 # summary_model = "..."  # model that writes the context summary; default: model.model
+# vision_model = "..."   # model for calls with images; default: model.model
 
 [tools]
 # workspace = "/path"   # default: <state dir>/workspace
@@ -560,7 +660,8 @@ drained while the command runs and only their first and last
 `max_output_bytes / 2` bytes are kept, so endless output cannot exhaust memory;
 the result says how many bytes were omitted. `ask` prompts on the controlling terminal; with no terminal
 the action is declined and the model is told so. Tools set to `deny` are not
-offered to the model at all.
+offered to the model at all. `browser` is offered when the host has a
+browser installed; see [Browser](#browser).
 
 ## Reliability, caching and cost
 

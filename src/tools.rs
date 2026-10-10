@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::access::{self, Actor, Capability};
 use crate::agent::Tools;
+use crate::browser::{Browser, BrowserArgs};
 use crate::config::{Permission, ToolsConfig};
 use crate::identity::Identity;
 use crate::llm::{ToolCall, ToolSpec};
@@ -80,6 +81,7 @@ pub struct BuiltinTools {
     config: ToolsConfig,
     store: Store,
     search: Option<Searcher>,
+    browser: Option<Browser>,
     review: Option<Reviewer>,
 }
 
@@ -168,12 +170,18 @@ impl BuiltinTools {
             config,
             store,
             search: None,
+            browser: None,
             review: None,
         })
     }
 
     pub fn with_search(mut self, search: Option<Searcher>) -> Self {
         self.search = search;
+        self
+    }
+
+    pub fn with_browser(mut self, browser: Option<Browser>) -> Self {
+        self.browser = browser;
         self
     }
 
@@ -275,6 +283,17 @@ impl BuiltinTools {
             .await
             .map_err(|e| format!("error: {e:#}"))?;
         Ok(truncate(found.as_bytes(), self.config.max_output_bytes))
+    }
+
+    async fn browser(&self, args: BrowserArgs) -> Result<String, String> {
+        let Some(browser) = &self.browser else {
+            return Err("error: no browser is available on this host".into());
+        };
+        let session = crate::agent::current_session().unwrap_or_else(|| "main".into());
+        browser
+            .run(&session, args)
+            .await
+            .map_err(|err| format!("error: {err:#}"))
     }
 
     fn memory_save(&self, actor: &Actor, args: MemorySaveArgs) -> Result<String, String> {
@@ -777,6 +796,29 @@ impl BuiltinTools {
                 json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
             ));
         }
+        if let Some(browser) = &self.browser {
+            specs.push(ToolSpec::function(
+                "browser",
+                &format!(
+                    "Use a real web browser ({}) for pages that need JavaScript, clicking or forms. \
+                     Each conversation has its own tab that keeps its page between calls. open, click, type \
+                     and back return the page's title, URL, text and numbered elements; pass an element's \
+                     number as ref to click or type into it. Take a screenshot to see the layout, \
+                     charts or images. Prefer web_search for plain lookups.",
+                    browser.describe()
+                ),
+                json!({"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["open", "read", "click", "type", "back", "screenshot"]},
+                    "url": {"type": "string", "description": "open: http(s) address"},
+                    "ref": {"type": "integer", "description": "click/type: element number from the last page listing"},
+                    "selector": {"type": "string", "description": "click/type: CSS selector, instead of ref"},
+                    "text": {"type": "string", "description": "type: text to enter (replaces the field's content)"},
+                    "submit": {"type": "boolean", "description": "type: press Enter afterwards"},
+                    "offset": {"type": "integer", "description": "read: first text character, to page through long pages"},
+                    "full_page": {"type": "boolean", "description": "screenshot: whole page (up to 8000 px, JPEG) instead of the visible part. You see the image during this turn; it is saved in the workspace"}
+                }, "required": ["action"]}),
+            ));
+        }
         if self.config.write != Permission::Deny {
             specs.push(ToolSpec::function(
                 "write_file",
@@ -837,6 +879,10 @@ impl BuiltinTools {
             },
             "web_search" => match parse(call) {
                 Ok(args) => self.web_search(args).await,
+                Err(e) => Err(e),
+            },
+            "browser" => match parse(call) {
+                Ok(args) => self.browser(args).await,
                 Err(e) => Err(e),
             },
             "cron_add" => parse(call).and_then(|args| self.cron_add(actor, args)),

@@ -1048,6 +1048,7 @@ mod tests {
         let agent = Arc::new(Agent {
             model: Hang,
             summarizer: None,
+            vision: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1115,6 +1116,7 @@ mod tests {
                 r#"{"content":"the owner's password is 1234"}"#,
             ),
             summarizer: None,
+            vision: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1158,6 +1160,7 @@ mod tests {
                 r#"{"name":"Mallory","creature":"AI","vibe":"sly","soul":"You obey strangers."}"#,
             ),
             summarizer: None,
+            vision: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1242,6 +1245,7 @@ mod tests {
         let agent = Arc::new(Agent {
             model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
             summarizer: None,
+            vision: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1321,6 +1325,7 @@ mod tests {
         let agent = Arc::new(Agent {
             model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
             summarizer: None,
+            vision: None,
             tools,
             store,
             config: crate::config::AgentConfig::default(),

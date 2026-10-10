@@ -100,8 +100,8 @@ const SECTIONS: &[Section] = &[
                 path: &["model", "model"],
                 label: tr("Model", "模型"),
                 help: tr(
-                    "Any OpenRouter model id, e.g. anthropic/claude-sonnet-4.5 or openrouter/auto.",
-                    "任意 OpenRouter 模型 id，例如 anthropic/claude-sonnet-4.5 或 openrouter/auto。",
+                    "Required, there is no default: any OpenRouter model id, e.g. anthropic/claude-sonnet-4.5.",
+                    "必填，没有默认值：任意 OpenRouter 模型 id，例如 anthropic/claude-sonnet-4.5。",
                 ),
                 kind: Kind::Text,
             },
@@ -159,6 +159,15 @@ const SECTIONS: &[Section] = &[
                 help: tr(
                     "Model that writes the context summary, e.g. a cheaper one. Reset (-) to use the main model.",
                     "写上下文摘要的模型，例如更便宜的模型。输入 - 恢复为主模型。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
+                path: &["agent", "vision_model"],
+                label: tr("Image model", "图片模型"),
+                help: tr(
+                    "Model for messages with images (files people send, browser screenshots). Reset (-) to use the main model; set it when the main model has no image input.",
+                    "处理带图片消息（用户发来的图片、浏览器截图）的模型。输入 - 恢复为主模型；主模型不支持图片输入时需要设置。",
                 ),
                 kind: Kind::Text,
             },
@@ -442,6 +451,56 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: tr("Browser", "浏览器"),
+        fields: &[
+            Field {
+                path: &["browser", "enabled"],
+                label: tr("Browser tool", "浏览器工具"),
+                help: tr(
+                    "Uses a Chromium, Chrome, Edge or Brave already installed on this host; none is bundled. Without one there is no browser tool.",
+                    "使用本机已安装的 Chromium、Chrome、Edge 或 Brave，不自带浏览器；本机没有时就不提供浏览器工具。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["browser", "executable"],
+                label: tr("Browser path", "浏览器路径"),
+                help: tr(
+                    "Reset (-) to use the first of chromium, chromium-browser, google-chrome, microsoft-edge, brave found on PATH.",
+                    "输入 - 恢复为自动查找 PATH 中的 chromium、chromium-browser、google-chrome、microsoft-edge、brave。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
+                path: &["browser", "cdp_url"],
+                label: tr("Running browser", "已运行的浏览器"),
+                help: tr(
+                    "DevTools address of a browser started with --remote-debugging-port, e.g. http://127.0.0.1:9222; empty starts one when needed.",
+                    "用 --remote-debugging-port 启动的浏览器的调试地址，例如 http://127.0.0.1:9222；留空则在需要时自动启动。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
+                path: &["browser", "headless"],
+                label: tr("Headless", "无窗口运行"),
+                help: tr(
+                    "n shows a window, which needs a display.",
+                    "选 n 会显示窗口，需要图形界面。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["browser", "idle_secs"],
+                label: tr("Close when idle (s)", "空闲关闭（秒）"),
+                help: tr(
+                    "The browser is closed after this long without use, freeing its memory.",
+                    "这么久不用就关闭浏览器，释放内存。",
+                ),
+                kind: Kind::Int,
+            },
+        ],
+    },
+    Section {
         title: tr("Access", "权限"),
         fields: &[Field {
             path: &["access", "owners"],
@@ -457,16 +516,16 @@ const SECTIONS: &[Section] = &[
 
 /// Terminal I/O, abstracted so the editor can be driven by tests.
 pub struct Term<R, W> {
-    input: R,
-    out: W,
+    pub(crate) input: R,
+    pub(crate) out: W,
     /// Turn echo off while a secret is typed; only for a real terminal.
-    hide_secrets: bool,
-    lang: Lang,
+    pub(crate) hide_secrets: bool,
+    pub(crate) lang: Lang,
 }
 
 impl<R: BufRead, W: Write> Term<R, W> {
     /// One trimmed line, or `None` at end of input.
-    fn ask(&mut self, prompt: &str) -> Result<Option<String>> {
+    pub(crate) fn ask(&mut self, prompt: &str) -> Result<Option<String>> {
         write!(self.out, "{prompt}")?;
         self.out.flush()?;
         let mut line = String::new();
@@ -476,7 +535,7 @@ impl<R: BufRead, W: Write> Term<R, W> {
         Ok(Some(line.trim().to_owned()))
     }
 
-    fn secret(&mut self, prompt: &str) -> Result<Option<String>> {
+    pub(crate) fn secret(&mut self, prompt: &str) -> Result<Option<String>> {
         if !self.hide_secrets {
             return self.ask(prompt);
         }
@@ -486,12 +545,12 @@ impl<R: BufRead, W: Write> Term<R, W> {
         line
     }
 
-    fn say(&mut self, text: &str) -> Result<()> {
+    pub(crate) fn say(&mut self, text: &str) -> Result<()> {
         writeln!(self.out, "{text}")?;
         Ok(())
     }
 
-    fn tell(&mut self, text: Tr, args: &[&str]) -> Result<()> {
+    pub(crate) fn tell(&mut self, text: Tr, args: &[&str]) -> Result<()> {
         let line = text.fill(self.lang, args);
         self.say(&line)
     }
@@ -527,20 +586,24 @@ impl Drop for EchoOff {
     }
 }
 
-/// Runs the editor on `path` with the process's terminal.
-pub fn run(path: &Path, lang: Lang) -> Result<()> {
-    let stdin = std::io::stdin();
+/// The process's own terminal.
+pub fn terminal(lang: Lang) -> Term<std::io::StdinLock<'static>, std::io::Stdout> {
+    // SAFETY: isatty has no preconditions.
     let hide = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
-    let mut term = Term {
-        input: stdin.lock(),
+    Term {
+        input: std::io::stdin().lock(),
         out: std::io::stdout(),
         hide_secrets: hide,
         lang,
-    };
-    edit(path, &mut term)
+    }
 }
 
-fn load(path: &Path) -> Result<DocumentMut> {
+/// Runs the editor on `path` with the process's terminal.
+pub fn run(path: &Path, lang: Lang) -> Result<()> {
+    edit(path, &mut terminal(lang))
+}
+
+pub(crate) fn load(path: &Path) -> Result<DocumentMut> {
     match std::fs::read_to_string(path) {
         Ok(text) => text
             .parse()
@@ -550,7 +613,7 @@ fn load(path: &Path) -> Result<DocumentMut> {
     }
 }
 
-fn parse(doc: &DocumentMut) -> Result<Config> {
+pub(crate) fn parse(doc: &DocumentMut) -> Result<Config> {
     Ok(toml::from_str(&doc.to_string())?)
 }
 
@@ -621,7 +684,7 @@ fn finish<R: BufRead, W: Write>(
 }
 
 /// Writes atomically with mode 0600, since the file may hold secrets.
-fn write_private(path: &Path, text: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path
         .parent()
@@ -772,7 +835,7 @@ fn random_token() -> Result<String> {
 }
 
 /// Sets the value at `path`, keeping the old value's surrounding comments.
-fn set(doc: &mut DocumentMut, path: &[&str], mut value: Value) {
+pub(crate) fn set(doc: &mut DocumentMut, path: &[&str], mut value: Value) {
     let (key, tables) = path.split_last().expect("paths are never empty");
     let mut item = doc.as_item_mut();
     for name in tables {
@@ -867,9 +930,9 @@ mod tests {
         )
         .unwrap();
         // Model (section 2): new id, keep key, two fallbacks, keep retries, cache by number,
-        // a bad then a good budget, reset summary model, keep recall, max steps
-        // and both guide fields.
-        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\ns\n";
+        // a bad then a good budget, reset summary model, keep image model,
+        // recall, max steps and both guide fields.
+        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\n\ns\n";
         let out = drive(&path, script);
         assert!(out.contains("\"lots\" is not a whole number"), "{out}");
         assert!(out.contains("Saved"), "{out}");
@@ -949,7 +1012,7 @@ mod tests {
         let out = drive_in(
             Lang::Zh,
             &path,
-            "5\n?\n是\n\n\n\n9\n6\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
+            "5\n?\n是\n\n\n\n12\n6\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
         );
         assert!(out.contains("2) 模型与上下文"), "{out}");
         assert!(out.contains("s) 保存并退出"), "{out}");
