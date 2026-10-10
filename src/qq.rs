@@ -134,6 +134,17 @@ impl QqBot {
         }))
     }
 
+    /// Logs in and asks for the event gateway, as `run` does: `doctor`'s
+    /// proof that the app id, secret and permissions work.
+    pub async fn check(&self) -> Result<String> {
+        self.access_token().await?;
+        let gateway = self.api(reqwest::Method::GET, "/gateway/bot", None).await?;
+        Ok(match gateway["shards"].as_u64() {
+            Some(shards) => format!("logged in, gateway ready ({shards} shard)"),
+            None => "logged in, gateway ready".into(),
+        })
+    }
+
     /// Cached access token, renewed a minute before it expires.
     async fn access_token(&self) -> Result<String> {
         let mut cached = self.token.lock().await;

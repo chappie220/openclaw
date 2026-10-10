@@ -137,6 +137,13 @@ const COMMANDS: &[(&str, Tr)] = &[
         tr("Delete a fact by id", "按编号删除一条记忆"),
     ),
     (
+        "doctor",
+        tr(
+            "Check that the key, models, browser, channels and service work",
+            "检查 key、模型、浏览器、各渠道和服务是否正常",
+        ),
+    ),
+    (
         "init",
         tr(
             "Guided first-time setup: language, OpenRouter key, model",
@@ -209,6 +216,14 @@ const ARGS: &[(&str, &str, Tr)] = &[
     ("*", "version", tr("Print version", "显示版本")),
     ("*", "session", tr("Session name", "会话名")),
     ("ask", "message", tr("Message to send", "要发送的消息")),
+    (
+        "doctor",
+        "offline",
+        tr(
+            "Only read the config and this host; contact nothing",
+            "只检查配置和本机，不联网",
+        ),
+    ),
     (
         "ask",
         "attach",

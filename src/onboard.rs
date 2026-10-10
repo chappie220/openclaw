@@ -39,7 +39,8 @@ pub struct ModelInfo {
 /// What checking an API key found.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyCheck {
-    Valid,
+    /// Accepted; the detail says how much credit is used or left, when known.
+    Valid(Option<String>),
     /// The server refused it; the text says why.
     Invalid(String),
     /// It could not be checked (offline, another server).
@@ -82,7 +83,10 @@ impl Catalog for OpenRouter {
             .send()
             .await;
         match response {
-            Ok(r) if r.status().is_success() => KeyCheck::Valid,
+            Ok(r) if r.status().is_success() => {
+                let body: Json = r.json().await.unwrap_or_default();
+                KeyCheck::Valid(credit(&body))
+            }
             Ok(r) if matches!(r.status().as_u16(), 401 | 403) => {
                 let status = r.status();
                 let body: Json = r.json().await.unwrap_or_default();
@@ -107,6 +111,16 @@ impl Catalog for OpenRouter {
             .json()
             .await?;
         Ok(parse_models(&body))
+    }
+}
+
+/// Credit left on a key (or spent, for keys without a limit), from `/key`.
+fn credit(body: &Json) -> Option<String> {
+    let number = |k: &str| body.pointer(&format!("/data/{k}")).and_then(Json::as_f64);
+    match (number("limit_remaining"), number("usage")) {
+        (Some(left), _) => Some(format!("${left:.2} left")),
+        (None, Some(used)) => Some(format!("${used:.2} used, no limit")),
+        _ => None,
     }
 }
 
@@ -347,7 +361,7 @@ pub async fn wizard<R: BufRead, W: Write>(
             term.tell(KEY_FROM_ENV, &[])?;
             term.tell(KEY_CHECKING, &[])?;
             match catalog.check_key(&key).await {
-                KeyCheck::Valid => term.tell(KEY_OK, &[])?,
+                KeyCheck::Valid(_) => term.tell(KEY_OK, &[])?,
                 KeyCheck::Invalid(why) => {
                     term.tell(KEY_ENV_BAD, &[&why])?;
                     return aborted(term);
@@ -383,7 +397,7 @@ pub async fn wizard<R: BufRead, W: Write>(
                 };
                 term.tell(KEY_CHECKING, &[])?;
                 match catalog.check_key(&key).await {
-                    KeyCheck::Valid => term.tell(KEY_OK, &[])?,
+                    KeyCheck::Valid(_) => term.tell(KEY_OK, &[])?,
                     KeyCheck::Invalid(why) => {
                         term.tell(KEY_BAD, &[&why])?;
                         continue;
@@ -623,7 +637,7 @@ mod tests {
         async fn check_key(&self, key: &str) -> KeyCheck {
             self.checked.lock().unwrap().push(key.to_owned());
             if key == self.valid {
-                KeyCheck::Valid
+                KeyCheck::Valid(None)
             } else {
                 KeyCheck::Invalid("HTTP 401".into())
             }
@@ -761,6 +775,10 @@ mod tests {
         );
         assert!(!models[1].tools && models[1].price.is_none());
         assert_eq!(money(0.004), "0.004");
+        let key = serde_json::json!({"data": {"limit_remaining": 4.5, "usage": 5.5}});
+        assert_eq!(credit(&key).as_deref(), Some("$4.50 left"));
+        let key = serde_json::json!({"data": {"limit_remaining": null, "usage": 1.25}});
+        assert_eq!(credit(&key).as_deref(), Some("$1.25 used, no limit"));
         assert_eq!(money(2.5), "2.5");
         assert_eq!(search(&models, "", false).len(), 1);
     }

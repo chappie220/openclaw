@@ -82,6 +82,37 @@ before it is accepted, and the file is saved with mode 0600. It also opens a
 file that currently fails to load, so it can be repaired. The full list of
 options is under [Memory](#memory) below.
 
+## Checking the setup
+
+```sh
+openclaw-rs doctor             # everything, including two tiny model calls
+openclaw-rs doctor --offline   # only the config and this host
+```
+
+`doctor` checks what is configured and says, for each problem, what to
+change. Each line is ✓ (works), ! (works, but read this), ✗ (broken) or ·
+(for information); it exits with status 1 when anything is broken, so it
+can run from a script.
+
+- Config: the file loads, the workspace is writable.
+- Models: a model and a key are set; OpenRouter accepts the key (and how
+  much credit is left); every configured model id (`model.model`,
+  `agent.summary_model`, `agent.vision_model`, `search.model`) is on
+  OpenRouter's list; the main model can call tools; something can see
+  images. Then two real calls, a few hundred tokens: the main model is asked
+  to call a tool, and the image model is shown a small red picture and
+  asked its colour.
+- Browser: which one was found, and that it starts and opens a page (in a
+  scratch profile, closed again right after).
+- Web search: SearXNG answers with JSON.
+- Gateway: an address other hosts can reach has a token (else `serve`
+  refuses to start), and whether a Gateway is running.
+- QQ and email, when enabled: QQ logs in and gets its gateway; email logs
+  in over IMAP and SMTP, as `mail check` does.
+- Access and service: owners are set when QQ or email is on; whether the
+  OpenRC service is installed. The service runs as its own account, so run
+  `doctor` as that account to check its config.
+
 ## Shell completion
 
 ```sh

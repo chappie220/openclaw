@@ -9,6 +9,7 @@ mod completions;
 mod config;
 mod context;
 mod cron;
+mod doctor;
 mod gateway;
 mod guide;
 mod i18n;
@@ -103,6 +104,12 @@ enum Command {
     },
     /// Guided first-time setup: language, OpenRouter key, model.
     Init,
+    /// Check that the key, models, browser, channels and service work.
+    Doctor {
+        /// Only read the config and this host; contact nothing.
+        #[arg(long)]
+        offline: bool,
+    },
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
     Config,
     /// Print a shell completion script: bash, zsh, fish, elvish or powershell.
@@ -309,6 +316,12 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Config = cli.command {
         return setup::run(&config_path, i18n::current());
     }
+    if let Command::Doctor { offline } = cli.command {
+        if !doctor::run(&config_path, &state, offline).await? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if let Command::Init = cli.command {
         onboard::run(&config_path, i18n::current()).await?;
         return Ok(());
@@ -363,7 +376,9 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
-        Command::Config | Command::Init => unreachable!("handled before the config is loaded"),
+        Command::Config | Command::Init | Command::Doctor { .. } => {
+            unreachable!("handled before the config is loaded")
+        }
         Command::Completions { .. } => unreachable!("handled before state is opened"),
         Command::Serve { bind } => {
             if store.identity()?.is_none() {
