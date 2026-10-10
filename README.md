@@ -232,7 +232,16 @@ model can `open` an http(s) address (`file:`, `chrome:` and script URLs are
 refused), `read` the page (title, URL, text paged by `max_chars`, and its
 links, buttons and fields numbered), `click` or `type` into an element by
 its number or a CSS selector (`submit` presses Enter), go `back`, and take a
-`screenshot`, saved as PNG under `screenshots/` in the workspace.
+`screenshot`, saved under `screenshots/` in the workspace (PNG, or JPEG for
+`full_page`, up to 8000 px tall).
+
+The model looks at its screenshots, so it can read layouts, charts and
+pictures the page text does not carry. During the turn that took them, the
+latest two are sent as images, each right after the tool result that saved
+it, in a note marked as automatic rather than from the user; it is not
+stored, and later turns only see the path. A model without image input is
+retried once with the screenshots only listed, as with
+[images sent by people](#images-and-files).
 
 ```toml
 [browser]

@@ -528,7 +528,15 @@ impl<M: Model, T: Tools> Agent<M, T> {
             .skip(turn_start.unwrap_or(ctx.messages.len()))
             .filter(|(_, m)| m.role == Role::User)
             .map(|(_, m)| crate::attachments::show_tokens(&m.attachments))
-            .sum::<usize>();
+            .sum::<usize>()
+            + ctx
+                .messages
+                .iter()
+                .skip(turn_start.unwrap_or(ctx.messages.len()))
+                .filter(|(_, m)| is_tool_image(m))
+                .count()
+                .min(MAX_TOOL_IMAGES)
+                * crate::attachments::IMAGE_TOKENS;
         let overhead = context::estimate(system)
             + context::estimate(tool_json)
             + recall.map_or(0, context::estimate)
@@ -582,6 +590,11 @@ impl<M: Model, T: Tools> Agent<M, T> {
                 text.push_str("\n[This model cannot see images; they are only listed.]");
             }
         }
+        if let Some(current) = current
+            && send_images
+        {
+            self.show_tool_images(&mut messages, current);
+        }
         if let Some(recall) = recall
             && let Some(current) = current.and_then(|i| messages.get_mut(i))
         {
@@ -596,7 +609,55 @@ impl<M: Model, T: Tools> Agent<M, T> {
             .chain(messages)
             .collect())
     }
+
+    /// Shows the model the latest images tools made during this turn
+    /// (browser screenshots): each goes in a message of its own right after
+    /// the tool results it came with, for this call only. Tool messages
+    /// cannot carry images for every provider, and later turns only see the
+    /// tool's text.
+    fn show_tool_images(&self, messages: &mut Vec<ChatMessage>, current: usize) {
+        let made: Vec<usize> = (current..messages.len())
+            .filter(|&i| is_tool_image(&messages[i]))
+            .collect();
+        let shown = &made[made.len().saturating_sub(MAX_TOOL_IMAGES)..];
+        // From the last, so the indices still to come stay valid; images
+        // after the same results keep their order.
+        for &index in shown.iter().rev() {
+            let content = messages[index].content.as_deref().unwrap_or_default();
+            let path = crate::attachments::tool_image(content)
+                .unwrap_or_default()
+                .to_owned();
+            let mut message = ChatMessage::user("");
+            let note = match crate::attachments::image_data_url(&self.config.workspace, &path) {
+                Ok(url) => {
+                    message.images = vec![url];
+                    format!("{TOOL_IMAGE_NOTE} {path}]")
+                }
+                Err(why) => format!("{TOOL_IMAGE_NOTE} {path}; not shown: {why}]"),
+            };
+            message.content = Some(note);
+            let mut at = index + 1;
+            while messages.get(at).is_some_and(|m| m.role == Role::Tool) {
+                at += 1;
+            }
+            messages.insert(at, message);
+        }
+    }
 }
+
+fn is_tool_image(message: &ChatMessage) -> bool {
+    message.role == Role::Tool
+        && message
+            .content
+            .as_deref()
+            .and_then(crate::attachments::tool_image)
+            .is_some()
+}
+
+/// Images from tools shown per model call; older ones are only listed.
+const MAX_TOOL_IMAGES: usize = 2;
+/// Introduces a tool's image; the model reads it, so it stays in English.
+const TOOL_IMAGE_NOTE: &str = "[Automatic, not from the user: the image a tool call above saved,";
 
 /// Characters of each message the acknowledgement is written from.
 const ACK_CLIP_CHARS: usize = 400;
@@ -1255,6 +1316,98 @@ mod tests {
                 ..AgentConfig::default()
             },
         }
+    }
+
+    /// Saves a numbered "screenshot" per call, as the browser tool does.
+    struct Camera(std::path::PathBuf, std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl Tools for Camera {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        async fn call(&self, _call: &ToolCall) -> String {
+            let n = self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = format!("screenshots/{n}.png");
+            std::fs::create_dir_all(self.0.join("screenshots")).unwrap();
+            std::fs::write(self.0.join(&path), [n as u8]).unwrap();
+            format!(
+                "{}\nScreenshot saved.",
+                crate::attachments::tool_image_line(&path)
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn the_latest_tool_images_are_shown_in_their_turn_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent {
+            model: Playback {
+                script: Mutex::new(vec![
+                    echo_call("a"),
+                    echo_call("b"),
+                    echo_call("c"),
+                    answer("seen"),
+                    answer("later"),
+                ]),
+                seen: Mutex::new(Vec::new()),
+            },
+            summarizer: None,
+            tools: Camera(dir.path().to_owned(), Default::default()),
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig {
+                workspace: dir.path().to_owned(),
+                ..AgentConfig::default()
+            },
+        };
+        let actor = || Actor::owner(access::CLI);
+        agent
+            .run_turn(actor(), "s", "look", &mut |_| {})
+            .await
+            .unwrap();
+        agent
+            .run_turn(actor(), "s", "thanks", &mut |_| {})
+            .await
+            .unwrap();
+        let seen = agent.model.seen.lock().unwrap();
+
+        // Each image follows the tool result that saved it, as a note of its own.
+        let first = &seen[1];
+        let at = first.iter().position(|m| !m.images.is_empty()).unwrap();
+        assert_eq!(first[at - 1].role, Role::Tool);
+        assert_eq!(first[at].role, Role::User);
+        assert!(
+            first[at]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("screenshots/0.png")
+        );
+        assert_eq!(first[at].images, ["data:image/png;base64,AA=="]);
+
+        // Only the latest two of the turn are shown.
+        let last = &seen[3];
+        let shown: Vec<&str> = last
+            .iter()
+            .filter(|m| !m.images.is_empty())
+            .map(|m| m.content.as_deref().unwrap())
+            .collect();
+        assert_eq!(shown.len(), 2);
+        assert!(
+            shown[0].contains("1.png") && shown[1].contains("2.png"),
+            "{shown:?}"
+        );
+
+        // The next turn only has the tool's text, and nothing extra was stored.
+        assert!(seen[4].iter().all(|m| m.images.is_empty()));
+        let id = agent.store.session_id("s").unwrap();
+        let history = agent.store.history(id, 50).unwrap();
+        assert!(history.iter().all(|m| {
+            !m.content
+                .as_deref()
+                .unwrap_or("")
+                .starts_with(TOOL_IMAGE_NOTE)
+        }));
     }
 
     fn guided(rating: f64, max_wait_steps: usize, waiting: &[&str]) -> Guided {

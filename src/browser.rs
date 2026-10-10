@@ -43,6 +43,9 @@ const APPS: &[&str] = &[
     "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
 ];
 
+/// Where screenshots are saved, relative to the workspace.
+const SCREENSHOTS: &str = "screenshots";
+
 /// Interactive elements listed per page, so the list stays readable.
 const MAX_ELEMENTS: usize = 150;
 
@@ -51,7 +54,7 @@ pub struct Browser {
     /// The browser to start; `None` when attaching to `cdp_url`.
     executable: Option<PathBuf>,
     profile: PathBuf,
-    screenshots: PathBuf,
+    workspace: PathBuf,
     running: Arc<Mutex<Option<Running>>>,
     last_used: Arc<SyncMutex<Instant>>,
 }
@@ -98,7 +101,7 @@ impl Browser {
             config: config.clone(),
             executable,
             profile: state.join("browser"),
-            screenshots: workspace.join("screenshots"),
+            workspace: workspace.to_owned(),
             running: Arc::new(Mutex::new(None)),
             last_used: Arc::new(SyncMutex::new(Instant::now())),
         })
@@ -310,17 +313,22 @@ impl Browser {
                 self.snapshot(cdp, &tab, 0).await
             }
             "screenshot" => {
-                let mut params = json!({"format": "png"});
-                if args.full_page {
+                // A whole page is large, so it goes as JPEG; providers also
+                // refuse images taller than about 8000 px.
+                let (format, params) = if args.full_page {
                     let metrics = cdp
                         .call(Some(&tab), "Page.getLayoutMetrics", json!({}))
                         .await?;
                     let size = metrics.get("cssContentSize").cloned().unwrap_or_default();
                     let dim = |k: &str| size.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-                    params = json!({"format": "png", "captureBeyondViewport": true, "clip": {
-                        "x": 0, "y": 0, "width": dim("width"), "height": dim("height").min(16384.0), "scale": 1
-                    }});
-                }
+                    let clip = json!({"x": 0, "y": 0, "width": dim("width"),
+                                      "height": dim("height").min(8000.0), "scale": 1});
+                    let params = json!({"format": "jpeg", "quality": 80,
+                                        "captureBeyondViewport": true, "clip": clip});
+                    ("jpg", params)
+                } else {
+                    ("png", json!({"format": "png"}))
+                };
                 let shot = cdp
                     .call(Some(&tab), "Page.captureScreenshot", params)
                     .await?;
@@ -329,16 +337,18 @@ impl Browser {
                     .and_then(Value::as_str)
                     .context("the browser returned no image")?;
                 use base64::Engine;
-                let png = base64::engine::general_purpose::STANDARD.decode(data)?;
-                tokio::fs::create_dir_all(&self.screenshots).await?;
-                let path = self.screenshots.join(format!(
-                    "{}.png",
+                let image = base64::engine::general_purpose::STANDARD.decode(data)?;
+                tokio::fs::create_dir_all(self.workspace.join(SCREENSHOTS)).await?;
+                let relative = format!(
+                    "{SCREENSHOTS}/{}.{format}",
                     chrono::Local::now().format("%Y%m%d-%H%M%S%.3f")
-                ));
-                tokio::fs::write(&path, &png).await?;
+                );
+                let path = self.workspace.join(&relative);
+                tokio::fs::write(&path, &image).await?;
                 Ok(format!(
-                    "saved screenshot ({} KB) to {}",
-                    png.len() / 1024,
+                    "{}\nScreenshot saved ({} KB) to {}.",
+                    crate::attachments::tool_image_line(&relative),
+                    image.len() / 1024,
                     path.display()
                 ))
             }
@@ -919,8 +929,29 @@ mod live {
         assert!(other.contains("URL: about:blank"), "{other}");
 
         let shot = browser.run("s1", args("screenshot")).await.unwrap();
-        let path = shot.rsplit(' ').next().unwrap();
-        assert!(std::fs::read(path).unwrap().starts_with(b"\x89PNG"));
+        let path = crate::attachments::tool_image(&shot).unwrap();
+        assert!(
+            path.starts_with("screenshots/") && path.ends_with(".png"),
+            "{shot}"
+        );
+        let png = std::fs::read(dir.path().join(path)).unwrap();
+        assert!(png.starts_with(b"\x89PNG"));
+        let full = browser
+            .run(
+                "s1",
+                BrowserArgs {
+                    full_page: true,
+                    ..args("screenshot")
+                },
+            )
+            .await
+            .unwrap();
+        let jpg = std::fs::read(
+            dir.path()
+                .join(crate::attachments::tool_image(&full).unwrap()),
+        )
+        .unwrap();
+        assert!(jpg.starts_with(b"\xff\xd8"));
         let refused = browser
             .run(
                 "s1",

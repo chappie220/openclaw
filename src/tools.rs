@@ -803,7 +803,8 @@ impl BuiltinTools {
                     "Use a real web browser ({}) for pages that need JavaScript, clicking or forms. \
                      Each conversation has its own tab that keeps its page between calls. open, click, type \
                      and back return the page's title, URL, text and numbered elements; pass an element's \
-                     number as ref to click or type into it. Prefer web_search for plain lookups.",
+                     number as ref to click or type into it. Take a screenshot to see the layout, \
+                     charts or images. Prefer web_search for plain lookups.",
                     browser.describe()
                 ),
                 json!({"type": "object", "properties": {
@@ -814,7 +815,7 @@ impl BuiltinTools {
                     "text": {"type": "string", "description": "type: text to enter (replaces the field's content)"},
                     "submit": {"type": "boolean", "description": "type: press Enter afterwards"},
                     "offset": {"type": "integer", "description": "read: first text character, to page through long pages"},
-                    "full_page": {"type": "boolean", "description": "screenshot: whole page instead of the visible part; saved as PNG in the workspace"}
+                    "full_page": {"type": "boolean", "description": "screenshot: whole page (up to 8000 px, JPEG) instead of the visible part. You see the image during this turn; it is saved in the workspace"}
                 }, "required": ["action"]}),
             ));
         }
