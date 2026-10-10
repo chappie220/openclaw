@@ -144,6 +144,13 @@ const COMMANDS: &[(&str, Tr)] = &[
         ),
     ),
     (
+        "completions",
+        tr(
+            "Print a shell completion script: bash, zsh, fish, elvish or powershell",
+            "输出 shell 自动补全脚本：bash、zsh、fish、elvish 或 powershell",
+        ),
+    ),
+    (
         "usage",
         tr(
             "Tokens and cost of model calls, per session",
@@ -283,6 +290,14 @@ const ARGS: &[(&str, &str, Tr)] = &[
     ),
     ("sessions delete", "name", tr("Session name", "会话名")),
     (
+        "completions",
+        "shell",
+        tr(
+            "Shell to complete for; see README \"Shell completion\" for where the script goes",
+            "要补全的 shell；脚本放在哪里见 README 的 \"Shell completion\"",
+        ),
+    ),
+    (
         "help",
         "subcommand",
         tr("The subcommand whose help to show", "要显示帮助的子命令"),
@@ -370,6 +385,26 @@ fn localize(mut cmd: Command, path: &str, lang: Lang) -> Command {
         cmd = cmd.mut_subcommand(&name, |c| localize(c, &sub, lang));
     }
     cmd
+}
+
+/// Writes a completion script for `shell`, registered for the program's
+/// name, with descriptions in the current language.
+pub fn completions<T: CommandFactory>(shell: clap_complete::Shell, lang: Lang) -> String {
+    let mut cmd = command::<T>(lang);
+    let bin = cmd.get_name().to_owned();
+    let mut out = Vec::new();
+    clap_complete::generate(shell, &mut cmd, &bin, &mut out);
+    let script = String::from_utf8_lossy(&out).into_owned();
+    if shell != clap_complete::Shell::Bash {
+        return script;
+    }
+    // clap_complete's bash script spells a hyphenated name two ways: the
+    // state it assigns (`openclaw__rs__subcmd__cron`) and the branch that
+    // should match it (`openclaw__subcmd__rs__subcmd__cron`), so nothing
+    // below the top level would complete. Use the assigned spelling.
+    let assigned = bin.replace('-', "__");
+    let branch = bin.replace('-', "__subcmd__");
+    script.replace(&branch, &assigned)
 }
 
 pub const ERROR: Tr = tr("error: {}", "错误：{}");
@@ -573,6 +608,50 @@ mod tests {
         let en = command::<crate::Cli>(Lang::En).render_help().to_string();
         assert!(en.contains("Interactive chat in the terminal"), "{en}");
         assert!(!en.contains("用法"), "{en}");
+    }
+
+    #[test]
+    fn completion_scripts_cover_every_shell() {
+        use clap_complete::Shell;
+        for lang in [Lang::En, Lang::Zh] {
+            for shell in [
+                Shell::Bash,
+                Shell::Zsh,
+                Shell::Fish,
+                Shell::Elvish,
+                Shell::PowerShell,
+            ] {
+                let script = completions::<crate::Cli>(shell, lang);
+                for word in ["chat", "serve", "usage", "completions", "lang"] {
+                    assert!(script.contains(word), "{shell} lacks {word}");
+                }
+                if lang == Lang::Zh && shell == Shell::Zsh {
+                    assert!(
+                        script.contains("在终端里交互聊天"),
+                        "zsh shows descriptions"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every state the bash script moves to has a branch that handles it.
+    #[test]
+    fn bash_completion_reaches_subcommands() {
+        let script = completions::<crate::Cli>(clap_complete::Shell::Bash, Lang::En);
+        let states: Vec<&str> = script
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("cmd=\""))
+            .filter_map(|l| l.strip_suffix('"'))
+            .filter(|state| !state.is_empty())
+            .collect();
+        assert!(states.contains(&"openclaw__rs__subcmd__cron"));
+        for state in states {
+            assert!(
+                script.contains(&format!("        {state})")),
+                "no branch for {state}"
+            );
+        }
     }
 
     #[test]

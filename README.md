@@ -54,6 +54,34 @@ before it is accepted, and the file is saved with mode 0600. It also opens a
 file that currently fails to load, so it can be repaired. The full list of
 options is under [Memory](#memory) below.
 
+## Shell completion
+
+`openclaw-rs completions <shell>` prints a completion script for bash, zsh,
+fish, elvish or powershell; descriptions follow the [language](#language).
+Install it once (and again after upgrading):
+
+```sh
+# bash (needs the bash-completion package; on Alpine: apk add bash bash-completion)
+openclaw-rs completions bash > /usr/share/bash-completion/completions/openclaw-rs
+# or just for you: openclaw-rs completions bash > ~/.local/share/bash-completion/completions/openclaw-rs
+
+# zsh: any directory in $fpath, before compinit runs
+mkdir -p ~/.zfunc && openclaw-rs completions zsh > ~/.zfunc/_openclaw-rs
+# in ~/.zshrc: fpath=(~/.zfunc $fpath); autoload -U compinit && compinit
+
+# fish
+openclaw-rs completions fish > ~/.config/fish/completions/openclaw-rs.fish
+
+# elvish: in rc.elv
+#   eval (openclaw-rs completions elvish | slurp)
+
+# PowerShell: in $PROFILE
+#   openclaw-rs completions powershell | Out-String | Invoke-Expression
+```
+
+Alpine's default `ash` (BusyBox) has no programmable completion; use bash,
+zsh or fish for it.
+
 ## Language
 
 English and Chinese. CLI output and `--help`, the config editor, and the

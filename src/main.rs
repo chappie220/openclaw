@@ -40,7 +40,7 @@ use crate::tools::{BuiltinTools, TerminalApprover, with_approver};
 #[command(name = "openclaw-rs", version, about = "Single-binary OpenClaw")]
 struct Cli {
     /// Config file (default: <state dir>/config.toml).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_hint = clap::ValueHint::FilePath)]
     config: Option<PathBuf>,
     /// Language of output and help (default: `language` in config.toml, else the locale).
     #[arg(long, global = true, value_enum)]
@@ -95,6 +95,8 @@ enum Command {
     },
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
     Config,
+    /// Print a shell completion script: bash, zsh, fish, elvish or powershell.
+    Completions { shell: clap_complete::Shell },
     /// Tokens and cost of model calls, per session.
     Usage {
         /// How many days back to count.
@@ -171,7 +173,7 @@ enum IdentityAction {
         )]
         soul: Option<String>,
         /// Read the soul from a SOUL.md file.
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         soul_file: Option<PathBuf>,
     },
     /// Forget the identity; the next conversation sets it up again.
@@ -261,6 +263,15 @@ fn startup_lang(args: &[std::ffi::OsString]) -> Lang {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if let Some(lang) = cli.lang {
+        i18n::set(lang);
+    }
+    if let Command::Completions { shell } = cli.command {
+        // Descriptions follow the current language (zsh, fish, elvish and
+        // PowerShell show them); options and commands are the same in all.
+        print!("{}", text::completions::<Cli>(shell, i18n::current()));
+        return Ok(());
+    }
     if let Command::Service { action } = &cli.command {
         return match action {
             ServiceAction::Install { user } => service::install(user),
@@ -270,9 +281,6 @@ async fn run(cli: Cli) -> Result<()> {
     let state = config::state_dir()?;
     let config_path = cli.config.unwrap_or_else(|| state.join("config.toml"));
     // Before loading, so a file that does not load can still be repaired.
-    if let Some(lang) = cli.lang {
-        i18n::set(lang);
-    }
     if let Command::Config = cli.command {
         return setup::run(&config_path, i18n::current());
     }
@@ -315,6 +323,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
         Command::Config => unreachable!("handled before the config is loaded"),
+        Command::Completions { .. } => unreachable!("handled before state is opened"),
         Command::Serve { bind } => {
             if store.identity()?.is_none() {
                 eprintln!("{}", text::FIRST_START.now());
