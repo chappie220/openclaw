@@ -151,6 +151,13 @@ const COMMANDS: &[(&str, Tr)] = &[
         ),
     ),
     (
+        "completions install",
+        tr(
+            "Install completion for your shell, asking before editing its rc file",
+            "为你的 shell 安装自动补全；修改 rc 文件前会先询问",
+        ),
+    ),
+    (
         "usage",
         tr(
             "Tokens and cost of model calls, per session",
@@ -290,11 +297,27 @@ const ARGS: &[(&str, &str, Tr)] = &[
     ),
     ("sessions delete", "name", tr("Session name", "会话名")),
     (
+        "completions install",
+        "shell",
+        tr(
+            "Shell to install for (default: from $SHELL)",
+            "要安装补全的 shell（默认：根据 $SHELL）",
+        ),
+    ),
+    (
+        "completions install",
+        "yes",
+        tr(
+            "Edit the rc file without asking",
+            "不询问，直接修改 rc 文件",
+        ),
+    ),
+    (
         "completions",
         "shell",
         tr(
-            "Shell to complete for; see README \"Shell completion\" for where the script goes",
-            "要补全的 shell；脚本放在哪里见 README 的 \"Shell completion\"",
+            "Shell to print the script for; `completions install` puts it in place for you",
+            "要输出脚本的 shell；用 `completions install` 可以自动安装到正确位置",
         ),
     ),
     (
@@ -408,6 +431,10 @@ pub fn completions<T: CommandFactory>(shell: clap_complete::Shell, lang: Lang) -
 }
 
 pub const ERROR: Tr = tr("error: {}", "错误：{}");
+pub const NAME_A_SHELL: Tr = tr(
+    "name a shell (bash, zsh, fish, elvish, powershell), or run `openclaw-rs completions install`",
+    "请指定 shell（bash、zsh、fish、elvish、powershell），或运行 `openclaw-rs completions install`",
+);
 pub const FIRST_START: Tr = tr(
     "First start: the agent has no identity yet and will ask who it should be. Describe it, or name a fictional character for it to look up and become (e.g. \"be Sun Wukong\"). `openclaw-rs identity set` works too.",
     "首次启动：智能体还没有身份，会先问你它该是谁。描述一下，或者说出一个虚构角色让它去查并成为它（例如“做孙悟空”）。也可以用 `openclaw-rs identity set`。",
@@ -500,6 +527,7 @@ mod tests {
 
     const MESSAGES: &[Tr] = &[
         ERROR,
+        NAME_A_SHELL,
         FIRST_START,
         CHAT_BANNER,
         NOTHING_TO_SEND,

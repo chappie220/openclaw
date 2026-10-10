@@ -3,6 +3,7 @@
 mod access;
 mod agent;
 mod cli_text;
+mod completions;
 mod config;
 mod context;
 mod cron;
@@ -96,7 +97,12 @@ enum Command {
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
     Config,
     /// Print a shell completion script: bash, zsh, fish, elvish or powershell.
-    Completions { shell: clap_complete::Shell },
+    #[command(args_conflicts_with_subcommands = true)]
+    Completions {
+        shell: Option<clap_complete::Shell>,
+        #[command(subcommand)]
+        action: Option<CompletionsAction>,
+    },
     /// Tokens and cost of model calls, per session.
     Usage {
         /// How many days back to count.
@@ -120,6 +126,19 @@ enum ServiceAction {
     },
     /// Stop and remove the service; state is kept.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum CompletionsAction {
+    /// Install completion for your shell, asking before editing its rc file.
+    Install {
+        /// Shell to install for (default: from $SHELL).
+        #[arg(long, value_enum)]
+        shell: Option<clap_complete::Shell>,
+        /// Edit the rc file without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -266,11 +285,8 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(lang) = cli.lang {
         i18n::set(lang);
     }
-    if let Command::Completions { shell } = cli.command {
-        // Descriptions follow the current language (zsh, fish, elvish and
-        // PowerShell show them); options and commands are the same in all.
-        print!("{}", text::completions::<Cli>(shell, i18n::current()));
-        return Ok(());
+    if let Command::Completions { shell, action } = cli.command {
+        return completions_command(shell, action);
     }
     if let Command::Service { action } = &cli.command {
         return match action {
@@ -409,6 +425,31 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn completions_command(
+    shell: Option<clap_complete::Shell>,
+    action: Option<CompletionsAction>,
+) -> Result<()> {
+    let lang = i18n::current();
+    match (shell, action) {
+        // Descriptions follow the current language (zsh, fish, elvish and
+        // PowerShell show them); options and commands are the same in all.
+        (Some(shell), _) => print!("{}", text::completions::<Cli>(shell, lang)),
+        (None, Some(CompletionsAction::Install { shell, yes })) => completions::install(
+            shell,
+            std::env::var("SHELL").ok().as_deref(),
+            &completions::Home::from_env()?,
+            None,
+            yes,
+            lang,
+            &|shell| text::completions::<Cli>(shell, lang),
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+        )?,
+        (None, None) => bail!(text::NAME_A_SHELL.now()),
+    }
+    Ok(())
 }
 
 type CliAgent = Agent<llm::Client, BuiltinTools>;

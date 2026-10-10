@@ -56,31 +56,29 @@ options is under [Memory](#memory) below.
 
 ## Shell completion
 
-`openclaw-rs completions <shell>` prints a completion script for bash, zsh,
-fish, elvish or powershell; descriptions follow the [language](#language).
-Install it once (and again after upgrading):
-
 ```sh
-# bash (needs the bash-completion package; on Alpine: apk add bash bash-completion)
-openclaw-rs completions bash > /usr/share/bash-completion/completions/openclaw-rs
-# or just for you: openclaw-rs completions bash > ~/.local/share/bash-completion/completions/openclaw-rs
-
-# zsh: any directory in $fpath, before compinit runs
-mkdir -p ~/.zfunc && openclaw-rs completions zsh > ~/.zfunc/_openclaw-rs
-# in ~/.zshrc: fpath=(~/.zfunc $fpath); autoload -U compinit && compinit
-
-# fish
-openclaw-rs completions fish > ~/.config/fish/completions/openclaw-rs.fish
-
-# elvish: in rc.elv
-#   eval (openclaw-rs completions elvish | slurp)
-
-# PowerShell: in $PROFILE
-#   openclaw-rs completions powershell | Out-String | Invoke-Expression
+openclaw-rs completions install          # for the shell in $SHELL
+openclaw-rs completions install --shell zsh
 ```
 
-Alpine's default `ash` (BusyBox) has no programmable completion; use bash,
-zsh or fish for it.
+It writes the completion script where the shell looks for it and, only
+when the shell needs it, adds loading lines to its rc file, after showing
+them and asking (`--yes` skips the question). The lines sit between
+`# >>> openclaw-rs completion >>>` markers, so running it again, which you
+should after upgrading, never adds them twice. Descriptions follow the
+[language](#language).
+
+| Shell | Script | rc file |
+|---|---|---|
+| fish | `~/.config/fish/completions/openclaw-rs.fish` | none |
+| bash | `~/.local/share/bash-completion/completions/openclaw-rs` | `~/.bashrc` only without the bash-completion package |
+| zsh | `~/.zfunc/_openclaw-rs` | `~/.zshrc` (or `$ZDOTDIR`): `fpath` and `compinit`, unless it already puts `~/.zfunc` on `fpath` |
+| elvish | none | `~/.config/elvish/rc.elv` loads it at startup |
+| PowerShell | none | the profile loads it at startup |
+
+`openclaw-rs completions <shell>` prints the script instead, for packaging
+or a custom location. Alpine's default `ash` (BusyBox) has no programmable
+completion; use bash (`apk add bash bash-completion`), zsh or fish.
 
 ## Language
 
