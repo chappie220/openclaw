@@ -5,6 +5,7 @@
 use anyhow::{Result, bail};
 use rusqlite::{OptionalExtension, params};
 
+use crate::i18n::chat;
 use crate::store::{Store, now};
 
 const MAX_FIELD_CHARS: usize = 120;
@@ -109,22 +110,16 @@ pub fn command(store: &Store, actor: &crate::access::Actor, text: &str) -> Optio
         return None;
     }
     if !actor.can(crate::access::Capability::Identity) {
-        return Some("Only the owner can approve or reject identity drafts.".into());
+        return Some(chat::IDENTITY_OWNER_ONLY.now().into());
     }
     let words: Vec<&str> = rest.split_whitespace().collect();
     let decide = |approve: bool, id: &str, code: Option<&&str>| -> String {
         let Ok(id) = id.trim_start_matches('#').parse::<i64>() else {
-            return format!("{id:?} is not a draft number");
+            return chat::NOT_A_DRAFT.with(&[&format!("{id:?}")]);
         };
         match store.identity_decide(id, approve, code.copied(), &actor.id) {
-            Ok(d) if approve => format!(
-                "Identity draft #{} approved: I am now {}.",
-                d.id, d.identity.name
-            ),
-            Ok(d) => format!(
-                "Identity draft #{} rejected; nothing was saved. Tell me what to change.",
-                d.id
-            ),
+            Ok(d) if approve => chat::DRAFT_APPROVED.with(&[&d.id.to_string(), &d.identity.name]),
+            Ok(d) => chat::DRAFT_REJECTED.with(&[&d.id.to_string()]),
             Err(err) => format!("{err:#}"),
         }
     };
@@ -132,7 +127,7 @@ pub fn command(store: &Store, actor: &crate::access::Actor, text: &str) -> Optio
         ["approve", id, code @ ..] => decide(true, id, code.first()),
         ["reject", id, ..] => decide(false, id, None),
         [] | ["show"] => match store.identity_drafts_awaiting() {
-            Ok(drafts) if drafts.is_empty() => "No identity draft is waiting.".into(),
+            Ok(drafts) if drafts.is_empty() => chat::NO_DRAFT.now().into(),
             Ok(drafts) => drafts
                 .iter()
                 .map(|d| format!("{}\n\n{}", d.render(), approval_hint(d)))
@@ -140,16 +135,14 @@ pub fn command(store: &Store, actor: &crate::access::Actor, text: &str) -> Optio
                 .join("\n\n"),
             Err(err) => format!("{err:#}"),
         },
-        _ => "Usage: /identity [show] | /identity approve <n> [code] | /identity reject <n>".into(),
+        _ => chat::IDENTITY_USAGE.now().into(),
     })
 }
 
 /// How a person approves `draft` from a chat channel.
 pub fn approval_hint(draft: &Draft) -> String {
-    format!(
-        "Reply \"/identity approve {} {}\" to save it, or \"/identity reject {}\".",
-        draft.id, draft.hash, draft.id
-    )
+    let id = draft.id.to_string();
+    chat::APPROVAL_HINT.with(&[&id, &draft.hash, &id])
 }
 
 /// Trims one field and enforces its length.
@@ -239,9 +232,8 @@ impl Draft {
     /// The draft exactly as stored, for a person to approve.
     pub fn render(&self) -> String {
         format!(
-            "Identity draft #{} (code {})\n{}\n\nSOUL.md:\n{}",
-            self.id,
-            self.hash,
+            "{}\n{}\n\nSOUL.md:\n{}",
+            chat::DRAFT_TITLE.with(&[&self.id.to_string(), &self.hash]),
             self.identity.identity_md(),
             self.identity.soul
         )

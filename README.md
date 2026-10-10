@@ -42,6 +42,59 @@ cargo build --release
 ./target/release/openclaw-rs memory search chinese
 ```
 
+## Configuration
+
+`openclaw-rs config` edits `<state dir>/config.toml` interactively, section by
+section (model and context, tools, gateway, QQ, email, web search, access).
+Each field shows the value in effect; Enter keeps it, `-` resets it to the
+default, `?` explains it. Secrets are typed without echo and the prompt says
+when an environment variable overrides them; `+` generates a Gateway token.
+Comments and keys the editor does not know are kept, every change is checked
+before it is accepted, and the file is saved with mode 0600. It also opens a
+file that currently fails to load, so it can be repaired. The full list of
+options is under [Memory](#memory) below.
+
+## Shell completion
+
+```sh
+openclaw-rs completions install          # for the shell in $SHELL
+openclaw-rs completions install --shell zsh
+```
+
+It writes the completion script where the shell looks for it and, only
+when the shell needs it, adds loading lines to its rc file, after showing
+them and asking (`--yes` skips the question). The lines sit between
+`# >>> openclaw-rs completion >>>` markers, so running it again, which you
+should after upgrading, never adds them twice. Descriptions follow the
+[language](#language).
+
+| Shell | Script | rc file |
+|---|---|---|
+| fish | `~/.config/fish/completions/openclaw-rs.fish` | none |
+| bash | `~/.local/share/bash-completion/completions/openclaw-rs` | `~/.bashrc` only without the bash-completion package |
+| zsh | `~/.zfunc/_openclaw-rs` | `~/.zshrc` (or `$ZDOTDIR`): `fpath` and `compinit`, unless it already puts `~/.zfunc` on `fpath` |
+| elvish | none | `~/.config/elvish/rc.elv` loads it at startup |
+| PowerShell | none | the profile loads it at startup |
+
+`openclaw-rs completions <shell>` prints the script instead, for packaging
+or a custom location. Alpine's default `ash` (BusyBox) has no programmable
+completion; use bash (`apk add bash bash-completion`), zsh or fish.
+
+## Language
+
+English and Chinese. CLI output and `--help`, the config editor, and the
+program's own chat replies (`/compact`, `/identity`, errors on QQ and email)
+use, in order: `--lang en|zh`, then `language` in config.toml, then the
+locale (`LC_ALL`, `LC_MESSAGES`, `LANG`; `zh*` means Chinese). A service
+started by OpenRC usually has no locale, so set it in the file:
+
+```toml
+language = "zh"   # first line, above the [tables]
+```
+
+The Web UI follows the browser's language and has a 中文/EN switch, remembered
+per browser. Logs and everything the model reads stay in English.
+
 ## Gateway and Web UI
 
 ```sh
@@ -59,6 +112,42 @@ declined. Without a token the Gateway only binds to loopback.
 bind = "127.0.0.1:18789"
 # token = "..."   # prefer OPENCLAW_RS_TOKEN
 ```
+
+## Images and files
+
+Files sent with a message are saved in the workspace as
+`inbox/<content hash>-<name>` (names are sanitized; the same file sent twice,
+such as a retried email, lands on the same path) and recorded with the
+message:
+
+- QQ: image and file attachments, downloaded only over https from QQ's own
+  media hosts.
+- Email: every attachment except attached emails; an email may be just an
+  attachment.
+- Web UI: the 📎 button, or paste an image into the message box.
+- CLI: `openclaw-rs ask -a photo.jpg -a notes.txt "what is this?"`, or
+  `/attach <path>` in `chat` for the next message.
+
+During that message's turn the model sees the images (PNG, JPEG, GIF, WebP up
+to 5 MB, four per message), text files up to 16 KB inline, and a list of
+every file with its workspace path, so tools can open the rest. Later turns
+only get the list. A model without image input is retried once with the
+files only listed. Limits: 20 MB per file, ten files per message.
+
+## Stopping a turn
+
+A turn that runs too long can be stopped without losing what it did:
+
+- CLI (`chat`, `ask`): Ctrl-C stops the current turn; at the `>` prompt it
+  still quits.
+- Web UI: while a turn runs, the Send button becomes Stop.
+- QQ and email: send `/stop`. Only the owner or whoever started the turn can
+  stop it; it is handled ahead of the queue the running turn holds.
+
+The model call or tool in progress is dropped (a shell command's whole
+process group is killed), the text shown so far is kept with a note telling
+the model it was cut off, and the turn replies "Stopped". Messages saved
+before that point stay in the history.
 
 ## Scheduled jobs
 
@@ -318,6 +407,21 @@ text matches by substring without word segmentation. Space-separated terms
 match any; terms shorter than three characters fall back to `LIKE`. The model
 gets `memory_save`, `memory_search` and `memory_delete` tools.
 
+Memories are also recalled without the model asking: each message is broken
+into words and three-character CJK runs (skipping stopwords and runs with
+function characters such as 我、的、吧), and up to `agent.recall_limit`
+memories that share enough of them (two, when the message has more than
+three terms) are shown to the model with that message, within
+`agent.recall_tokens`. They go with the current turn only and are never
+stored in the history. Recall needs the `memory` capability, and a guest
+only recalls their own memories.
+
+```toml
+[agent]
+recall_limit = 5      # 0 turns recall off
+recall_tokens = 800
+```
+
 State lives in `~/.openclaw-rs` (override with `OPENCLAW_RS_HOME`):
 
 - `config.toml`: optional settings
@@ -362,6 +466,9 @@ and nothing is touched.
 model = "openrouter/auto"            # any OpenRouter model id
 base_url = "https://openrouter.ai/api/v1"
 request_timeout_secs = 300
+# fallbacks = ["openai/gpt-x"]       # OpenRouter tries these when `model` fails
+max_retries = 3                      # connection errors, HTTP 408/429/5xx, early stream errors
+prompt_cache = "auto"                # auto | on | off: cache_control breakpoints
 
 [agent]
 system_prompt = "You are a helpful personal assistant running on OpenClaw."
@@ -383,7 +490,9 @@ turn that made them; later turns see just the user's messages and the
 assistant's replies. When a conversation outgrows `context_tokens`, it is cut
 back to half the budget: the oldest turns, tool output included, are folded
 by the model into a running summary sent at the start of the window.
-The full history stays in `chats.sqlite`. If the summary call fails, nothing
+The full history stays in `chats.sqlite`.
+The budget is corrected per session by how far the token estimate has been
+from the provider's own counts. If the summary call fails, nothing
 is moved and the next call tries again. The owner can send `/compact` in any
 chat (CLI, Web UI, QQ, email) to fold the whole conversation into the summary
 now; the command itself never reaches the model.
@@ -396,6 +505,25 @@ drained while the command runs and only their first and last
 the result says how many bytes were omitted. `ask` prompts on the controlling terminal; with no terminal
 the action is declined and the model is told so. Tools set to `deny` are not
 offered to the model at all.
+
+## Reliability, caching and cost
+
+A failed model request is retried with exponential backoff (honouring
+`Retry-After`, at most 30 s apart) on connection errors, HTTP 408, 429 and
+5xx, and on a stream that fails before any text reached the user; a stream
+that fails after text was shown is not repeated. `fallbacks` is sent as
+OpenRouter's `models` list, so OpenRouter switches models itself.
+
+OpenAI and DeepSeek models cache repeated prompt prefixes on their own;
+Anthropic and Google models only cache at `cache_control` breakpoints, which
+`prompt_cache = "auto"` adds for `anthropic/` and `google/` models (use `on`
+for `openrouter/auto` if it routes to them). Every call's provider-reported
+tokens, cached tokens and cost are kept in `runtime.sqlite`:
+
+```sh
+openclaw-rs usage            # last 30 days, per session
+openclaw-rs usage --days 1
+```
 
 ## Command auto-review
 

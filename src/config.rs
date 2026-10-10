@@ -15,6 +15,10 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful personal assistant runnin
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Language of CLI output and the program's own chat replies; `None`
+    /// follows the locale. Root keys must come before the tables in TOML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<crate::i18n::Lang>,
     pub model: ModelConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
@@ -189,6 +193,25 @@ pub struct ModelConfig {
     /// Prefer `OPENROUTER_API_KEY`; a key here is stored in plain text.
     pub api_key: Option<String>,
     pub request_timeout_secs: u64,
+    /// Models OpenRouter tries, in order, when `model` fails (OpenRouter's
+    /// `models` parameter; other servers ignore it).
+    pub fallbacks: Vec<String>,
+    /// Retries of a failed request (connection errors, HTTP 408/429/5xx, a
+    /// stream that fails before any text), with exponential backoff.
+    pub max_retries: u32,
+    pub prompt_cache: PromptCache,
+}
+
+/// Whether to mark `cache_control` breakpoints for prompt caching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCache {
+    /// For `anthropic/` and `google/` models, which cache only at breakpoints;
+    /// others (OpenAI, DeepSeek, …) cache on their own.
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +227,15 @@ pub struct AgentConfig {
     /// Model that writes the context summary, e.g. a cheaper one; default:
     /// model.model.
     pub summary_model: Option<String>,
+    /// Saved memories looked up from each message and shown with it; 0 turns
+    /// recall off.
+    pub recall_limit: usize,
+    /// Token cap on the recalled memories of one turn.
+    pub recall_tokens: usize,
+    /// Where files sent with messages are saved (under `inbox/`); set at
+    /// startup from `tools.workspace`, never read from the file.
+    #[serde(skip)]
+    pub workspace: PathBuf,
 }
 
 /// What a tool category may do without asking.
@@ -311,6 +343,9 @@ impl Default for ModelConfig {
             model: DEFAULT_MODEL.into(),
             api_key: None,
             request_timeout_secs: 300,
+            fallbacks: Vec::new(),
+            max_retries: 3,
+            prompt_cache: PromptCache::Auto,
         }
     }
 }
@@ -322,6 +357,9 @@ impl Default for AgentConfig {
             max_steps: 25,
             context_tokens: 64_000,
             summary_model: None,
+            recall_limit: 5,
+            recall_tokens: 800,
+            workspace: PathBuf::new(),
         }
     }
 }

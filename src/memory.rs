@@ -129,6 +129,114 @@ impl Store {
     }
 }
 
+/// Common English words that say nothing about which memory is relevant.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "you", "are", "was", "were", "what", "when", "where", "which", "who",
+    "how", "why", "this", "that", "these", "those", "with", "have", "has", "had", "can", "could",
+    "would", "should", "will", "please", "about", "from", "your", "yours", "mine", "our", "they",
+    "them", "their", "there", "here", "not", "but", "all", "any", "some", "just", "also", "into",
+    "than", "then", "too", "very", "does", "did", "done", "its", "let", "get", "got", "tell",
+    "know", "want", "need", "like", "make", "today",
+];
+
+/// Most terms taken from one message, so a pasted document stays cheap.
+const MAX_RECALL_TERMS: usize = 48;
+
+/// Chinese function characters; a trigram with one of them is mostly glue
+/// (我想要, 一杯乌, 龙茶吧) and says little about the topic.
+const CJK_GLUE: &str = "我你您他她它们的了吗呢吧啊呀是在有和与就都也还要想会能可去来这那么什怎样个一不没很太好请帮给把被让着过到对从为";
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+}
+
+/// Search terms in `text`: ASCII words of three or more letters that are not
+/// stopwords, and every run of three CJK characters without a function
+/// character, since CJK has no spaces and the trigram index matches
+/// three-character substrings.
+fn recall_terms(text: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    let push = |term: String, terms: &mut Vec<String>| {
+        if terms.len() < MAX_RECALL_TERMS && !terms.contains(&term) {
+            terms.push(term);
+        }
+    };
+    let lower = text.to_lowercase();
+    let mut word = String::new();
+    let mut cjk: Vec<char> = Vec::new();
+    for c in lower.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphanumeric() {
+            word.push(c);
+        } else if !word.is_empty() {
+            if word.len() >= TRIGRAM && !STOPWORDS.contains(&word.as_str()) {
+                push(std::mem::take(&mut word), &mut terms);
+            }
+            word.clear();
+        }
+        if is_cjk(c) {
+            cjk.push(c);
+        } else if !cjk.is_empty() {
+            for window in cjk.windows(TRIGRAM) {
+                if !window.iter().any(|c| CJK_GLUE.contains(*c)) {
+                    push(window.iter().collect(), &mut terms);
+                }
+            }
+            cjk.clear();
+        }
+    }
+    terms
+}
+
+impl Store {
+    /// Memories within `scope` that share terms with `text`, best first, for
+    /// recall at the start of a turn. With more than three terms a memory
+    /// must share at least two, so one common word does not pull it in.
+    pub fn memory_recall_in(
+        &self,
+        text: &str,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Vec<Memory>> {
+        let terms = recall_terms(text);
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let expr = terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let candidates: Vec<Memory> = {
+            let conn = self.soul();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.content, m.created_at FROM memories_fts f
+                 JOIN memories m ON m.id = f.rowid
+                 WHERE memories_fts MATCH ?1 AND (?3 IS NULL OR m.created_by = ?3)
+                 ORDER BY bm25(memories_fts) LIMIT ?2",
+            )?;
+            stmt.query_map(params![expr, (limit * 4) as i64, scope], row)?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let needed = if terms.len() > 3 { 2 } else { 1 };
+        let mut scored: Vec<(usize, Memory)> = candidates
+            .into_iter()
+            .map(|m| {
+                let content = m.content.to_lowercase();
+                let shared = terms
+                    .iter()
+                    .filter(|t| content.contains(t.as_str()))
+                    .count();
+                (shared, m)
+            })
+            .filter(|(shared, _)| *shared >= needed)
+            .collect();
+        // Stable, so equal scores keep the full-text ranking.
+        scored.sort_by_key(|(shared, _)| std::cmp::Reverse(*shared));
+        Ok(scored.into_iter().take(limit).map(|(_, m)| m).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +272,49 @@ mod tests {
         assert!(store.memory_search("乌龙茶", 5).unwrap().is_empty());
         assert_eq!(store.memory_list(10).unwrap().len(), 2);
         assert!(store.memory_save("  ").is_err());
+    }
+
+    #[test]
+    fn recall_terms_cover_words_and_cjk_trigrams() {
+        assert_eq!(
+            recall_terms("What does the Raspberry Pi run? 我想喝乌龙茶"),
+            ["raspberry", "run", "喝乌龙", "乌龙茶"]
+        );
+        assert!(recall_terms("hi 你好").is_empty());
+        assert!(recall_terms(&"字".repeat(500)).len() <= 1);
+    }
+
+    #[test]
+    fn recalls_memories_that_share_enough_with_the_message() {
+        let store = Store::open_in_memory().unwrap();
+        let tea = store.memory_save("用户喜欢喝乌龙茶，不加糖").unwrap();
+        let pi = store
+            .memory_save("The home server is a Raspberry Pi 5 running Alpine")
+            .unwrap();
+        store
+            .memory_save("Weekly meeting is on Tuesday at 10")
+            .unwrap();
+        let ids = |text: &str, scope| -> Vec<i64> {
+            store
+                .memory_recall_in(text, 5, scope)
+                .unwrap()
+                .iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        assert_eq!(ids("帮我泡一杯乌龙茶吧", None), [tea]);
+        assert_eq!(
+            ids("Is the Alpine server on the Raspberry Pi still up?", None),
+            [pi]
+        );
+        // One shared word among many is not enough.
+        assert!(ids("Which server should I buy for my office next year?", None).is_empty());
+        assert!(ids("你好", None).is_empty());
+        // A guest recalls only their own memories.
+        let own = store
+            .memory_save_by("访客喜欢乌龙茶和绿茶", Some("qq:X"))
+            .unwrap();
+        assert_eq!(ids("推荐一款乌龙茶", Some("qq:X")), [own]);
     }
 
     #[test]
