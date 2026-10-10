@@ -9,6 +9,7 @@ mod config;
 mod context;
 mod cron;
 mod gateway;
+mod guide;
 mod i18n;
 mod identity;
 mod llm;
@@ -352,6 +353,11 @@ async fn run(cli: Cli) -> Result<()> {
             let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
             let gateway =
                 gateway::Gateway::new(agent, config.gateway.token(), config.access.clone());
+            if let Some(guide) =
+                guide::Guide::from_config(&config.guide, &config.model, &config.api_key()?)?
+            {
+                gateway.set_guide(guide);
+            }
             if config.qq.enabled {
                 // Auto-review runs commands nobody approved, so it counts as unattended.
                 let reviewed_shell = config.tools.shell == config::Permission::Ask
@@ -564,6 +570,8 @@ async fn turn(
                 text::TOOL_END.with(&[&name, &output.len().to_string()])
             );
         }
+        // The terminal reads no input while a turn runs.
+        AgentEvent::FollowUp(_) => {}
     };
     let cancel = agent::Cancel::default();
     let run = agent.run_turn_until(

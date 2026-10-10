@@ -560,7 +560,7 @@ fn handle<M: Model + 'static, T: Tools + 'static>(
         }
         let text = crate::attachments::with_problems(&incoming.text, &problems);
         let reply = match gateway
-            .run_unattended_with(actor, &session, &text, &uploads)
+            .chat_unattended_with(actor, &session, &text, &uploads)
             .await
         {
             Ok(text) => text,

@@ -26,7 +26,54 @@ pub struct Config {
     pub qq: QqConfig,
     pub mail: MailConfig,
     pub search: SearchConfig,
+    pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
+}
+
+/// Guided conversation: messages sent while a turn runs join that turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuideConfig {
+    /// Off: a message sent during a turn waits and runs as its own turn.
+    pub enabled: bool,
+    /// Which model picks the moment; `off` inserts at the very next step.
+    pub provider: ReviewProvider,
+    /// Default: `typesafe/jev-1.13` (openrouter), model.model (openrouter-chat),
+    /// `jev-latest` (typesafe), or `kev-latest` (typesafe with base_url).
+    pub model: Option<String>,
+    /// TypeSafe key; prefer `TYPESAFE_API_KEY`. Not sent to a local base_url.
+    pub api_key: Option<String>,
+    /// Loopback origin of a local Kev System One server.
+    pub base_url: Option<String>,
+    /// Probability that now is a good moment at or above which the messages go in.
+    pub insert_at: f64,
+    /// Steps a message may be held back before it goes in anyway.
+    pub max_wait_steps: usize,
+    pub timeout_secs: u64,
+}
+
+impl Default for GuideConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: ReviewProvider::Openrouter,
+            model: None,
+            api_key: None,
+            base_url: None,
+            insert_at: 0.5,
+            max_wait_steps: 3,
+            timeout_secs: 10,
+        }
+    }
+}
+
+impl GuideConfig {
+    pub fn api_key(&self) -> Option<String> {
+        std::env::var("TYPESAFE_API_KEY")
+            .ok()
+            .or_else(|| self.api_key.clone())
+            .filter(|k| !k.trim().is_empty())
+    }
 }
 
 /// Where `web_search` looks things up.
