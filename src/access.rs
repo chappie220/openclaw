@@ -30,10 +30,12 @@ pub enum Capability {
     WebSearch,
     /// `browser`: opens any web page, including ones on the local network.
     Browser,
+    /// `web_fetch`: reads public web pages.
+    WebFetch,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 8] = [
+    pub const ALL: [Capability; 9] = [
         Capability::Shell,
         Capability::FilesRead,
         Capability::FilesWrite,
@@ -42,6 +44,7 @@ impl Capability {
         Capability::Identity,
         Capability::WebSearch,
         Capability::Browser,
+        Capability::WebFetch,
     ];
 
     /// The capability a built-in tool needs; `None` for tools anyone may call.
@@ -55,6 +58,7 @@ impl Capability {
             "identity_set" | "identity_propose" => Capability::Identity,
             "web_search" => Capability::WebSearch,
             "browser" => Capability::Browser,
+            "web_fetch" => Capability::WebFetch,
             _ => return None,
         })
     }
@@ -133,7 +137,7 @@ impl Default for AccessConfig {
     fn default() -> Self {
         Self {
             owners: Vec::new(),
-            guest: vec![Capability::WebSearch],
+            guest: vec![Capability::WebSearch, Capability::WebFetch],
             grants: BTreeMap::new(),
         }
     }

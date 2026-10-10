@@ -25,6 +25,7 @@ pub struct Config {
     pub mail: MailConfig,
     pub search: SearchConfig,
     pub browser: BrowserConfig,
+    pub fetch: FetchConfig,
     pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
 }
@@ -147,6 +148,35 @@ impl Default for BrowserConfig {
             args: Vec::new(),
             timeout_secs: 30,
             idle_secs: 300,
+            max_chars: 8000,
+        }
+    }
+}
+
+/// `web_fetch`: downloads a page and reads its text, without a browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FetchConfig {
+    /// Off: no `web_fetch` tool.
+    pub enabled: bool,
+    /// Let owners fetch pages on this host and the local network (the
+    /// router, a NAS); never guests.
+    pub private_network: bool,
+    /// Seconds one download may take.
+    pub timeout_secs: u64,
+    /// Bytes downloaded at most; a longer page is cut.
+    pub max_bytes: usize,
+    /// Characters of page text returned per call.
+    pub max_chars: usize,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            private_network: false,
+            timeout_secs: 20,
+            max_bytes: 2_000_000,
             max_chars: 8000,
         }
     }

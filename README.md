@@ -17,6 +17,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Email channel (IMAP in, SMTP out) | ✅ |
 | Identity setup on first start, web search | ✅ |
 | Browser, using the one installed on the host | ✅ |
+| Reading web pages without a browser (`web_fetch`) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -104,6 +105,8 @@ can run from a script.
   asked its colour.
 - Browser: which one was found, and that it starts and opens a page (in a
   scratch profile, closed again right after).
+- Reading web pages: `web_fetch` reads `https://example.com`, so a host
+  that is offline or needs a proxy shows up here.
 - Web search: SearXNG answers with JSON.
 - Gateway: an address other hosts can reach has a token (else `serve`
   refuses to start), and whether a Gateway is running.
@@ -335,6 +338,38 @@ The browser can reach anything the host can, including pages on your local
 network, so it is the `browser` [capability](#access): the owner has it,
 guests do not unless granted.
 
+## Reading web pages
+
+Most pages do not need a browser. `web_fetch` downloads a page and turns its
+HTML into text, with headings, lists, tables and links (as Markdown) kept, in
+a few hundred milliseconds and without starting anything. The model reads
+search results and links people send this way, and keeps the `browser` for
+pages that need JavaScript, a login or clicking.
+
+- Only the page's own content is kept: scripts, styles, navigation, footers,
+  hidden parts and links to other language versions are dropped, and when a
+  page marks its content with `<main>` or `<article>`, only that is read.
+- Long pages come in `max_chars` pieces; the model reads on with `offset`,
+  which comes from a short-lived cache rather than downloading again.
+- Pages are read in their own charset (GBK and others included). PDFs,
+  images and other files are refused with a hint to use the browser or shell.
+- Pages on this host and the local network (127.0.0.1, 192.168.x.x,
+  `localhost`, cloud metadata addresses and so on) are refused, also after a
+  redirect or behind a name that resolves to them, so a guest cannot use it to
+  reach your router. `private_network = true` lets owners read them; guests
+  never can.
+
+```toml
+[fetch]
+enabled = true
+private_network = false   # true: owners may also read pages on the LAN
+timeout_secs = 20
+max_bytes = 2000000       # a longer page is cut
+max_chars = 8000          # text per call
+```
+
+It is the `web_fetch` [capability](#access), which guests have by default.
+
 ## Scheduled jobs
 
 `serve` runs jobs on standard 5-field cron schedules in the host's local time.
@@ -476,13 +511,13 @@ not offered (or is talked into it) is still refused:
   unless it only listens on loopback) act as the **owner**: every tool, subject
   to the `[tools]` settings.
 - QQ and email senders are **guests** unless listed in `access.owners`. A guest
-  only gets `access.guest` (by default just `web_search`): no shell, no files,
+  only gets `access.guest` (by default `web_search` and `web_fetch`): no shell, no files,
   no memory, no scheduled jobs and no identity changes.
 
 ```toml
 [access]
 owners = ["qq:<your openid>", "mail:me@example.com"]
-guest = ["web_search"]               # what any other sender may use
+guest = ["web_search", "web_fetch"] # what any other sender may use
 [access.grants]                      # more for named senders, sessions or channels
 "qq:<friend openid>" = ["memory", "cron"]
 "qq:group:<group openid>" = ["web_search"]
@@ -490,7 +525,7 @@ guest = ["web_search"]               # what any other sender may use
 ```
 
 Capabilities: `shell`, `files_read` (`read_file`, `list_dir`), `files_write`,
-`memory`, `cron`, `identity`, `web_search`, `browser`. `shell`, `files_write` and
+`memory`, `cron`, `identity`, `web_search`, `web_fetch`, `browser`. `shell`, `files_write` and
 `identity` still follow `tools.shell`, `tools.write` and `tools.identity`, and
 `ask` is still declined where nobody can approve.
 

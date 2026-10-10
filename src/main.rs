@@ -10,6 +10,7 @@ mod config;
 mod context;
 mod cron;
 mod doctor;
+mod fetch;
 mod gateway;
 mod guide;
 mod i18n;
@@ -564,6 +565,7 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         tools: BuiltinTools::new(workspace.clone(), config.tools.clone(), store.clone())?
             .with_search(search)
             .with_browser(browser::Browser::new(&config.browser, state, &workspace))
+            .with_fetch(fetch::Fetcher::new(&config.fetch)?)
             .with_review(review),
         store,
         config: config::AgentConfig {

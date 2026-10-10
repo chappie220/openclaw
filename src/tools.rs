@@ -15,6 +15,7 @@ use crate::access::{self, Actor, Capability};
 use crate::agent::Tools;
 use crate::browser::{Browser, BrowserArgs};
 use crate::config::{Permission, ToolsConfig};
+use crate::fetch::Fetcher;
 use crate::identity::Identity;
 use crate::llm::{ToolCall, ToolSpec};
 use crate::review::{Reviewer, Verdict};
@@ -82,6 +83,7 @@ pub struct BuiltinTools {
     store: Store,
     search: Option<Searcher>,
     browser: Option<Browser>,
+    fetch: Option<Fetcher>,
     review: Option<Reviewer>,
 }
 
@@ -152,6 +154,13 @@ struct WebSearchArgs {
 }
 
 #[derive(Deserialize)]
+struct WebFetchArgs {
+    url: String,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct MemoryDeleteArgs {
     id: i64,
 }
@@ -171,6 +180,7 @@ impl BuiltinTools {
             store,
             search: None,
             browser: None,
+            fetch: None,
             review: None,
         })
     }
@@ -182,6 +192,11 @@ impl BuiltinTools {
 
     pub fn with_browser(mut self, browser: Option<Browser>) -> Self {
         self.browser = browser;
+        self
+    }
+
+    pub fn with_fetch(mut self, fetch: Option<Fetcher>) -> Self {
+        self.fetch = fetch;
         self
     }
 
@@ -292,6 +307,14 @@ impl BuiltinTools {
         let session = crate::agent::current_session().unwrap_or_else(|| "main".into());
         browser
             .run(&session, args)
+            .await
+            .map_err(|err| format!("error: {err:#}"))
+    }
+
+    async fn web_fetch(&self, actor: &Actor, args: WebFetchArgs) -> Result<String, String> {
+        let fetch = self.fetch.as_ref().ok_or("error: web_fetch is off")?;
+        fetch
+            .fetch(&args.url, args.offset.unwrap_or(0), actor.owner)
             .await
             .map_err(|err| format!("error: {err:#}"))
     }
@@ -796,6 +819,18 @@ impl BuiltinTools {
                 json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
             ));
         }
+        if self.fetch.is_some() {
+            specs.push(ToolSpec::function(
+                "web_fetch",
+                "Download a web page and read its text, with links as Markdown. Fast and light: use it to read \
+                 pages found with web_search or links the user sends. Pages that only show content after \
+                 JavaScript runs, or need logging in or clicking, need the browser instead.",
+                json!({"type": "object", "properties": {
+                    "url": {"type": "string", "description": "http(s) address"},
+                    "offset": {"type": "integer", "description": "first text character, to read on in long pages"}
+                }, "required": ["url"]}),
+            ));
+        }
         if let Some(browser) = &self.browser {
             specs.push(ToolSpec::function(
                 "browser",
@@ -804,7 +839,7 @@ impl BuiltinTools {
                      Each conversation has its own tab that keeps its page between calls. open, click, type \
                      and back return the page's title, URL, text and numbered elements; pass an element's \
                      number as ref to click or type into it. Take a screenshot to see the layout, \
-                     charts or images. Prefer web_search for plain lookups.",
+                     charts or images. Prefer web_search for plain lookups and web_fetch for reading plain pages.",
                     browser.describe()
                 ),
                 json!({"type": "object", "properties": {
@@ -883,6 +918,10 @@ impl BuiltinTools {
             },
             "browser" => match parse(call) {
                 Ok(args) => self.browser(args).await,
+                Err(e) => Err(e),
+            },
+            "web_fetch" => match parse(call) {
+                Ok(args) => self.web_fetch(actor, args).await,
                 Err(e) => Err(e),
             },
             "cron_add" => parse(call).and_then(|args| self.cron_add(actor, args)),

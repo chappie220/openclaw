@@ -501,6 +501,29 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: tr("Reading web pages", "读取网页"),
+        fields: &[
+            Field {
+                path: &["fetch", "enabled"],
+                label: tr("web_fetch tool", "web_fetch 工具"),
+                help: tr(
+                    "Downloads a page and reads its text without a browser: fast and light. Pages that need JavaScript still need the browser.",
+                    "不用浏览器，直接下载网页读取文字，又快又省资源。需要 JavaScript 的页面仍然要用浏览器。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["fetch", "private_network"],
+                label: tr("Local network", "局域网"),
+                help: tr(
+                    "y lets owners read pages on this host and the local network (router, NAS). Guests never can.",
+                    "选 y 允许 owner 读取本机和局域网里的页面（路由器、NAS）。访客始终不行。",
+                ),
+                kind: Kind::Bool,
+            },
+        ],
+    },
+    Section {
         title: tr("Access", "权限"),
         fields: &[Field {
             path: &["access", "owners"],

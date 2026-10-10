@@ -20,6 +20,7 @@ chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
 croner = "4.0.1"
+encoding_rs = "0.8.42"
 futures-util = "0.3.34"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "rustls-native-certs", "hostname", "aws-lc-rs"] }
 libc = "0.2.190"

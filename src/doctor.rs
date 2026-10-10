@@ -68,6 +68,7 @@ const OFFLINE_NOTE: Tr = tr(
 const S_CONFIG: Tr = tr("Config", "配置");
 const S_MODELS: Tr = tr("Models", "模型");
 const S_BROWSER: Tr = tr("Browser", "浏览器");
+const S_FETCH: Tr = tr("Reading web pages", "读取网页");
 const S_SEARCH: Tr = tr("Web search", "网页搜索");
 const S_GATEWAY: Tr = tr("Gateway", "Gateway");
 const S_QQ: Tr = tr("QQ", "QQ");
@@ -161,6 +162,20 @@ const BROWSER_FOUND: Tr = tr("found {}", "找到 {}");
 const BROWSER_STARTS: Tr = tr("starts and opens a page: {}", "能启动并打开页面：{}");
 const BROWSER_FAILED: Tr = tr("cannot start: {}", "无法启动：{}");
 
+const FETCH_OFF: Tr = tr(
+    "turned off (fetch.enabled = false): no web_fetch tool",
+    "已关闭（fetch.enabled = false）：没有 web_fetch 工具",
+);
+const FETCH_ON: Tr = tr("web_fetch is on", "web_fetch 已开启");
+const FETCH_OK: Tr = tr("reads {}: {}", "能读取 {}：{}");
+const FETCH_FAILED: Tr = tr(
+    "cannot read {}: {} (is this host online, or does it need a proxy?)",
+    "无法读取 {}：{}（本机能上网吗？是否需要代理？）",
+);
+const FETCH_PRIVATE: Tr = tr(
+    "owners may also read pages on this host and the local network (fetch.private_network)",
+    "owner 还可以读取本机和局域网里的页面（fetch.private_network）",
+);
 const SEARCH_OFF: Tr = tr("off: no web_search tool", "已关闭：没有 web_search 工具");
 const SEARCH_OPENROUTER: Tr = tr(
     "OpenRouter's web plugin, billed per search with the same key",
@@ -236,6 +251,7 @@ pub const ALL: &[Tr] = &[
     S_CONFIG,
     S_MODELS,
     S_BROWSER,
+    S_FETCH,
     S_SEARCH,
     S_GATEWAY,
     S_QQ,
@@ -277,6 +293,11 @@ pub const ALL: &[Tr] = &[
     BROWSER_FOUND,
     BROWSER_STARTS,
     BROWSER_FAILED,
+    FETCH_OFF,
+    FETCH_ON,
+    FETCH_OK,
+    FETCH_FAILED,
+    FETCH_PRIVATE,
     SEARCH_OFF,
     SEARCH_OPENROUTER,
     SEARXNG_OK,
@@ -416,6 +437,9 @@ pub async fn run(path: &Path, state: &Path, offline: bool) -> Result<bool> {
 
     report.section(S_BROWSER);
     report.add(browser_findings(&config, &workspace, state, offline).await);
+
+    report.section(S_FETCH);
+    report.add(fetch_findings(&config, offline).await);
 
     report.section(S_SEARCH);
     report.add(search_findings(&config, offline).await);
@@ -635,6 +659,36 @@ async fn browser_findings(
 
 fn tempfile_dir(state: &Path) -> std::path::PathBuf {
     state.join(format!(".doctor-{}", std::process::id()))
+}
+
+async fn fetch_findings(config: &Config, offline: bool) -> Vec<Finding> {
+    let fetcher = match crate::fetch::Fetcher::new(&config.fetch) {
+        Ok(Some(fetcher)) => fetcher,
+        Ok(None) => return vec![info(FETCH_OFF.now())],
+        Err(err) => return vec![fail(format!("{err:#}"))],
+    };
+    let mut findings = Vec::new();
+    if offline {
+        findings.push(info(FETCH_ON.now()));
+    } else {
+        const PAGE: &str = "https://example.com";
+        findings.push(match fetcher.fetch(PAGE, 0, false).await {
+            Ok(page) => {
+                let title = page
+                    .lines()
+                    .next()
+                    .and_then(|l| l.strip_prefix("Title: "))
+                    .unwrap_or("")
+                    .to_owned();
+                ok(FETCH_OK.with(&[PAGE, &title]))
+            }
+            Err(err) => fail(FETCH_FAILED.with(&[PAGE, &format!("{err:#}")])),
+        });
+    }
+    if config.fetch.private_network {
+        findings.push(info(FETCH_PRIVATE.now()));
+    }
+    findings
 }
 
 async fn search_findings(config: &Config, offline: bool) -> Vec<Finding> {
