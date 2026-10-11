@@ -19,6 +19,8 @@ use crate::i18n::{Tr, tr};
 enum Kind {
     Text,
     Int,
+    /// US dollars; 0 means no limit.
+    Money,
     Bool,
     Choice(&'static [&'static str]),
     /// Comma-separated strings.
@@ -168,6 +170,15 @@ const SECTIONS: &[Section] = &[
                 help: tr(
                     "Model for messages with images (files people send, browser screenshots). Reset (-) to use the main model; set it when the main model has no image input.",
                     "处理带图片消息（用户发来的图片、浏览器截图）的模型。输入 - 恢复为主模型；主模型不支持图片输入时需要设置。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
+                path: &["agent", "audio_model"],
+                label: tr("Audio model", "音频模型"),
+                help: tr(
+                    "Model that transcribes voice messages (email, Web UI, QQ when QQ sends no transcript). Reset (-) to use the main model; set it when the main model has no audio input.",
+                    "把语音消息转成文字的模型（邮件、Web UI，以及 QQ 没给识别结果时）。输入 - 恢复为主模型；主模型不支持音频输入时需要设置。",
                 ),
                 kind: Kind::Text,
             },
@@ -501,6 +512,111 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: tr("Reading web pages", "读取网页"),
+        fields: &[
+            Field {
+                path: &["fetch", "enabled"],
+                label: tr("web_fetch tool", "web_fetch 工具"),
+                help: tr(
+                    "Downloads a page and reads its text without a browser: fast and light. Pages that need JavaScript still need the browser.",
+                    "不用浏览器，直接下载网页读取文字，又快又省资源。需要 JavaScript 的页面仍然要用浏览器。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["fetch", "private_network"],
+                label: tr("Local network", "局域网"),
+                help: tr(
+                    "y lets owners read pages on this host and the local network (router, NAS). Guests never can.",
+                    "选 y 允许 owner 读取本机和局域网里的页面（路由器、NAS）。访客始终不行。",
+                ),
+                kind: Kind::Bool,
+            },
+        ],
+    },
+    Section {
+        title: tr("Spending limits", "花费上限"),
+        fields: &[
+            Field {
+                path: &["limits", "daily_usd"],
+                label: tr(
+                    "Daily limit, whole agent (USD)",
+                    "整个 agent 每日上限（美元）",
+                ),
+                help: tr(
+                    "Model calls stop for everyone, owners included, once this much was spent today. 0: no limit.",
+                    "今天花到这个数后，所有人（包括 owner）的模型调用都会停止。0 表示不限。",
+                ),
+                kind: Kind::Money,
+            },
+            Field {
+                path: &["limits", "monthly_usd"],
+                label: tr(
+                    "Monthly limit, whole agent (USD)",
+                    "整个 agent 每月上限（美元）",
+                ),
+                help: tr(
+                    "The same per calendar month. 0: no limit.",
+                    "同上，按自然月计算。0 表示不限。",
+                ),
+                kind: Kind::Money,
+            },
+            Field {
+                path: &["limits", "guest_daily_usd"],
+                label: tr("Daily limit per guest (USD)", "每个访客每日上限（美元）"),
+                help: tr(
+                    "What each QQ or email sender who is not an owner may spend a day. 0: no limit.",
+                    "每个不是 owner 的 QQ 或邮件发送者每天最多能花多少。0 表示不限。",
+                ),
+                kind: Kind::Money,
+            },
+            Field {
+                path: &["limits", "turn_usd"],
+                label: tr("Limit per turn (USD)", "每轮上限（美元）"),
+                help: tr(
+                    "Stops one reply that keeps calling tools once it cost this much. 0: no limit.",
+                    "一次回复不停调用工具、花到这个数时就停下。0 表示不限。",
+                ),
+                kind: Kind::Money,
+            },
+        ],
+    },
+    Section {
+        title: tr("Updates", "更新"),
+        fields: &[
+            Field {
+                path: &["update", "check"],
+                label: tr("Look for new versions", "检查新版本"),
+                help: tr(
+                    "The Gateway checks GitHub Releases once a day and logs a new version.",
+                    "Gateway 每天检查一次 GitHub Releases，发现新版本就写进日志。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["update", "auto"],
+                label: tr("Install updates on their own", "自动安装更新"),
+                help: tr(
+                    "The Gateway installs a new version (checksum checked, old binary kept) and restarts when no turn is running. The service account must be able to write the binary.",
+                    "Gateway 自动安装新版本（会校验 checksum，保留旧版本），并在没有对话进行时重启。服务账号需要能写入程序文件。",
+                ),
+                kind: Kind::Bool,
+            },
+        ],
+    },
+    Section {
+        title: tr("Skills", "Skills"),
+        fields: &[Field {
+            path: &["skills", "enabled"],
+            label: tr("Skills", "Skills"),
+            help: tr(
+                "Task instructions in workspace/skills/<name>/SKILL.md that the agent loads when a request needs them. Manage them with openclaw-rs skills.",
+                "放在 workspace/skills/<名字>/SKILL.md 里的任务说明，需要时 agent 会自动加载。用 openclaw-rs skills 管理。",
+            ),
+            kind: Kind::Bool,
+        }],
+    },
+    Section {
         title: tr("Access", "权限"),
         fields: &[Field {
             path: &["access", "owners"],
@@ -791,6 +907,15 @@ fn value_for(kind: Kind, text: &str, lang: Lang) -> Result<Value> {
                 .with_context(|| NOT_NUMBER.fill(lang, &[&format!("{text:?}")]))?;
             Value::from(i64::from(n))
         }
+        Kind::Money => {
+            let n: f64 = text
+                .trim_start_matches('$')
+                .parse()
+                .ok()
+                .filter(|n: &f64| n.is_finite() && *n >= 0.0)
+                .with_context(|| NOT_NUMBER.fill(lang, &[&format!("{text:?}")]))?;
+            Value::from(n)
+        }
         Kind::Bool => match text.to_ascii_lowercase().as_str() {
             "y" | "yes" | "true" | "on" | "1" | "是" => Value::from(true),
             "n" | "no" | "false" | "off" | "0" | "否" => Value::from(false),
@@ -930,9 +1055,9 @@ mod tests {
         )
         .unwrap();
         // Model (section 2): new id, keep key, two fallbacks, keep retries, cache by number,
-        // a bad then a good budget, reset summary model, keep image model,
-        // recall, max steps and both guide fields.
-        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\n\ns\n";
+        // a bad then a good budget, reset summary model, keep image and audio
+        // models, recall, max steps and both guide fields.
+        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\n\n\ns\n";
         let out = drive(&path, script);
         assert!(out.contains("\"lots\" is not a whole number"), "{out}");
         assert!(out.contains("Saved"), "{out}");
@@ -1012,7 +1137,7 @@ mod tests {
         let out = drive_in(
             Lang::Zh,
             &path,
-            "5\n?\n是\n\n\n\n12\n6\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
+            "5\n?\n是\n\n\n\n99\n6\n\n\nabc\n\n\n\n\n\n\n\n\n\ns\n",
         );
         assert!(out.contains("2) 模型与上下文"), "{out}");
         assert!(out.contains("s) 保存并退出"), "{out}");

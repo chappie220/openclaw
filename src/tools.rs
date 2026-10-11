@@ -15,10 +15,13 @@ use crate::access::{self, Actor, Capability};
 use crate::agent::Tools;
 use crate::browser::{Browser, BrowserArgs};
 use crate::config::{Permission, ToolsConfig};
+use crate::fetch::Fetcher;
 use crate::identity::Identity;
 use crate::llm::{ToolCall, ToolSpec};
+use crate::mcp::Mcp;
 use crate::review::{Reviewer, Verdict};
 use crate::search::Searcher;
+use crate::skills::Skills;
 use crate::store::Store;
 
 /// Asks a person whether a gated action may run. Front ends supply their own.
@@ -82,6 +85,9 @@ pub struct BuiltinTools {
     store: Store,
     search: Option<Searcher>,
     browser: Option<Browser>,
+    fetch: Option<Fetcher>,
+    mcp: Option<Mcp>,
+    skills: Option<Skills>,
     review: Option<Reviewer>,
 }
 
@@ -152,6 +158,18 @@ struct WebSearchArgs {
 }
 
 #[derive(Deserialize)]
+struct WebFetchArgs {
+    url: String,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SkillArgs {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct MemoryDeleteArgs {
     id: i64,
 }
@@ -171,6 +189,9 @@ impl BuiltinTools {
             store,
             search: None,
             browser: None,
+            fetch: None,
+            mcp: None,
+            skills: None,
             review: None,
         })
     }
@@ -183,6 +204,51 @@ impl BuiltinTools {
     pub fn with_browser(mut self, browser: Option<Browser>) -> Self {
         self.browser = browser;
         self
+    }
+
+    pub fn with_fetch(mut self, fetch: Option<Fetcher>) -> Self {
+        self.fetch = fetch;
+        self
+    }
+
+    pub fn with_mcp(mut self, mcp: Option<Mcp>) -> Self {
+        self.mcp = mcp.filter(|m| !m.is_empty());
+        self
+    }
+
+    pub fn with_skills(mut self, skills: Option<Skills>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    fn skill(&self, args: SkillArgs) -> Result<String, String> {
+        let skills = self.skills.as_ref().ok_or("error: skills are off")?;
+        skills
+            .load(args.name.trim())
+            .map_err(|err| format!("error: {err:#}"))
+    }
+
+    async fn mcp(&self, name: &str, arguments: &str) -> Result<String, String> {
+        let mcp = self
+            .mcp
+            .as_ref()
+            .ok_or("error: no MCP servers are configured")?;
+        let permission = mcp
+            .permission(name)
+            .ok_or_else(|| format!("error: unknown tool {name}"))?;
+        let arguments = if arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str::<serde_json::Value>(arguments)
+                .map_err(|e| format!("error: arguments are not valid JSON: {e}"))?
+        };
+        let summary: String = arguments.to_string().chars().take(500).collect();
+        self.permit(permission, name, &summary).await?;
+        let out = mcp
+            .call(name, arguments)
+            .await
+            .map_err(|err| format!("error: {err:#}"))?;
+        Ok(truncate(out.as_bytes(), self.config.max_output_bytes))
     }
 
     /// Reviews `shell` commands set to `ask` before anyone is asked.
@@ -276,12 +342,21 @@ impl BuiltinTools {
         }
     }
 
-    async fn web_search(&self, args: WebSearchArgs) -> Result<String, String> {
+    async fn web_search(&self, actor: &Actor, args: WebSearchArgs) -> Result<String, String> {
         let search = self.search.as_ref().ok_or("error: web search is off")?;
-        let found = search
+        let (found, usage) = search
             .search(&args.query)
             .await
             .map_err(|e| format!("error: {e:#}"))?;
+        if let Some(usage) = usage {
+            let session = crate::agent::current_session().unwrap_or_default();
+            if let Err(err) =
+                self.store
+                    .record_usage(&session, "search", Some(&actor.id), search.model(), &usage)
+            {
+                eprintln!("usage: cannot record a search: {err:#}");
+            }
+        }
         Ok(truncate(found.as_bytes(), self.config.max_output_bytes))
     }
 
@@ -292,6 +367,14 @@ impl BuiltinTools {
         let session = crate::agent::current_session().unwrap_or_else(|| "main".into());
         browser
             .run(&session, args)
+            .await
+            .map_err(|err| format!("error: {err:#}"))
+    }
+
+    async fn web_fetch(&self, actor: &Actor, args: WebFetchArgs) -> Result<String, String> {
+        let fetch = self.fetch.as_ref().ok_or("error: web_fetch is off")?;
+        fetch
+            .fetch(&args.url, args.offset.unwrap_or(0), actor.owner)
             .await
             .map_err(|err| format!("error: {err:#}"))
     }
@@ -700,6 +783,16 @@ impl Tools for BuiltinTools {
         specs
     }
 
+    fn prompt(&self) -> Option<String> {
+        let skills = self.skills.as_ref()?;
+        let actor = access::current()?;
+        if !actor.can(Capability::Skills) {
+            return None;
+        }
+        let can_write = actor.can(Capability::FilesWrite) && self.config.write != Permission::Deny;
+        skills.prompt(can_write)
+    }
+
     async fn call(&self, call: &ToolCall) -> String {
         let name = call.function.name.as_str();
         // Fail closed: a call outside any turn has no authority at all.
@@ -796,6 +889,18 @@ impl BuiltinTools {
                 json!({"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
             ));
         }
+        if self.fetch.is_some() {
+            specs.push(ToolSpec::function(
+                "web_fetch",
+                "Download a web page and read its text, with links as Markdown. Fast and light: use it to read \
+                 pages found with web_search or links the user sends. Pages that only show content after \
+                 JavaScript runs, or need logging in or clicking, need the browser instead.",
+                json!({"type": "object", "properties": {
+                    "url": {"type": "string", "description": "http(s) address"},
+                    "offset": {"type": "integer", "description": "first text character, to read on in long pages"}
+                }, "required": ["url"]}),
+            ));
+        }
         if let Some(browser) = &self.browser {
             specs.push(ToolSpec::function(
                 "browser",
@@ -804,7 +909,7 @@ impl BuiltinTools {
                      Each conversation has its own tab that keeps its page between calls. open, click, type \
                      and back return the page's title, URL, text and numbered elements; pass an element's \
                      number as ref to click or type into it. Take a screenshot to see the layout, \
-                     charts or images. Prefer web_search for plain lookups.",
+                     charts or images. Prefer web_search for plain lookups and web_fetch for reading plain pages.",
                     browser.describe()
                 ),
                 json!({"type": "object", "properties": {
@@ -818,6 +923,24 @@ impl BuiltinTools {
                     "full_page": {"type": "boolean", "description": "screenshot: whole page (up to 8000 px, JPEG) instead of the visible part. You see the image during this turn; it is saved in the workspace"}
                 }, "required": ["action"]}),
             ));
+        }
+        if let Some(skills) = &self.skills
+            && !skills.ready().is_empty()
+        {
+            specs.push(ToolSpec::function(
+                "skill",
+                "Load a skill listed under Skills in the system prompt: its full instructions and files.",
+                json!({"type": "object", "properties": {
+                    "name": {"type": "string", "description": "skill name as listed"}
+                }, "required": ["name"]}),
+            ));
+        }
+        if let Some(mcp) = &self.mcp {
+            specs.extend(
+                mcp.specs()
+                    .into_iter()
+                    .filter(|spec| mcp.permission(&spec.function.name) != Some(Permission::Deny)),
+            );
         }
         if self.config.write != Permission::Deny {
             specs.push(ToolSpec::function(
@@ -878,16 +1001,24 @@ impl BuiltinTools {
                 Err(e) => Err(e),
             },
             "web_search" => match parse(call) {
-                Ok(args) => self.web_search(args).await,
+                Ok(args) => self.web_search(actor, args).await,
                 Err(e) => Err(e),
             },
             "browser" => match parse(call) {
                 Ok(args) => self.browser(args).await,
                 Err(e) => Err(e),
             },
+            "web_fetch" => match parse(call) {
+                Ok(args) => self.web_fetch(actor, args).await,
+                Err(e) => Err(e),
+            },
+            "skill" => parse(call).and_then(|args| self.skill(args)),
             "cron_add" => parse(call).and_then(|args| self.cron_add(actor, args)),
             "cron_list" => self.cron_list(actor),
             "cron_remove" => parse(call).and_then(|args| self.cron_remove(actor, args)),
+            other if crate::mcp::is_mcp_tool(other) => {
+                self.mcp(other, &call.function.arguments).await
+            }
             other => Err(format!("error: unknown tool {other}")),
         }
     }
@@ -1208,6 +1339,57 @@ mod tests {
         let out = run(reviewed(None, None), "touch nobody").await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("nobody").exists());
+    }
+
+    #[tokio::test]
+    async fn skills_are_listed_and_loaded_only_for_those_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("skills/weather/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: weather\ndescription: Weather for a city.\n---\nAsk wttr.in.\n",
+        )
+        .unwrap();
+        let config = ToolsConfig {
+            write: Permission::Allow,
+            ..ToolsConfig::default()
+        };
+        let skills = Skills::new(dir.path(), &crate::config::SkillsConfig::default());
+        let t = BuiltinTools::new(
+            dir.path().to_owned(),
+            config,
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap()
+        .with_skills(Some(skills));
+        let (prompt, offered, loaded) = owner(async {
+            (
+                t.prompt(),
+                t.specs().iter().any(|s| s.function.name == "skill"),
+                t.call(&call("skill", json!({"name": "weather"}))).await,
+            )
+        })
+        .await;
+        let prompt = prompt.unwrap();
+        assert!(
+            prompt.contains("- weather: Weather for a city."),
+            "{prompt}"
+        );
+        assert!(prompt.contains("skills/<name>/SKILL.md"), "{prompt}");
+        assert!(offered);
+        assert!(loaded.ends_with("Ask wttr.in."), "{loaded}");
+
+        let guest = crate::access::AccessConfig::default().resolve("qq:X", "qq:c2c:X");
+        let (prompt, loaded) = access::with_actor(guest, async {
+            (
+                t.prompt(),
+                t.call(&call("skill", json!({"name": "weather"}))).await,
+            )
+        })
+        .await;
+        assert_eq!(prompt, None);
+        assert!(loaded.contains("not permitted"), "{loaded}");
     }
 
     #[tokio::test]

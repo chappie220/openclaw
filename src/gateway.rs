@@ -366,6 +366,12 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         locks.entry(session.to_owned()).or_default().clone()
     }
 
+    /// Whether no turn is running in any session.
+    pub fn idle(&self) -> bool {
+        let locks = self.session_locks.lock().unwrap_or_else(|p| p.into_inner());
+        locks.values().all(|lock| lock.try_lock().is_ok())
+    }
+
     pub fn store(&self) -> &crate::store::Store {
         &self.agent.store
     }
@@ -445,11 +451,8 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         if let Some(reply) = crate::identity::command(&self.agent.store, &actor, prompt) {
             return Ok(reply);
         }
-        let (files, problems) = self.agent.save_uploads(uploads);
-        let mut next = FollowUp {
-            text: crate::attachments::with_problems(prompt, &problems),
-            files,
-        };
+        let (files, text) = self.agent.receive(&actor, session, prompt, uploads).await;
+        let mut next = FollowUp { text, files };
         if chatting {
             match self.follow_up(session, &actor, next) {
                 // With acknowledgements on, the reply comes once it goes in.
@@ -824,11 +827,11 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         });
         return;
     }
-    let (files, problems) = gateway.agent.save_uploads(&uploads);
-    let mut next = FollowUp {
-        text: crate::attachments::with_problems(&text, &problems),
-        files,
-    };
+    let (files, text) = gateway
+        .agent
+        .receive(&actor, &session, &text, &uploads)
+        .await;
+    let mut next = FollowUp { text, files };
     match gateway.follow_up(&session, &actor, next) {
         Ok(()) => {
             let _ = out.send(ServerMsg::Queued { session });
@@ -1049,6 +1052,7 @@ mod tests {
             model: Hang,
             summarizer: None,
             vision: None,
+            voice: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1117,6 +1121,7 @@ mod tests {
             ),
             summarizer: None,
             vision: None,
+            voice: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1161,6 +1166,7 @@ mod tests {
             ),
             summarizer: None,
             vision: None,
+            voice: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1246,6 +1252,7 @@ mod tests {
             model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
             summarizer: None,
             vision: None,
+            voice: None,
             tools,
             store: store.clone(),
             config: crate::config::AgentConfig::default(),
@@ -1326,6 +1333,7 @@ mod tests {
             model: Gate(go.clone(), AtomicU64::new(0), fail_ack),
             summarizer: None,
             vision: None,
+            voice: None,
             tools,
             store,
             config: crate::config::AgentConfig::default(),

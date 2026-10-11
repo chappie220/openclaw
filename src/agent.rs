@@ -100,6 +100,11 @@ pub enum AgentEvent {
 pub trait Tools: Send + Sync {
     fn specs(&self) -> Vec<ToolSpec>;
     async fn call(&self, call: &ToolCall) -> String;
+    /// Instructions for this turn's actor that go after the identity in
+    /// the system prompt (the skills they may load).
+    fn prompt(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Abstracts the model so the loop can be tested without a network.
@@ -131,6 +136,8 @@ pub struct Agent<M: Model, T: Tools> {
     pub summarizer: Option<M>,
     /// Answers the calls that carry images; `model` when not set.
     pub vision: Option<M>,
+    /// Transcribes voice messages when they arrive.
+    pub voice: Option<crate::voice::Transcriber>,
     pub tools: T,
     pub store: Store,
     pub config: AgentConfig,
@@ -195,6 +202,46 @@ impl<M: Model, T: Tools> Agent<M, T> {
         crate::attachments::save_all(&self.config.workspace, uploads)
     }
 
+    /// Saves files that came with a message and transcribes its voice
+    /// messages: the files, and the message text with notes about files that
+    /// could not be kept and the transcripts.
+    /// Transcription is for `actor` in `session`, and skipped once they
+    /// reached a spending limit (the turn then says so).
+    pub async fn receive(
+        &self,
+        actor: &Actor,
+        session: &str,
+        text: &str,
+        uploads: &[Upload],
+    ) -> (Vec<Attachment>, String) {
+        let (files, problems) = self.save_uploads(uploads);
+        let text = crate::attachments::with_problems(text, &problems);
+        let over = || {
+            let limits = &self.config.limits;
+            limits.check(&self.store, actor).ok().flatten().is_some()
+        };
+        let notes = match &self.voice {
+            Some(voice) if files.iter().any(|f| crate::voice::is_audio(&f.mime)) && !over() => {
+                let mut record = |usage: &crate::llm::Usage| {
+                    if let Err(err) = self.store.record_usage(
+                        session,
+                        "voice",
+                        Some(&actor.id),
+                        Some(&voice.model),
+                        usage,
+                    ) {
+                        eprintln!("usage: cannot record a transcription: {err:#}");
+                    }
+                };
+                voice
+                    .notes(&self.config.workspace, &files, &mut record)
+                    .await
+            }
+            _ => Vec::new(),
+        };
+        (files, crate::voice::with_notes(&text, &notes))
+    }
+
     async fn turn(
         &self,
         session: &str,
@@ -205,6 +252,9 @@ impl<M: Model, T: Tools> Agent<M, T> {
         on_event: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<String> {
         let session_id = self.store.session_id(session)?;
+        if let Some((hit, owner)) = self.over_limit(0.0) {
+            return Ok(hit.message(owner));
+        }
         if is_compact_command(input) {
             if !access::current().is_some_and(|a| a.owner) {
                 return Ok(chat::COMPACT_OWNER_ONLY.now().into());
@@ -222,14 +272,21 @@ impl<M: Model, T: Tools> Agent<M, T> {
         let recall = self.recall(input);
         let specs = self.tools.specs();
         let tool_json = serde_json::to_string(&specs)?;
+        let tools_prompt = self.tools.prompt();
         // Answers given before messages sent during the turn were inserted.
         let mut answers: Vec<String> = Vec::new();
+        // What this turn's model calls cost so far.
+        let mut spent = 0.0;
         for step in 0..self.config.max_steps {
             // Read per call so an identity saved mid-turn takes effect on the next call.
             let identity = self.store.identity()?;
             let can_set = access::current().is_some_and(|a| a.can(access::Capability::Identity));
-            let system =
+            let mut system =
                 identity::system_prompt(&self.config.system_prompt, identity.as_ref(), can_set);
+            if let Some(extra) = &tools_prompt {
+                system.push_str("\n\n");
+                system.push_str(extra);
+            }
             let mut messages = vec![ChatMessage::system(&system)];
             messages.extend(
                 self.window(
@@ -275,6 +332,7 @@ impl<M: Model, T: Tools> Agent<M, T> {
                 other => other?,
             };
             self.record(session, "turn", &completion);
+            spent += completion.usage.map_or(0.0, |u| u.cost);
             if let Some(usage) = completion.usage
                 && let Err(err) =
                     self.store
@@ -338,6 +396,13 @@ impl<M: Model, T: Tools> Agent<M, T> {
                 if !ready.is_empty() {
                     self.insert(session_id, ready, on_event)?;
                 }
+            }
+            if let Some((hit, owner)) = self.over_limit(spent) {
+                self.store
+                    .append(session_id, &ChatMessage::assistant(hit.note()))?;
+                answers.push(hit.message(owner));
+                answers.retain(|a| !a.trim().is_empty());
+                return Ok(answers.join("\n\n"));
             }
         }
         bail!(
@@ -457,11 +522,46 @@ impl<M: Model, T: Tools> Agent<M, T> {
         let Some(usage) = &completion.usage else {
             return;
         };
-        if let Err(err) = self
-            .store
-            .record_usage(session, kind, completion.model.as_deref(), usage)
-        {
+        let actor = access::current().map(|a| a.id);
+        if let Err(err) = self.store.record_usage(
+            session,
+            kind,
+            actor.as_deref(),
+            completion.model.as_deref(),
+            usage,
+        ) {
             eprintln!("usage: cannot record a model call: {err:#}");
+        }
+    }
+
+    /// The spending limit this turn's actor has reached, with whether they
+    /// are an owner; `turn_spent` is what the turn cost so far.
+    fn over_limit(&self, turn_spent: f64) -> Option<(crate::limits::Exceeded, bool)> {
+        let limits = &self.config.limits;
+        let actor = access::current()?;
+        if let Some(limit) = limits.turn_limit()
+            && turn_spent >= limit
+        {
+            let hit = crate::limits::Exceeded {
+                kind: crate::limits::Kind::Turn,
+                spent: turn_spent,
+                limit,
+            };
+            return Some((hit, actor.owner));
+        }
+        match limits.check(&self.store, &actor) {
+            Ok(Some(hit)) => {
+                eprintln!(
+                    "limits: {:?} limit reached for {} (${:.4} of ${:.4})",
+                    hit.kind, actor.id, hit.spent, hit.limit
+                );
+                Some((hit, actor.owner))
+            }
+            Ok(None) => None,
+            Err(err) => {
+                eprintln!("limits: cannot read spending: {err:#}");
+                None
+            }
         }
     }
 
@@ -771,6 +871,7 @@ mod tests {
             ])),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -838,6 +939,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -854,6 +956,148 @@ mod tests {
                 .unwrap();
         }
         agent
+    }
+
+    fn costly_call(cost: f64) -> Completion {
+        Completion {
+            tool_calls: vec![ToolCall {
+                id: "c".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+            usage: Some(crate::llm::Usage {
+                cost,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_stops_at_its_spending_limit() {
+        let agent = Agent {
+            model: Scripted(Mutex::new(vec![
+                costly_call(0.03),
+                costly_call(0.03),
+                costly_call(0.03),
+            ])),
+            summarizer: None,
+            vision: None,
+            voice: None,
+            tools: Echo,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig {
+                limits: crate::limits::LimitsConfig {
+                    turn_usd: Some(0.05),
+                    ..Default::default()
+                },
+                ..AgentConfig::default()
+            },
+        };
+        let reply = agent
+            .run_turn(Actor::owner(access::CLI), "s", "loop", &mut |_| {})
+            .await
+            .unwrap();
+        assert!(
+            reply.contains("0.06") && reply.contains("limits.turn_usd"),
+            "{reply}"
+        );
+        // The third call was never made.
+        assert_eq!(agent.model.0.lock().unwrap().len(), 1);
+        let id = agent.store.session_id("s").unwrap();
+        let last = agent.store.history(id, 100).unwrap().pop().unwrap();
+        assert!(
+            last.content
+                .unwrap()
+                .starts_with("[Stopped: this turn's spending limit")
+        );
+        assert!((agent.store.spent_since(0, Some("cli")).unwrap() - 0.06).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_guest_over_their_allowance_is_refused_before_any_call() {
+        let agent = Agent {
+            model: Scripted(Mutex::new(Vec::new())),
+            summarizer: None,
+            vision: None,
+            voice: None,
+            tools: Echo,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig::default(),
+        };
+        let spent = crate::llm::Usage {
+            cost: crate::limits::DEFAULT_GUEST_DAILY_USD,
+            ..Default::default()
+        };
+        agent
+            .store
+            .record_usage("qq:c2c:X", "turn", Some("qq:X"), None, &spent)
+            .unwrap();
+        let guest = crate::access::AccessConfig::default().resolve("qq:X", "qq:c2c:X");
+        let reply = agent
+            .run_turn(guest, "qq:c2c:X", "hi", &mut |_| {})
+            .await
+            .unwrap();
+        assert!(reply.contains("0.5"), "{reply}");
+        assert!(!reply.contains("limits."), "{reply}");
+        let id = agent.store.session_id("qq:c2c:X").unwrap();
+        assert!(agent.store.history(id, 100).unwrap().is_empty());
+        // Someone else still gets an answer.
+        let other = crate::access::AccessConfig::default().resolve("qq:Y", "qq:c2c:Y");
+        agent.model.0.lock().unwrap().push(Completion {
+            text: "hello".into(),
+            ..Default::default()
+        });
+        let reply = agent
+            .run_turn(other, "qq:c2c:Y", "hi", &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(reply, "hello");
+    }
+
+    /// Tools that add to the system prompt.
+    struct Prompted;
+
+    #[async_trait::async_trait]
+    impl Tools for Prompted {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        async fn call(&self, _call: &ToolCall) -> String {
+            String::new()
+        }
+        fn prompt(&self) -> Option<String> {
+            Some("## Skills\n\n- weather: Weather.".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tools_prompt_follows_the_identity() {
+        let agent = Agent {
+            model: Recorder {
+                summary: None,
+                seen: Mutex::new(Vec::new()),
+            },
+            summarizer: None,
+            vision: None,
+            voice: None,
+            tools: Prompted,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig::default(),
+        };
+        agent
+            .run_turn(Actor::owner(access::CLI), "s", "hi", &mut |_| {})
+            .await
+            .unwrap();
+        let seen = agent.model.seen.lock().unwrap();
+        let system = seen[0][0].content.as_deref().unwrap();
+        assert!(
+            system.ends_with("\n\n## Skills\n\n- weather: Weather."),
+            "{system}"
+        );
     }
 
     #[tokio::test]
@@ -944,6 +1188,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1063,6 +1308,7 @@ mod tests {
             }])),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Stuck,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1138,6 +1384,7 @@ mod tests {
             model,
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1343,6 +1590,7 @@ mod tests {
             }])),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1413,6 +1661,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1458,6 +1707,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Camera(dir.path().to_owned(), Default::default()),
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1664,6 +1914,7 @@ mod tests {
             model: Scripted(Mutex::new(looping)),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {

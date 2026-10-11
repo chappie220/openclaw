@@ -137,6 +137,56 @@ const COMMANDS: &[(&str, Tr)] = &[
         tr("Delete a fact by id", "按编号删除一条记忆"),
     ),
     (
+        "doctor",
+        tr(
+            "Check that the key, models, browser, channels and service work",
+            "检查 key、模型、浏览器、各渠道和服务是否正常",
+        ),
+    ),
+    (
+        "update",
+        tr(
+            "Install the latest release from GitHub, or go back to the previous binary",
+            "从 GitHub 安装最新版本，或者回退到上一个版本",
+        ),
+    ),
+    (
+        "skills",
+        tr("List, install or remove skills", "列出、安装或删除 skill"),
+    ),
+    (
+        "skills list",
+        tr(
+            "Show installed skills and whether they can be used",
+            "显示已安装的 skill 以及能否使用",
+        ),
+    ),
+    (
+        "skills install",
+        tr(
+            "Install skills from a directory or a git URL",
+            "从目录或 git 地址安装 skill",
+        ),
+    ),
+    (
+        "skills remove",
+        tr("Delete an installed skill", "删除已安装的 skill"),
+    ),
+    (
+        "backup",
+        tr(
+            "Save the config, memory, chats, jobs and workspace to one .tar.gz file",
+            "把配置、记忆、对话、定时任务和工作区保存到一个 .tar.gz 文件",
+        ),
+    ),
+    (
+        "restore",
+        tr(
+            "Restore a backup made with `backup` (stop the Gateway first)",
+            "恢复用 `backup` 做的备份（请先停止 Gateway）",
+        ),
+    ),
+    (
         "init",
         tr(
             "Guided first-time setup: language, OpenRouter key, model",
@@ -209,6 +259,66 @@ const ARGS: &[(&str, &str, Tr)] = &[
     ("*", "version", tr("Print version", "显示版本")),
     ("*", "session", tr("Session name", "会话名")),
     ("ask", "message", tr("Message to send", "要发送的消息")),
+    (
+        "backup",
+        "file",
+        tr(
+            "File to write (default: openclaw-backup-<date>-<time>.tar.gz here)",
+            "要写入的文件（默认：当前目录下的 openclaw-backup-<日期>-<时间>.tar.gz）",
+        ),
+    ),
+    (
+        "backup",
+        "no_workspace",
+        tr("Leave the workspace out", "不包含工作区"),
+    ),
+    ("restore", "file", tr("Backup file", "备份文件")),
+    (
+        "skills install",
+        "source",
+        tr(
+            "Directory, git URL, or GitHub link to a folder (…/tree/<branch>/<path>)",
+            "目录、git 地址，或 GitHub 上某个文件夹的链接（…/tree/<分支>/<路径>）",
+        ),
+    ),
+    (
+        "skills install",
+        "force",
+        tr("Replace skills with the same name", "替换同名的 skill"),
+    ),
+    ("skills remove", "name", tr("Skill name", "skill 名")),
+    (
+        "update",
+        "check",
+        tr(
+            "Only say whether a newer version exists",
+            "只检查有没有新版本",
+        ),
+    ),
+    (
+        "update",
+        "rollback",
+        tr(
+            "Put back the binary the last update replaced",
+            "恢复上次更新前的程序",
+        ),
+    ),
+    (
+        "restore",
+        "force",
+        tr(
+            "Replace an existing config and state; what is replaced is moved aside",
+            "替换现有的配置和数据；被替换的文件会移到一旁",
+        ),
+    ),
+    (
+        "doctor",
+        "offline",
+        tr(
+            "Only read the config and this host; contact nothing",
+            "只检查配置和本机，不联网",
+        ),
+    ),
     (
         "ask",
         "attach",

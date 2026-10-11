@@ -1,6 +1,7 @@
 //! Runtime configuration: one TOML file under the state directory, with
 //! environment overrides for secrets.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -25,6 +26,11 @@ pub struct Config {
     pub mail: MailConfig,
     pub search: SearchConfig,
     pub browser: BrowserConfig,
+    pub fetch: FetchConfig,
+    pub mcp: McpConfig,
+    pub skills: SkillsConfig,
+    pub limits: crate::limits::LimitsConfig,
+    pub update: crate::update::UpdateConfig,
     pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
 }
@@ -148,6 +154,102 @@ impl Default for BrowserConfig {
             timeout_secs: 30,
             idle_secs: 300,
             max_chars: 8000,
+        }
+    }
+}
+
+/// `web_fetch`: downloads a page and reads its text, without a browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FetchConfig {
+    /// Off: no `web_fetch` tool.
+    pub enabled: bool,
+    /// Let owners fetch pages on this host and the local network (the
+    /// router, a NAS); never guests.
+    pub private_network: bool,
+    /// Seconds one download may take.
+    pub timeout_secs: u64,
+    /// Bytes downloaded at most; a longer page is cut.
+    pub max_bytes: usize,
+    /// Characters of page text returned per call.
+    pub max_chars: usize,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            private_network: false,
+            timeout_secs: 20,
+            max_bytes: 2_000_000,
+            max_chars: 8000,
+        }
+    }
+}
+
+/// Skills in `<workspace>/skills/<name>/SKILL.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub enabled: bool,
+    /// Skills left out, by name.
+    pub disabled: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
+        }
+    }
+}
+
+/// MCP servers whose tools the agent may use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// By name; the name prefixes the server's tools (`<name>__<tool>`).
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// One MCP server: a local program (`command`) or a remote endpoint (`url`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub enabled: bool,
+    /// Program speaking MCP on stdin/stdout, e.g. `npx` or `uvx`.
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// Extra environment; `${NAME}` reads the Gateway's own.
+    pub env: BTreeMap<String, String>,
+    /// Working directory; default: where openclaw-rs was started.
+    pub cwd: Option<PathBuf>,
+    /// Streamable HTTP endpoint, instead of `command`.
+    pub url: Option<String>,
+    /// HTTP headers, e.g. `Authorization = "Bearer ${TOKEN}"`.
+    pub headers: BTreeMap<String, String>,
+    /// Offer only these tools (by the server's names); empty: all.
+    pub tools: Vec<String>,
+    /// `ask` has every call approved first; `deny` turns the server off.
+    pub permission: Permission,
+    /// Seconds one tool call may take.
+    pub timeout_secs: u64,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            url: None,
+            headers: BTreeMap::new(),
+            tools: Vec::new(),
+            permission: Permission::Allow,
+            timeout_secs: 60,
         }
     }
 }
@@ -322,6 +424,9 @@ pub struct AgentConfig {
     /// screenshots); default: model.model. Set it when the main model has
     /// no image input.
     pub vision_model: Option<String>,
+    /// Model that transcribes voice messages; default: model.model. Set it
+    /// when the main model has no audio input.
+    pub audio_model: Option<String>,
     /// Saved memories looked up from each message and shown with it; 0 turns
     /// recall off.
     pub recall_limit: usize,
@@ -331,6 +436,9 @@ pub struct AgentConfig {
     /// startup from `tools.workspace`, never read from the file.
     #[serde(skip)]
     pub workspace: PathBuf,
+    /// `[limits]`, set at startup; never read from `[agent]`.
+    #[serde(skip)]
+    pub limits: crate::limits::LimitsConfig,
 }
 
 /// What a tool category may do without asking.
@@ -453,9 +561,11 @@ impl Default for AgentConfig {
             context_tokens: 64_000,
             summary_model: None,
             vision_model: None,
+            audio_model: None,
             recall_limit: 5,
             recall_tokens: 800,
             workspace: PathBuf::new(),
+            limits: crate::limits::LimitsConfig::default(),
         }
     }
 }

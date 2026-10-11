@@ -17,6 +17,13 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Email channel (IMAP in, SMTP out) | ✅ |
 | Identity setup on first start, web search | ✅ |
 | Browser, using the one installed on the host | ✅ |
+| Reading web pages without a browser (`web_fetch`) | ✅ |
+| Backup and restore (`backup`, `restore`) | ✅ |
+| Voice messages to text (QQ, email, Web UI) | ✅ |
+| MCP client (stdio and Streamable HTTP servers) | ✅ |
+| Skills (`SKILL.md`, compatible with OpenClaw and Agent Skills) | ✅ |
+| Spending limits (daily, monthly, per guest, per turn) | ✅ |
+| Updates from GitHub Releases (`update`, optional auto-update) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -30,6 +37,9 @@ scp target/aarch64-unknown-linux-musl/release/openclaw-rs pi:/usr/local/bin/
 ```
 
 Or build on the Pi itself: `apk add cargo build-base && cargo build --release`.
+
+Or download a release binary (`openclaw-rs-aarch64-unknown-linux-musl`)
+from GitHub Releases; later versions then come with [`update`](#updates).
 
 ## Usage
 
@@ -81,6 +91,45 @@ Comments and keys the editor does not know are kept, every change is checked
 before it is accepted, and the file is saved with mode 0600. It also opens a
 file that currently fails to load, so it can be repaired. The full list of
 options is under [Memory](#memory) below.
+
+## Checking the setup
+
+```sh
+openclaw-rs doctor             # everything, including two tiny model calls
+openclaw-rs doctor --offline   # only the config and this host
+```
+
+`doctor` checks what is configured and says, for each problem, what to
+change. Each line is ✓ (works), ! (works, but read this), ✗ (broken) or ·
+(for information); it exits with status 1 when anything is broken, so it
+can run from a script.
+
+- Config: the file loads, the workspace is writable.
+- Models: a model and a key are set; OpenRouter accepts the key (and how
+  much credit is left); every configured model id (`model.model`,
+  `agent.summary_model`, `agent.vision_model`, `search.model`) is on
+  OpenRouter's list; the main model can call tools; something can see
+  images. Then two real calls, a few hundred tokens: the main model is asked
+  to call a tool, and the image model is shown a small red picture and
+  asked its colour.
+- Browser: which one was found, and that it starts and opens a page (in a
+  scratch profile, closed again right after).
+- Reading web pages: `web_fetch` reads `https://example.com`, so a host
+  that is offline or needs a proxy shows up here.
+- MCP servers: each starts and lists its tools.
+- Skills: each installed skill, and what it still needs.
+- Web search: SearXNG answers with JSON.
+- Gateway: an address other hosts can reach has a token (else `serve`
+  refuses to start), and whether a Gateway is running.
+- QQ and email, when enabled: QQ logs in and gets its gateway; email logs
+  in over IMAP and SMTP, as `mail check` does.
+- Spending limits: which are set; a warning when QQ or email is on and
+  guests have no limit.
+- Updates: this version and platform, whether a newer release exists, and
+  whether `update.auto` can replace the binary.
+- Access and service: owners are set when QQ or email is on; whether the
+  OpenRC service is installed. The service runs as its own account, so run
+  `doctor` as that account to check its config.
 
 ## Shell completion
 
@@ -175,6 +224,31 @@ model. When the model given the images refuses them, the call is retried
 once with the files only listed, and the reply ends with a note in your
 language saying the images were not looked at and to set (or change)
 `agent.vision_model`.
+
+## Voice messages
+
+Voice messages become text when they arrive, so the model and the history
+only see words:
+
+- **QQ:** QQ sends its own speech recognition with each voice message; that
+  is used as is, free, with nothing downloaded. Without it, the WAV version QQ
+  offers is downloaded and transcribed as below.
+- **Email, Web UI, `ask --attach`:** audio attachments (wav, mp3, ogg, m4a,
+  aac, flac, aiff; up to 10 MB, three per message) are sent to a model with
+  audio input once and the transcript is added to the message. The file
+  stays in `inbox/`.
+
+The message then reads, for example,
+`[Voice message inbox/3fa2…-qq-voice.wav, transcribed: 明天早上八点叫我起床]`.
+When a file cannot be transcribed (an AMR or SILK file, a model without audio
+input), the note says why, and the model can tell the sender.
+
+```toml
+[agent]
+audio_model = "..."   # any OpenRouter model with audio input; default: the main model
+```
+
+`doctor` says whether the main model (or `audio_model`) takes audio.
 
 ## Stopping a turn
 
@@ -304,6 +378,142 @@ The browser can reach anything the host can, including pages on your local
 network, so it is the `browser` [capability](#access): the owner has it,
 guests do not unless granted.
 
+## Reading web pages
+
+Most pages do not need a browser. `web_fetch` downloads a page and turns its
+HTML into text, with headings, lists, tables and links (as Markdown) kept, in
+a few hundred milliseconds and without starting anything. The model reads
+search results and links people send this way, and keeps the `browser` for
+pages that need JavaScript, a login or clicking.
+
+- Only the page's own content is kept: scripts, styles, navigation, footers,
+  hidden parts and links to other language versions are dropped, and when a
+  page marks its content with `<main>` or `<article>`, only that is read.
+- Long pages come in `max_chars` pieces; the model reads on with `offset`,
+  which comes from a short-lived cache rather than downloading again.
+- Pages are read in their own charset (GBK and others included). PDFs,
+  images and other files are refused with a hint to use the browser or shell.
+- Pages on this host and the local network (127.0.0.1, 192.168.x.x,
+  `localhost`, cloud metadata addresses and so on) are refused, also after a
+  redirect or behind a name that resolves to them, so a guest cannot use it to
+  reach your router. `private_network = true` lets owners read them; guests
+  never can.
+
+```toml
+[fetch]
+enabled = true
+private_network = false   # true: owners may also read pages on the LAN
+timeout_secs = 20
+max_bytes = 2000000       # a longer page is cut
+max_chars = 8000          # text per call
+```
+
+It is the `web_fetch` [capability](#access), which guests have by default.
+
+## MCP servers
+
+Tools from [Model Context Protocol](https://modelcontextprotocol.io) servers
+are offered to the model next to the built-in ones, so the agent can use
+GitHub, Home Assistant, a database or anything else that has an MCP server,
+without the binary growing. Nothing is bundled: a server is a program already
+on the host (spoken to over stdin/stdout) or a remote Streamable HTTP endpoint.
+
+```toml
+[mcp.servers.time]                  # local: started with the Gateway
+command = "uvx"
+args = ["mcp-server-time", "--local-timezone=Asia/Shanghai"]
+
+[mcp.servers.files]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/pi/docs"]
+tools = ["read_text_file", "list_directory", "search_files"]   # only these
+env = { NODE_OPTIONS = "--max-old-space-size=128" }
+
+[mcp.servers.github]                # remote
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "Bearer ${GITHUB_TOKEN}" }   # read from the environment
+permission = "ask"                  # approve every call; "deny" turns it off
+timeout_secs = 60                   # per call
+```
+
+- A server's tools are called `<server>__<tool>` (`time__get_current_time`).
+  They start with every `chat`, `ask` and `serve`, all at once, within 30 s.
+  A server that fails to start, or exits later, is left out and started again
+  on the next call to one of its tools.
+- Text comes back as is. Images, audio and files a tool returns are saved
+  under `mcp/` in the workspace, and the model looks at the first image as
+  it does at browser screenshots. A server that changes its tool list is
+  read again after the next call.
+- `${NAME}` in `env` and `headers` is taken from the Gateway's environment,
+  so tokens can live in `/etc/conf.d/openclaw-rs` instead of the config.
+- A server's own processes form a process group that ends with the Gateway.
+- `doctor` starts each server and lists its tools (`--offline` only shows
+  what is configured, since `npx -y` may download).
+
+MCP tools need the `mcp` [capability](#access): owners have it, guests do not
+unless granted, since a server can do whatever it was built for. Use `tools`
+to offer only the harmless ones, or grant `mcp` to specific senders only.
+
+## Skills
+
+A skill teaches the agent how to do one kind of task: the steps, the
+commands, what to watch out for. Where an MCP server gives the agent new
+tools, a skill tells it how to use the ones it has. Skills use the
+`SKILL.md` format of OpenClaw and Agent Skills, so most published skills
+work as they are.
+
+```sh
+openclaw-rs skills install https://github.com/openclaw/openclaw/tree/main/skills/weather
+openclaw-rs skills install ./my-skills          # a skill, or a folder of them
+openclaw-rs skills list
+# ✓ weather  ready     Current weather and forecasts with web_fetch, ...
+# ✗ github   needs gh  GitHub CLI for issues, PRs, CI/check logs, ...
+openclaw-rs skills remove weather
+```
+
+A skill is a directory in `workspace/skills/`:
+
+```
+workspace/skills/weather/
+├── SKILL.md      # front matter, then the instructions
+└── forecast.sh   # optional scripts and references
+```
+
+```markdown
+---
+name: weather
+description: Current weather and forecasts. Use when asked about weather, rain or temperature.
+metadata: {"openclaw": {"requires": {"bins": ["curl"]}}}
+---
+# Weather
+Run `curl -s "wttr.in/<city>?format=3"` ...
+```
+
+- Only each skill's name and description go into the system prompt, so
+  many skills cost a few hundred tokens. When a request matches one, the
+  model loads its full text with the `skill` tool and follows it; scripts
+  run with `shell`, from the skill's directory (`{baseDir}` in a skill is
+  replaced by it).
+- `metadata.openclaw.requires` lists what a skill needs: `bins` (all on
+  PATH), `anyBins` (one of them), `env` (variables set) and `os`. A skill
+  whose needs are not met is left out; `skills list` and `doctor` say what
+  is missing.
+- Skills change without a restart: they are read again every turn. Being in
+  the workspace, they are in [backups](#backup-and-restore).
+- Ask the agent to "save this as a skill" and it writes one (owners only, as
+  it needs `files_write`).
+- `git` is needed to install from a URL. Installing a skill means trusting
+  its instructions, like running a script someone sent you: read it first.
+
+```toml
+[skills]
+enabled = true
+disabled = ["github"]   # installed but left out
+```
+
+Loading skills is the `skills` [capability](#access): owners have it,
+guests do not unless granted. A skill that runs commands still needs `shell`.
+
 ## Scheduled jobs
 
 `serve` runs jobs on standard 5-field cron schedules in the host's local time.
@@ -333,6 +543,68 @@ doas openclaw-rs service uninstall           # keeps state and logs
 The service runs as the given account with state in its `~/.openclaw-rs`,
 under `supervise-daemon` with automatic restart. `OPENROUTER_API_KEY`, `OPENCLAW_RS_TOKEN`, `QQ_APP_SECRET`, `MAIL_PASSWORD` and
 `TYPESAFE_API_KEY` from the installing shell are copied into `/etc/conf.d/openclaw-rs` (mode 0600).
+
+## Updates
+
+```sh
+openclaw-rs update --check     # is there a newer release?
+doas openclaw-rs update        # install it, and restart the service if it runs
+doas openclaw-rs update --rollback   # back to the binary the last update replaced
+```
+
+`update` takes the latest release of `update.repo` on GitHub, downloads the
+binary for this platform, checks it against the release's `SHA256SUMS`,
+makes sure it runs and reports the new version, and only then replaces the
+current binary, which is kept as `<binary>.old`. Run it as whoever owns the
+binary (root for `/usr/local/bin`).
+
+The Gateway also looks for a new release once a day and logs it. With
+`auto = true` it installs it on its own and restarts once no turn is
+running, in place (same process, so `supervise-daemon` keeps watching it);
+the browser and MCP servers are started again. That needs the service
+account to be able to write the binary, so keep it somewhere that account
+owns (e.g. `/home/pi/bin/openclaw-rs`, then `service install` again);
+`doctor` warns when it cannot.
+
+```toml
+[update]
+check = true                   # look once a day and log a new version
+auto = false                   # also install it and restart
+check_hours = 24
+repo = "chappie220/openclaw"   # where releases come from
+```
+
+Releases are published by pushing a tag that matches `Cargo.toml`'s version
+(`git tag v0.2.0 && git push origin v0.2.0`): the Release workflow builds
+the aarch64 and x86_64 musl binaries and their `SHA256SUMS`.
+
+## Backup and restore
+
+```sh
+openclaw-rs backup                         # ./openclaw-backup-<date>-<time>.tar.gz
+openclaw-rs backup /mnt/usb/oc.tar.gz --no-workspace
+openclaw-rs restore oc.tar.gz              # on the new host, Gateway stopped
+openclaw-rs restore oc.tar.gz --force      # over existing state
+```
+
+A backup is one ordinary `.tar.gz` (`tar tzf` lists it) with `config.toml`,
+the three databases (`soul.sqlite`: identity and memories; `chats.sqlite`:
+sessions; `runtime.sqlite`: scheduled jobs, the mail queue, usage) and the
+workspace. The browser profile is left out. Databases are copied with SQLite's
+`VACUUM INTO`, so backing up while the Gateway runs is safe, e.g. from the
+system crontab. The file is mode 0600 since the config holds keys and
+passwords; keys only in `/etc/conf.d/openclaw-rs` are not in it.
+
+`restore` refuses while a Gateway is running, and over an existing config or
+state unless `--force`, which moves everything it replaces to
+`<state dir>/before-restore-<time>/` rather than deleting it. The whole
+archive is unpacked and checked first (each database's integrity, the config
+parses), so a damaged backup changes nothing. Only the files a backup writes
+are taken from the archive, and links are skipped. Workspace files are
+merged in: files of the same name are replaced (and kept aside), others stay.
+
+For the service, run both as its account so the right state is used and the
+files keep their owner: `doas -u pi openclaw-rs backup`.
 
 ## QQ (official bot)
 
@@ -445,13 +717,13 @@ not offered (or is talked into it) is still refused:
   unless it only listens on loopback) act as the **owner**: every tool, subject
   to the `[tools]` settings.
 - QQ and email senders are **guests** unless listed in `access.owners`. A guest
-  only gets `access.guest` (by default just `web_search`): no shell, no files,
+  only gets `access.guest` (by default `web_search` and `web_fetch`): no shell, no files,
   no memory, no scheduled jobs and no identity changes.
 
 ```toml
 [access]
 owners = ["qq:<your openid>", "mail:me@example.com"]
-guest = ["web_search"]               # what any other sender may use
+guest = ["web_search", "web_fetch"] # what any other sender may use
 [access.grants]                      # more for named senders, sessions or channels
 "qq:<friend openid>" = ["memory", "cron"]
 "qq:group:<group openid>" = ["web_search"]
@@ -459,7 +731,7 @@ guest = ["web_search"]               # what any other sender may use
 ```
 
 Capabilities: `shell`, `files_read` (`read_file`, `list_dir`), `files_write`,
-`memory`, `cron`, `identity`, `web_search`, `browser`. `shell`, `files_write` and
+`memory`, `cron`, `identity`, `web_search`, `web_fetch`, `browser`, `mcp`, `skills`. `shell`, `files_write` and
 `identity` still follow `tools.shell`, `tools.write` and `tools.identity`, and
 `ask` is still declined where nobody can approve.
 
@@ -681,6 +953,34 @@ tokens, cached tokens and cost are kept in `runtime.sqlite`:
 openclaw-rs usage            # last 30 days, per session
 openclaw-rs usage --days 1
 ```
+
+### Spending limits
+
+Model calls stop once a limit is reached, so a chatty guest, a tool loop or
+a scheduled job cannot drain the OpenRouter balance:
+
+```toml
+[limits]                  # US dollars; 0 or unset: no limit
+daily_usd = 2             # the whole agent per day (local time), owners included
+monthly_usd = 20          # the whole agent per calendar month
+guest_daily_usd = 0.5     # each sender who is not an owner, per day (default 0.5)
+turn_usd = 0.3            # one reply that keeps calling tools
+[limits.senders]          # per day for named senders, instead of guest_daily_usd
+"qq:<friend openid>" = 2
+```
+
+- What counts: turns, context summaries, acknowledgements, `web_search`
+  through OpenRouter and voice transcription, each for the sender it was for.
+  Scheduled jobs count for whoever created them. The small calls of the
+  guided-conversation and command auto-review models are not counted.
+- A turn is refused before its first call when a limit is reached, and a
+  running turn stops before its next call; the last call can go a little over.
+  The person is told which limit it was and when it resets (owners also learn
+  which setting to change). Voice messages from someone over a limit are not
+  transcribed.
+- Costs are what OpenRouter reports per call, so with another `base_url`
+  limits only count what that provider reports; `doctor` says so.
+- `usage` shows today's and this month's spending against the limits.
 
 ## Command auto-review
 

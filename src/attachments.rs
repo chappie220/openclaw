@@ -104,10 +104,35 @@ pub fn guess_mime(name: &str) -> String {
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "aif" | "aiff" => "audio/aiff",
+        "amr" => "audio/amr",
+        "silk" | "slk" => "audio/silk",
         "mp4" => "video/mp4",
         _ => "application/octet-stream",
     }
     .into()
+}
+
+/// A file extension for a MIME type, for files saved without a name.
+pub fn extension_for(mime: &str) -> &'static str {
+    match mime.split(';').next().unwrap_or("").trim() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "application/pdf" => "pdf",
+        "application/json" => "json",
+        m if m.starts_with("text/") => "txt",
+        _ => "bin",
+    }
 }
 
 /// A safe file name: the last path component, without control characters,

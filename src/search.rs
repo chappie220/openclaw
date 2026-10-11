@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::config::{ModelConfig, SearchConfig, SearchProvider};
+use crate::llm::Usage;
 
 pub struct Searcher {
     http: reqwest::Client,
@@ -57,7 +58,16 @@ impl Searcher {
         }))
     }
 
-    pub async fn search(&self, query: &str) -> Result<String> {
+    /// The model OpenRouter searches run on; `None` for SearXNG.
+    pub fn model(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::OpenRouter { model, .. } => Some(model),
+            Backend::Searxng { .. } => None,
+        }
+    }
+
+    /// The results, and what the search cost when OpenRouter ran it.
+    pub async fn search(&self, query: &str) -> Result<(String, Option<Usage>)> {
         let query = query.trim();
         if query.is_empty() {
             bail!("query is empty");
@@ -86,7 +96,12 @@ impl Searcher {
                     .send()
                     .await
                     .context("search request failed")?;
-                Ok(openrouter_results(&json_body(response).await?))
+                let body = json_body(response).await?;
+                let usage = body
+                    .get("usage")
+                    .filter(|u| u.is_object())
+                    .map(Usage::parse);
+                Ok((openrouter_results(&body), usage))
             }
             Backend::Searxng { url } => {
                 let url = reqwest::Url::parse_with_params(
@@ -100,9 +115,9 @@ impl Searcher {
                     .send()
                     .await
                     .context("search request failed")?;
-                Ok(searxng_results(
-                    &json_body(response).await?,
-                    self.max_results,
+                Ok((
+                    searxng_results(&json_body(response).await?, self.max_results),
+                    None,
                 ))
             }
         }

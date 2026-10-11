@@ -3,18 +3,23 @@
 mod access;
 mod agent;
 mod attachments;
+mod backup;
 mod browser;
 mod cli_text;
 mod completions;
 mod config;
 mod context;
 mod cron;
+mod doctor;
+mod fetch;
 mod gateway;
 mod guide;
 mod i18n;
 mod identity;
+mod limits;
 mod llm;
 mod mail;
+mod mcp;
 mod memory;
 mod onboard;
 mod qq;
@@ -22,9 +27,12 @@ mod review;
 mod search;
 mod service;
 mod setup;
+mod skills;
 mod store;
 mod tools;
+mod update;
 mod usage;
+mod voice;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -103,6 +111,42 @@ enum Command {
     },
     /// Guided first-time setup: language, OpenRouter key, model.
     Init,
+    /// Check that the key, models, browser, channels and service work.
+    Doctor {
+        /// Only read the config and this host; contact nothing.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Install the latest release from GitHub, or go back to the previous binary.
+    Update {
+        /// Only say whether a newer version exists.
+        #[arg(long)]
+        check: bool,
+        /// Put back the binary the last update replaced.
+        #[arg(long, conflicts_with = "check")]
+        rollback: bool,
+    },
+    /// List, install or remove skills.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+    /// Save the config, memory, chats, jobs and workspace to one .tar.gz file.
+    Backup {
+        /// File to write (default: openclaw-backup-<date>-<time>.tar.gz here).
+        file: Option<PathBuf>,
+        /// Leave the workspace out.
+        #[arg(long)]
+        no_workspace: bool,
+    },
+    /// Restore a backup made with `backup` (stop the Gateway first).
+    Restore {
+        /// Backup file.
+        file: PathBuf,
+        /// Replace an existing config and state; what is replaced is moved aside.
+        #[arg(long)]
+        force: bool,
+    },
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
     Config,
     /// Print a shell completion script: bash, zsh, fish, elvish or powershell.
@@ -176,6 +220,21 @@ enum CronAction {
     Remove {
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// Show installed skills and whether they can be used.
+    List,
+    /// Install skills from a directory or a git URL.
+    Install {
+        source: String,
+        /// Replace skills with the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete an installed skill.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -309,6 +368,34 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Config = cli.command {
         return setup::run(&config_path, i18n::current());
     }
+    if let Command::Doctor { offline } = cli.command {
+        if !doctor::run(&config_path, &state, offline).await? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // Before loading, so a new host without a config can be restored.
+    if let Command::Backup { file, no_workspace } = &cli.command {
+        let paths = backup::Paths::new(&state, &config_path);
+        let file = file.clone().unwrap_or_else(backup::default_name);
+        backup::backup(&paths, &file, !no_workspace)?.print();
+        return Ok(());
+    }
+    if let Command::Restore { file, force } = &cli.command {
+        let bind = Config::load(&config_path)
+            .map(|c| c.gateway.bind)
+            .unwrap_or_else(|_| config::GatewayConfig::default().bind);
+        backup::ensure_stopped(&bind)?;
+        let paths = backup::Paths::new(&state, &config_path);
+        backup::restore(&paths, file, *force)?.print();
+        return Ok(());
+    }
+    // Before loading, so a config this version cannot read can still be
+    // fixed by the next one.
+    if let Command::Update { check, rollback } = cli.command {
+        let config = Config::load(&config_path).unwrap_or_default();
+        return update::run(&config.update, check, rollback, &config.gateway.bind).await;
+    }
     if let Command::Init = cli.command {
         onboard::run(&config_path, i18n::current()).await?;
         return Ok(());
@@ -325,6 +412,23 @@ async fn run(cli: Cli) -> Result<()> {
         i18n::set(lang);
         config = Config::load(&config_path)?;
         println!();
+    }
+    if let Command::Skills { action } = &cli.command {
+        let workspace = config
+            .tools
+            .workspace
+            .clone()
+            .unwrap_or_else(|| state.join("workspace"));
+        let skills = skills::Skills::new(&workspace, &config.skills);
+        match action {
+            SkillsAction::List => skills::print_list(&skills),
+            SkillsAction::Install { source, force } => {
+                let names = skills::install(&skills, source, *force)?;
+                skills::print_installed(&skills, &names);
+            }
+            SkillsAction::Remove { name } => skills::remove(&skills, name)?,
+        }
+        return Ok(());
     }
     let store = Store::open(&state)?;
     match cli.command {
@@ -363,13 +467,22 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
-        Command::Config | Command::Init => unreachable!("handled before the config is loaded"),
-        Command::Completions { .. } => unreachable!("handled before state is opened"),
+        Command::Config
+        | Command::Init
+        | Command::Doctor { .. }
+        | Command::Backup { .. }
+        | Command::Restore { .. }
+        | Command::Update { .. } => {
+            unreachable!("handled before the config is loaded")
+        }
+        Command::Completions { .. } | Command::Skills { .. } => {
+            unreachable!("handled before state is opened")
+        }
         Command::Serve { bind } => {
             if store.identity()?.is_none() {
                 eprintln!("{}", text::FIRST_START.now());
             }
-            let agent = Arc::new(build_agent(&config, &state, store)?);
+            let agent = Arc::new(build_agent(&config, &state, store).await?);
             let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
             let gateway =
                 gateway::Gateway::new(agent, config.gateway.token(), config.access.clone());
@@ -406,6 +519,8 @@ async fn run(cli: Cli) -> Result<()> {
                 tokio::spawn(mail::run(bot, gateway.clone()));
             }
             tokio::spawn(gateway.clone().run_scheduler());
+            let idle = gateway.clone();
+            tokio::spawn(update::watch(config.update.clone(), move || idle.idle()));
             gateway::serve(gateway, &bind).await
         }
         Command::Sessions { action } => sessions(&store, action.unwrap_or(SessionsAction::List)),
@@ -415,6 +530,7 @@ async fn run(cli: Cli) -> Result<()> {
                 "{}",
                 usage::report(&store.usage_since(since)?, i18n::current())
             );
+            print!("\n{}", config.limits.summary(&store)?);
             Ok(())
         }
         Command::Ask {
@@ -430,12 +546,12 @@ async fn run(cli: Cli) -> Result<()> {
                 .iter()
                 .map(|path| read_upload(path))
                 .collect::<Result<Vec<_>>>()?;
-            let agent = build_agent(&config, &state, store)?;
+            let agent = build_agent(&config, &state, store).await?;
             turn(&agent, &session, &message, &uploads).await
         }
         Command::Chat { session } => {
             let name = store.identity()?.map(|i| i.name);
-            let agent = build_agent(&config, &state, store)?;
+            let agent = build_agent(&config, &state, store).await?;
             eprintln!(
                 "{}",
                 text::CHAT_BANNER.with(&[
@@ -512,7 +628,7 @@ fn completions_command(
 
 type CliAgent = Agent<llm::Client, BuiltinTools>;
 
-fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
+async fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
     let workspace = config
         .tools
         .workspace
@@ -542,17 +658,30 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         )?),
         _ => None,
     };
+    let mcp = mcp::Mcp::connect(&config.mcp, &workspace).await;
+    let voice =
+        voice::Transcriber::new(&config.model, config.agent.audio_model.as_deref(), &api_key)?;
     Ok(Agent {
         model: llm::Client::new(&config.model, api_key)?,
         summarizer,
         vision,
+        voice: Some(voice),
         tools: BuiltinTools::new(workspace.clone(), config.tools.clone(), store.clone())?
             .with_search(search)
             .with_browser(browser::Browser::new(&config.browser, state, &workspace))
+            .with_fetch(fetch::Fetcher::new(&config.fetch)?)
+            .with_mcp(Some(mcp))
+            .with_skills(
+                config
+                    .skills
+                    .enabled
+                    .then(|| skills::Skills::new(&workspace, &config.skills)),
+            )
             .with_review(review),
         store,
         config: config::AgentConfig {
             workspace,
+            limits: config.limits.clone(),
             ..config.agent.clone()
         },
     })
@@ -582,11 +711,9 @@ async fn turn(
         owner_command(&agent.store, input);
         return Ok(());
     }
-    let (files, problems) = agent.save_uploads(uploads);
-    for problem in &problems {
-        eprintln!("{}", text::ERROR.with(&[problem]));
-    }
-    let input = attachments::with_problems(input, &problems);
+    let (files, input) = agent
+        .receive(&access::Actor::owner(access::CLI), session, input, uploads)
+        .await;
     let input = input.as_str();
     let mut stdout = std::io::stdout();
     let mut on_event = |event| match event {

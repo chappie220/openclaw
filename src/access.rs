@@ -30,10 +30,17 @@ pub enum Capability {
     WebSearch,
     /// `browser`: opens any web page, including ones on the local network.
     Browser,
+    /// `web_fetch`: reads public web pages.
+    WebFetch,
+    /// Tools of the configured MCP servers (`<server>__<tool>`), which can
+    /// do whatever those servers do.
+    Mcp,
+    /// `skill`: loads the instructions of installed skills.
+    Skills,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 8] = [
+    pub const ALL: [Capability; 11] = [
         Capability::Shell,
         Capability::FilesRead,
         Capability::FilesWrite,
@@ -42,6 +49,9 @@ impl Capability {
         Capability::Identity,
         Capability::WebSearch,
         Capability::Browser,
+        Capability::WebFetch,
+        Capability::Mcp,
+        Capability::Skills,
     ];
 
     /// The capability a built-in tool needs; `None` for tools anyone may call.
@@ -55,6 +65,9 @@ impl Capability {
             "identity_set" | "identity_propose" => Capability::Identity,
             "web_search" => Capability::WebSearch,
             "browser" => Capability::Browser,
+            "web_fetch" => Capability::WebFetch,
+            "skill" => Capability::Skills,
+            name if crate::mcp::is_mcp_tool(name) => Capability::Mcp,
             _ => return None,
         })
     }
@@ -133,7 +146,7 @@ impl Default for AccessConfig {
     fn default() -> Self {
         Self {
             owners: Vec::new(),
-            guest: vec![Capability::WebSearch],
+            guest: vec![Capability::WebSearch, Capability::WebFetch],
             grants: BTreeMap::new(),
         }
     }

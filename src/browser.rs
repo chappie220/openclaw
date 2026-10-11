@@ -79,6 +79,21 @@ pub struct BrowserArgs {
     pub full_page: bool,
 }
 
+impl BrowserArgs {
+    fn action(action: &str) -> Self {
+        Self {
+            action: action.into(),
+            url: None,
+            element: None,
+            selector: None,
+            text: None,
+            submit: false,
+            offset: None,
+            full_page: false,
+        }
+    }
+}
+
 impl Browser {
     /// `None` when the browser is turned off or none is installed.
     pub fn new(config: &BrowserConfig, state: &Path, workspace: &Path) -> Option<Self> {
@@ -105,6 +120,28 @@ impl Browser {
             running: Arc::new(Mutex::new(None)),
             last_used: Arc::new(SyncMutex::new(Instant::now())),
         })
+    }
+
+    /// Starts the browser (or attaches to it), opens a tab and closes it all
+    /// again: `doctor`'s proof that the tool works. Returns the version.
+    pub async fn check(&self) -> Result<String> {
+        self.run("doctor", BrowserArgs::action("read")).await?;
+        let mut running = self.running.lock().await;
+        let version = match running.as_ref() {
+            Some(browser) => browser
+                .cdp
+                .call(None, "Browser.getVersion", json!({}))
+                .await?
+                .get("product")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown version")
+                .to_owned(),
+            None => bail!("the browser closed right after starting"),
+        };
+        if let Some(mut browser) = running.take() {
+            browser.close_tabs().await;
+        }
+        Ok(version)
     }
 
     /// What the tool runs, for its description.
