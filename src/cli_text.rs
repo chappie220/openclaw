@@ -144,6 +144,28 @@ const COMMANDS: &[(&str, Tr)] = &[
         ),
     ),
     (
+        "skills",
+        tr("List, install or remove skills", "列出、安装或删除 skill"),
+    ),
+    (
+        "skills list",
+        tr(
+            "Show installed skills and whether they can be used",
+            "显示已安装的 skill 以及能否使用",
+        ),
+    ),
+    (
+        "skills install",
+        tr(
+            "Install skills from a directory or a git URL",
+            "从目录或 git 地址安装 skill",
+        ),
+    ),
+    (
+        "skills remove",
+        tr("Delete an installed skill", "删除已安装的 skill"),
+    ),
+    (
         "backup",
         tr(
             "Save the config, memory, chats, jobs and workspace to one .tar.gz file",
@@ -244,6 +266,20 @@ const ARGS: &[(&str, &str, Tr)] = &[
         tr("Leave the workspace out", "不包含工作区"),
     ),
     ("restore", "file", tr("Backup file", "备份文件")),
+    (
+        "skills install",
+        "source",
+        tr(
+            "Directory, git URL, or GitHub link to a folder (…/tree/<branch>/<path>)",
+            "目录、git 地址，或 GitHub 上某个文件夹的链接（…/tree/<分支>/<路径>）",
+        ),
+    ),
+    (
+        "skills install",
+        "force",
+        tr("Replace skills with the same name", "替换同名的 skill"),
+    ),
+    ("skills remove", "name", tr("Skill name", "skill 名")),
     (
         "restore",
         "force",

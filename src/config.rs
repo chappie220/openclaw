@@ -28,6 +28,7 @@ pub struct Config {
     pub browser: BrowserConfig,
     pub fetch: FetchConfig,
     pub mcp: McpConfig,
+    pub skills: SkillsConfig,
     pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
 }
@@ -180,6 +181,24 @@ impl Default for FetchConfig {
             timeout_secs: 20,
             max_bytes: 2_000_000,
             max_chars: 8000,
+        }
+    }
+}
+
+/// Skills in `<workspace>/skills/<name>/SKILL.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    pub enabled: bool,
+    /// Skills left out, by name.
+    pub disabled: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
         }
     }
 }

@@ -533,6 +533,18 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: tr("Skills", "Skills"),
+        fields: &[Field {
+            path: &["skills", "enabled"],
+            label: tr("Skills", "Skills"),
+            help: tr(
+                "Task instructions in workspace/skills/<name>/SKILL.md that the agent loads when a request needs them. Manage them with openclaw-rs skills.",
+                "放在 workspace/skills/<名字>/SKILL.md 里的任务说明，需要时 agent 会自动加载。用 openclaw-rs skills 管理。",
+            ),
+            kind: Kind::Bool,
+        }],
+    },
+    Section {
         title: tr("Access", "权限"),
         fields: &[Field {
             path: &["access", "owners"],

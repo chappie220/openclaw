@@ -21,6 +21,7 @@ use crate::llm::{ToolCall, ToolSpec};
 use crate::mcp::Mcp;
 use crate::review::{Reviewer, Verdict};
 use crate::search::Searcher;
+use crate::skills::Skills;
 use crate::store::Store;
 
 /// Asks a person whether a gated action may run. Front ends supply their own.
@@ -86,6 +87,7 @@ pub struct BuiltinTools {
     browser: Option<Browser>,
     fetch: Option<Fetcher>,
     mcp: Option<Mcp>,
+    skills: Option<Skills>,
     review: Option<Reviewer>,
 }
 
@@ -163,6 +165,11 @@ struct WebFetchArgs {
 }
 
 #[derive(Deserialize)]
+struct SkillArgs {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct MemoryDeleteArgs {
     id: i64,
 }
@@ -184,6 +191,7 @@ impl BuiltinTools {
             browser: None,
             fetch: None,
             mcp: None,
+            skills: None,
             review: None,
         })
     }
@@ -206,6 +214,18 @@ impl BuiltinTools {
     pub fn with_mcp(mut self, mcp: Option<Mcp>) -> Self {
         self.mcp = mcp.filter(|m| !m.is_empty());
         self
+    }
+
+    pub fn with_skills(mut self, skills: Option<Skills>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    fn skill(&self, args: SkillArgs) -> Result<String, String> {
+        let skills = self.skills.as_ref().ok_or("error: skills are off")?;
+        skills
+            .load(args.name.trim())
+            .map_err(|err| format!("error: {err:#}"))
     }
 
     async fn mcp(&self, name: &str, arguments: &str) -> Result<String, String> {
@@ -754,6 +774,16 @@ impl Tools for BuiltinTools {
         specs
     }
 
+    fn prompt(&self) -> Option<String> {
+        let skills = self.skills.as_ref()?;
+        let actor = access::current()?;
+        if !actor.can(Capability::Skills) {
+            return None;
+        }
+        let can_write = actor.can(Capability::FilesWrite) && self.config.write != Permission::Deny;
+        skills.prompt(can_write)
+    }
+
     async fn call(&self, call: &ToolCall) -> String {
         let name = call.function.name.as_str();
         // Fail closed: a call outside any turn has no authority at all.
@@ -885,6 +915,17 @@ impl BuiltinTools {
                 }, "required": ["action"]}),
             ));
         }
+        if let Some(skills) = &self.skills
+            && !skills.ready().is_empty()
+        {
+            specs.push(ToolSpec::function(
+                "skill",
+                "Load a skill listed under Skills in the system prompt: its full instructions and files.",
+                json!({"type": "object", "properties": {
+                    "name": {"type": "string", "description": "skill name as listed"}
+                }, "required": ["name"]}),
+            ));
+        }
         if let Some(mcp) = &self.mcp {
             specs.extend(
                 mcp.specs()
@@ -962,6 +1003,7 @@ impl BuiltinTools {
                 Ok(args) => self.web_fetch(actor, args).await,
                 Err(e) => Err(e),
             },
+            "skill" => parse(call).and_then(|args| self.skill(args)),
             "cron_add" => parse(call).and_then(|args| self.cron_add(actor, args)),
             "cron_list" => self.cron_list(actor),
             "cron_remove" => parse(call).and_then(|args| self.cron_remove(actor, args)),
@@ -1288,6 +1330,57 @@ mod tests {
         let out = run(reviewed(None, None), "touch nobody").await;
         assert!(out.contains("nobody can answer"), "{out}");
         assert!(!dir.path().join("nobody").exists());
+    }
+
+    #[tokio::test]
+    async fn skills_are_listed_and_loaded_only_for_those_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("skills/weather/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: weather\ndescription: Weather for a city.\n---\nAsk wttr.in.\n",
+        )
+        .unwrap();
+        let config = ToolsConfig {
+            write: Permission::Allow,
+            ..ToolsConfig::default()
+        };
+        let skills = Skills::new(dir.path(), &crate::config::SkillsConfig::default());
+        let t = BuiltinTools::new(
+            dir.path().to_owned(),
+            config,
+            Store::open_in_memory().unwrap(),
+        )
+        .unwrap()
+        .with_skills(Some(skills));
+        let (prompt, offered, loaded) = owner(async {
+            (
+                t.prompt(),
+                t.specs().iter().any(|s| s.function.name == "skill"),
+                t.call(&call("skill", json!({"name": "weather"}))).await,
+            )
+        })
+        .await;
+        let prompt = prompt.unwrap();
+        assert!(
+            prompt.contains("- weather: Weather for a city."),
+            "{prompt}"
+        );
+        assert!(prompt.contains("skills/<name>/SKILL.md"), "{prompt}");
+        assert!(offered);
+        assert!(loaded.ends_with("Ask wttr.in."), "{loaded}");
+
+        let guest = crate::access::AccessConfig::default().resolve("qq:X", "qq:c2c:X");
+        let (prompt, loaded) = access::with_actor(guest, async {
+            (
+                t.prompt(),
+                t.call(&call("skill", json!({"name": "weather"}))).await,
+            )
+        })
+        .await;
+        assert_eq!(prompt, None);
+        assert!(loaded.contains("not permitted"), "{loaded}");
     }
 
     #[tokio::test]

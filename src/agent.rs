@@ -100,6 +100,11 @@ pub enum AgentEvent {
 pub trait Tools: Send + Sync {
     fn specs(&self) -> Vec<ToolSpec>;
     async fn call(&self, call: &ToolCall) -> String;
+    /// Instructions for this turn's actor that go after the identity in
+    /// the system prompt (the skills they may load).
+    fn prompt(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Abstracts the model so the loop can be tested without a network.
@@ -237,14 +242,19 @@ impl<M: Model, T: Tools> Agent<M, T> {
         let recall = self.recall(input);
         let specs = self.tools.specs();
         let tool_json = serde_json::to_string(&specs)?;
+        let tools_prompt = self.tools.prompt();
         // Answers given before messages sent during the turn were inserted.
         let mut answers: Vec<String> = Vec::new();
         for step in 0..self.config.max_steps {
             // Read per call so an identity saved mid-turn takes effect on the next call.
             let identity = self.store.identity()?;
             let can_set = access::current().is_some_and(|a| a.can(access::Capability::Identity));
-            let system =
+            let mut system =
                 identity::system_prompt(&self.config.system_prompt, identity.as_ref(), can_set);
+            if let Some(extra) = &tools_prompt {
+                system.push_str("\n\n");
+                system.push_str(extra);
+            }
             let mut messages = vec![ChatMessage::system(&system)];
             messages.extend(
                 self.window(
@@ -871,6 +881,48 @@ mod tests {
                 .unwrap();
         }
         agent
+    }
+
+    /// Tools that add to the system prompt.
+    struct Prompted;
+
+    #[async_trait::async_trait]
+    impl Tools for Prompted {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+        async fn call(&self, _call: &ToolCall) -> String {
+            String::new()
+        }
+        fn prompt(&self) -> Option<String> {
+            Some("## Skills\n\n- weather: Weather.".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_tools_prompt_follows_the_identity() {
+        let agent = Agent {
+            model: Recorder {
+                summary: None,
+                seen: Mutex::new(Vec::new()),
+            },
+            summarizer: None,
+            vision: None,
+            voice: None,
+            tools: Prompted,
+            store: Store::open_in_memory().unwrap(),
+            config: AgentConfig::default(),
+        };
+        agent
+            .run_turn(Actor::owner(access::CLI), "s", "hi", &mut |_| {})
+            .await
+            .unwrap();
+        let seen = agent.model.seen.lock().unwrap();
+        let system = seen[0][0].content.as_deref().unwrap();
+        assert!(
+            system.ends_with("\n\n## Skills\n\n- weather: Weather."),
+            "{system}"
+        );
     }
 
     #[tokio::test]

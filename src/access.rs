@@ -35,10 +35,12 @@ pub enum Capability {
     /// Tools of the configured MCP servers (`<server>__<tool>`), which can
     /// do whatever those servers do.
     Mcp,
+    /// `skill`: loads the instructions of installed skills.
+    Skills,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 10] = [
+    pub const ALL: [Capability; 11] = [
         Capability::Shell,
         Capability::FilesRead,
         Capability::FilesWrite,
@@ -49,6 +51,7 @@ impl Capability {
         Capability::Browser,
         Capability::WebFetch,
         Capability::Mcp,
+        Capability::Skills,
     ];
 
     /// The capability a built-in tool needs; `None` for tools anyone may call.
@@ -63,6 +66,7 @@ impl Capability {
             "web_search" => Capability::WebSearch,
             "browser" => Capability::Browser,
             "web_fetch" => Capability::WebFetch,
+            "skill" => Capability::Skills,
             name if crate::mcp::is_mcp_tool(name) => Capability::Mcp,
             _ => return None,
         })

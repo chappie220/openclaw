@@ -71,6 +71,7 @@ const S_BROWSER: Tr = tr("Browser", "浏览器");
 const S_FETCH: Tr = tr("Reading web pages", "读取网页");
 const S_SEARCH: Tr = tr("Web search", "网页搜索");
 const S_MCP: Tr = tr("MCP servers", "MCP 服务器");
+const S_SKILLS: Tr = tr("Skills", "Skills");
 const S_GATEWAY: Tr = tr("Gateway", "Gateway");
 const S_QQ: Tr = tr("QQ", "QQ");
 const S_MAIL: Tr = tr("Email", "邮件");
@@ -203,6 +204,20 @@ const MCP_GUESTS: Tr = tr(
     "guests may use MCP tools (mcp in access.guest): they can do whatever the servers can",
     "访客可以使用 MCP 工具（access.guest 里有 mcp）：服务器能做的事他们都能做",
 );
+const SKILLS_OFF: Tr = tr(
+    "turned off (skills.enabled = false)",
+    "已关闭（skills.enabled = false）",
+);
+const SKILLS_NONE: Tr = tr(
+    "none installed (openclaw-rs skills install <directory or git URL>, or put them in {})",
+    "还没有安装（openclaw-rs skills install <目录或 git 地址>，或者放到 {}）",
+);
+const SKILL_READY: Tr = tr("{}: ready", "{}：可用");
+const SKILL_UNUSABLE: Tr = tr("{}: {}", "{}：{}");
+const SKILLS_GUESTS: Tr = tr(
+    "guests may load skills (skills in access.guest): they can read every skill's instructions",
+    "访客可以加载 skill（access.guest 里有 skills）：所有 skill 的说明他们都能读到",
+);
 const SEARCH_OFF: Tr = tr("off: no web_search tool", "已关闭：没有 web_search 工具");
 const SEARCH_OPENROUTER: Tr = tr(
     "OpenRouter's web plugin, billed per search with the same key",
@@ -281,6 +296,7 @@ pub const ALL: &[Tr] = &[
     S_FETCH,
     S_SEARCH,
     S_MCP,
+    S_SKILLS,
     S_GATEWAY,
     S_QQ,
     S_MAIL,
@@ -337,6 +353,11 @@ pub const ALL: &[Tr] = &[
     MCP_NO_TOOLS,
     MCP_FAILED,
     MCP_GUESTS,
+    SKILLS_OFF,
+    SKILLS_NONE,
+    SKILL_READY,
+    SKILL_UNUSABLE,
+    SKILLS_GUESTS,
     SEARCH_OFF,
     SEARCH_OPENROUTER,
     SEARXNG_OK,
@@ -485,6 +506,9 @@ pub async fn run(path: &Path, state: &Path, offline: bool) -> Result<bool> {
 
     report.section(S_MCP);
     report.add(mcp_findings(&config, &workspace, offline).await);
+
+    report.section(S_SKILLS);
+    report.add(skills_findings(&config, &workspace));
 
     report.section(S_GATEWAY);
     report.add(gateway_findings(&config));
@@ -749,6 +773,33 @@ async fn fetch_findings(config: &Config, offline: bool) -> Vec<Finding> {
 
 /// Starts each server and lists its tools; offline only says what is set,
 /// since starting one may download it (`npx -y ...`).
+fn skills_findings(config: &Config, workspace: &Path) -> Vec<Finding> {
+    if !config.skills.enabled {
+        return vec![info(SKILLS_OFF.now())];
+    }
+    let skills = crate::skills::Skills::new(workspace, &config.skills);
+    let all = skills.scan();
+    if all.is_empty() {
+        return vec![info(SKILLS_NONE.with(&[&skills.dir.display().to_string()]))];
+    }
+    let mut findings: Vec<Finding> = all
+        .iter()
+        .map(|skill| match &skill.state {
+            crate::skills::State::Ready => ok(SKILL_READY.with(&[&skill.name])),
+            crate::skills::State::Off => info(SKILL_UNUSABLE.with(&[&skill.name, &skill.status()])),
+            _ => warn(SKILL_UNUSABLE.with(&[&skill.name, &skill.status()])),
+        })
+        .collect();
+    if config
+        .access
+        .guest
+        .contains(&crate::access::Capability::Skills)
+    {
+        findings.push(warn(SKILLS_GUESTS.now()));
+    }
+    findings
+}
+
 async fn mcp_findings(config: &Config, workspace: &Path, offline: bool) -> Vec<Finding> {
     let servers = &config.mcp.servers;
     if servers.is_empty() {

@@ -21,6 +21,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Backup and restore (`backup`, `restore`) | ✅ |
 | Voice messages to text (QQ, email, Web UI) | ✅ |
 | MCP client (stdio and Streamable HTTP servers) | ✅ |
+| Skills (`SKILL.md`, compatible with OpenClaw and Agent Skills) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -111,6 +112,7 @@ can run from a script.
 - Reading web pages: `web_fetch` reads `https://example.com`, so a host
   that is offline or needs a proxy shows up here.
 - MCP servers: each starts and lists its tools.
+- Skills: each installed skill, and what it still needs.
 - Web search: SearXNG answers with JSON.
 - Gateway: an address other hosts can reach has a token (else `serve`
   refuses to start), and whether a Gateway is running.
@@ -443,6 +445,66 @@ MCP tools need the `mcp` [capability](#access): owners have it, guests do not
 unless granted, since a server can do whatever it was built for. Use `tools`
 to offer only the harmless ones, or grant `mcp` to specific senders only.
 
+## Skills
+
+A skill teaches the agent how to do one kind of task: the steps, the
+commands, what to watch out for. Where an MCP server gives the agent new
+tools, a skill tells it how to use the ones it has. Skills use the
+`SKILL.md` format of OpenClaw and Agent Skills, so most published skills
+work as they are.
+
+```sh
+openclaw-rs skills install https://github.com/openclaw/openclaw/tree/main/skills/weather
+openclaw-rs skills install ./my-skills          # a skill, or a folder of them
+openclaw-rs skills list
+# ✓ weather  ready     Current weather and forecasts with web_fetch, ...
+# ✗ github   needs gh  GitHub CLI for issues, PRs, CI/check logs, ...
+openclaw-rs skills remove weather
+```
+
+A skill is a directory in `workspace/skills/`:
+
+```
+workspace/skills/weather/
+├── SKILL.md      # front matter, then the instructions
+└── forecast.sh   # optional scripts and references
+```
+
+```markdown
+---
+name: weather
+description: Current weather and forecasts. Use when asked about weather, rain or temperature.
+metadata: {"openclaw": {"requires": {"bins": ["curl"]}}}
+---
+# Weather
+Run `curl -s "wttr.in/<city>?format=3"` ...
+```
+
+- Only each skill's name and description go into the system prompt, so
+  many skills cost a few hundred tokens. When a request matches one, the
+  model loads its full text with the `skill` tool and follows it; scripts
+  run with `shell`, from the skill's directory (`{baseDir}` in a skill is
+  replaced by it).
+- `metadata.openclaw.requires` lists what a skill needs: `bins` (all on
+  PATH), `anyBins` (one of them), `env` (variables set) and `os`. A skill
+  whose needs are not met is left out; `skills list` and `doctor` say what
+  is missing.
+- Skills change without a restart: they are read again every turn. Being in
+  the workspace, they are in [backups](#backup-and-restore).
+- Ask the agent to "save this as a skill" and it writes one (owners only, as
+  it needs `files_write`).
+- `git` is needed to install from a URL. Installing a skill means trusting
+  its instructions, like running a script someone sent you: read it first.
+
+```toml
+[skills]
+enabled = true
+disabled = ["github"]   # installed but left out
+```
+
+Loading skills is the `skills` [capability](#access): owners have it,
+guests do not unless granted. A skill that runs commands still needs `shell`.
+
 ## Scheduled jobs
 
 `serve` runs jobs on standard 5-field cron schedules in the host's local time.
@@ -626,7 +688,7 @@ guest = ["web_search", "web_fetch"] # what any other sender may use
 ```
 
 Capabilities: `shell`, `files_read` (`read_file`, `list_dir`), `files_write`,
-`memory`, `cron`, `identity`, `web_search`, `web_fetch`, `browser`, `mcp`. `shell`, `files_write` and
+`memory`, `cron`, `identity`, `web_search`, `web_fetch`, `browser`, `mcp`, `skills`. `shell`, `files_write` and
 `identity` still follow `tools.shell`, `tools.write` and `tools.identity`, and
 `ask` is still declined where nobody can approve.
 

@@ -26,6 +26,7 @@ mod review;
 mod search;
 mod service;
 mod setup;
+mod skills;
 mod store;
 mod tools;
 mod usage;
@@ -113,6 +114,11 @@ enum Command {
         /// Only read the config and this host; contact nothing.
         #[arg(long)]
         offline: bool,
+    },
+    /// List, install or remove skills.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
     },
     /// Save the config, memory, chats, jobs and workspace to one .tar.gz file.
     Backup {
@@ -203,6 +209,21 @@ enum CronAction {
     Remove {
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// Show installed skills and whether they can be used.
+    List,
+    /// Install skills from a directory or a git URL.
+    Install {
+        source: String,
+        /// Replace skills with the same name.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete an installed skill.
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -375,6 +396,23 @@ async fn run(cli: Cli) -> Result<()> {
         config = Config::load(&config_path)?;
         println!();
     }
+    if let Command::Skills { action } = &cli.command {
+        let workspace = config
+            .tools
+            .workspace
+            .clone()
+            .unwrap_or_else(|| state.join("workspace"));
+        let skills = skills::Skills::new(&workspace, &config.skills);
+        match action {
+            SkillsAction::List => skills::print_list(&skills),
+            SkillsAction::Install { source, force } => {
+                let names = skills::install(&skills, source, *force)?;
+                skills::print_installed(&skills, &names);
+            }
+            SkillsAction::Remove { name } => skills::remove(&skills, name)?,
+        }
+        return Ok(());
+    }
     let store = Store::open(&state)?;
     match cli.command {
         Command::Memory { action } => memory(&store, action),
@@ -419,7 +457,9 @@ async fn run(cli: Cli) -> Result<()> {
         | Command::Restore { .. } => {
             unreachable!("handled before the config is loaded")
         }
-        Command::Completions { .. } => unreachable!("handled before state is opened"),
+        Command::Completions { .. } | Command::Skills { .. } => {
+            unreachable!("handled before state is opened")
+        }
         Command::Serve { bind } => {
             if store.identity()?.is_none() {
                 eprintln!("{}", text::FIRST_START.now());
@@ -610,6 +650,12 @@ async fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliA
             .with_browser(browser::Browser::new(&config.browser, state, &workspace))
             .with_fetch(fetch::Fetcher::new(&config.fetch)?)
             .with_mcp(Some(mcp))
+            .with_skills(
+                config
+                    .skills
+                    .enabled
+                    .then(|| skills::Skills::new(&workspace, &config.skills)),
+            )
             .with_review(review),
         store,
         config: config::AgentConfig {
