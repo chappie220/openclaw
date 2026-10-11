@@ -25,6 +25,31 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Spending limits (daily, monthly, per guest, per turn) | ✅ |
 | Updates from GitHub Releases (`update`, optional auto-update) | ✅ |
 
+## Install
+
+On a Raspberry Pi (64-bit OS) or any x86_64/aarch64 Linux, from GitHub
+Releases:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/chappie220/openclaw/main/scripts/install.sh | doas sh
+openclaw-rs init
+```
+
+The script picks the binary for this machine, checks it against the
+release's `SHA256SUMS` and that it runs, and installs it to
+`/usr/local/bin` (`~/.local/bin` without root). It needs `curl` or `wget`
+(on Alpine: `doas apk add curl`). Options, after `sh -s --`:
+
+```sh
+curl -fsSL .../install.sh | sh -s -- --dir ~/bin        # somewhere else
+curl -fsSL .../install.sh | doas sh -s -- --version 0.2.0
+curl -fsSL .../install.sh | doas sh -s -- --service pi  # also the OpenRC service
+```
+
+`--service pi` installs the service right away when `pi` already has a
+config, and otherwise prints the two commands to run (`init` as `pi`, then
+`service install`). In a checkout, run `sh scripts/install.sh --help`.
+
 ## Build for Raspberry Pi (Alpine, aarch64)
 
 Alpine uses musl, so build a static binary. Cross-compile from any Linux host:
@@ -38,8 +63,7 @@ scp target/aarch64-unknown-linux-musl/release/openclaw-rs pi:/usr/local/bin/
 
 Or build on the Pi itself: `apk add cargo build-base && cargo build --release`.
 
-Or download a release binary (`openclaw-rs-aarch64-unknown-linux-musl`)
-from GitHub Releases; later versions then come with [`update`](#updates).
+Or use a release binary, with the [install script](#install).
 
 ## Usage
 
@@ -550,6 +574,14 @@ under `supervise-daemon` with automatic restart. `OPENROUTER_API_KEY`, `OPENCLAW
 openclaw-rs update --check     # is there a newer release?
 doas openclaw-rs update        # install it, and restart the service if it runs
 doas openclaw-rs update --rollback   # back to the binary the last update replaced
+```
+
+Or with the script, which also works when the installed binary is too old
+to have `update`, or broken (same options as the install script):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/chappie220/openclaw/main/scripts/update.sh | doas sh
+curl -fsSL .../update.sh | doas sh -s -- --version 0.1.0   # a given release, also to go back
 ```
 
 `update` takes the latest release of `update.repo` on GitHub, downloads the
