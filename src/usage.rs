@@ -17,21 +17,24 @@ pub struct SessionUsage {
 }
 
 impl Store {
-    /// Records one call; `kind` is `turn` or `summary`.
+    /// Records one call for `actor`; `kind` is `turn`, `summary`, `ack`,
+    /// `search` or `voice`.
     pub fn record_usage(
         &self,
         session: &str,
         kind: &str,
+        actor: Option<&str>,
         model: Option<&str>,
         usage: &Usage,
     ) -> Result<()> {
         self.runtime().execute(
-            "INSERT INTO usage(session, kind, model, prompt_tokens, cached_tokens,
+            "INSERT INTO usage(session, kind, actor, model, prompt_tokens, cached_tokens,
                cache_write_tokens, completion_tokens, cost, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 session,
                 kind,
+                actor,
                 model,
                 usage.prompt_tokens as i64,
                 usage.cached_tokens as i64,
@@ -194,13 +197,13 @@ mod tests {
             ..Usage::default()
         };
         store
-            .record_usage("a", "turn", Some("x/y"), &call(1000, 800, 0.01))
+            .record_usage("a", "turn", None, Some("x/y"), &call(1000, 800, 0.01))
             .unwrap();
         store
-            .record_usage("a", "summary", None, &call(500, 0, 0.002))
+            .record_usage("a", "summary", None, None, &call(500, 0, 0.002))
             .unwrap();
         store
-            .record_usage("b", "turn", None, &call(100, 0, 0.05))
+            .record_usage("b", "turn", None, None, &call(100, 0, 0.05))
             .unwrap();
         let rows = store.usage_since(0).unwrap();
         assert_eq!(rows[0].session, "b");

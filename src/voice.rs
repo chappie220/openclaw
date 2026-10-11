@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::attachments::Attachment;
 use crate::config::ModelConfig;
+use crate::llm::Usage;
 
 /// Largest audio file sent for transcription (about 10 minutes of speech).
 pub const MAX_AUDIO_BYTES: usize = 10 * 1024 * 1024;
@@ -48,7 +49,8 @@ impl Transcriber {
         })
     }
 
-    pub async fn transcribe(&self, data: &[u8], format: &str) -> Result<String> {
+    /// The transcript, and what it cost when the provider said.
+    pub async fn transcribe(&self, data: &[u8], format: &str) -> Result<(String, Option<Usage>)> {
         let body = json!({
             "model": self.model,
             "messages": [{"role": "user", "content": [
@@ -91,12 +93,22 @@ impl Transcriber {
         if transcript.is_empty() {
             bail!("{} returned no transcript", self.model);
         }
-        Ok(transcript.to_owned())
+        let usage = body
+            .as_ref()
+            .and_then(|b| b.get("usage"))
+            .filter(|u| u.is_object())
+            .map(Usage::parse);
+        Ok((transcript.to_owned(), usage))
     }
 
     /// Notes for the message text, one per audio file in `files`: its
-    /// transcript, or why there is none.
-    pub async fn notes(&self, workspace: &Path, files: &[Attachment]) -> Vec<String> {
+    /// transcript, or why there is none. `on_usage` gets each call's cost.
+    pub async fn notes(
+        &self,
+        workspace: &Path,
+        files: &[Attachment],
+        on_usage: &mut (dyn FnMut(&Usage) + Send),
+    ) -> Vec<String> {
         let mut notes = Vec::new();
         for (index, file) in files.iter().filter(|f| is_audio(&f.mime)).enumerate() {
             if index >= MAX_AUDIO {
@@ -107,7 +119,12 @@ impl Transcriber {
                 continue;
             }
             notes.push(match self.note(workspace, file).await {
-                Ok(transcript) => transcribed(file, &transcript),
+                Ok((transcript, usage)) => {
+                    if let Some(usage) = &usage {
+                        on_usage(usage);
+                    }
+                    transcribed(file, &transcript)
+                }
                 Err(err) => {
                     let mut why = format!("{err:#}");
                     if !self.chosen {
@@ -123,7 +140,7 @@ impl Transcriber {
         notes
     }
 
-    async fn note(&self, workspace: &Path, file: &Attachment) -> Result<String> {
+    async fn note(&self, workspace: &Path, file: &Attachment) -> Result<(String, Option<Usage>)> {
         let format = audio_format(&file.mime, &file.name).with_context(|| {
             format!(
                 "{} audio is not supported (wav, mp3, ogg, m4a, aac, flac, aiff are)",
@@ -267,7 +284,8 @@ mod tests {
     #[tokio::test]
     async fn audio_files_are_transcribed_into_notes() {
         let (url, seen) = server(
-            json!({"choices": [{"message": {"content": " 明天早上八点叫我起床 \n"}}]}),
+            json!({"choices": [{"message": {"content": " 明天早上八点叫我起床 \n"}}],
+                   "usage": {"prompt_tokens": 300, "completion_tokens": 9, "cost": 0.0012}}),
             200,
         )
         .await;
@@ -280,7 +298,11 @@ mod tests {
             audio("v.amr", "audio/amr", 5),
         ];
         let transcriber = Transcriber::new(&model(&url), Some(" audio/model "), "k").unwrap();
-        let notes = transcriber.notes(dir.path(), &files).await;
+        let mut costs = Vec::new();
+        let notes = transcriber
+            .notes(dir.path(), &files, &mut |u| costs.push(u.cost))
+            .await;
+        assert_eq!(costs, [0.0012]);
         assert_eq!(
             notes,
             [
@@ -312,7 +334,7 @@ mod tests {
         let transcriber = Transcriber::new(&model(&url), None, "k").unwrap();
         assert_eq!(transcriber.model, "main/model");
         let notes = transcriber
-            .notes(dir.path(), &[audio("v.mp3", "audio/mpeg", 3)])
+            .notes(dir.path(), &[audio("v.mp3", "audio/mpeg", 3)], &mut |_| {})
             .await;
         assert!(
             notes[0].contains("No endpoints found that support input audio"),

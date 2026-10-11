@@ -16,6 +16,7 @@ mod gateway;
 mod guide;
 mod i18n;
 mod identity;
+mod limits;
 mod llm;
 mod mail;
 mod mcp;
@@ -510,6 +511,7 @@ async fn run(cli: Cli) -> Result<()> {
                 "{}",
                 usage::report(&store.usage_since(since)?, i18n::current())
             );
+            print!("\n{}", config.limits.summary(&store)?);
             Ok(())
         }
         Command::Ask {
@@ -660,6 +662,7 @@ async fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliA
         store,
         config: config::AgentConfig {
             workspace,
+            limits: config.limits.clone(),
             ..config.agent.clone()
         },
     })
@@ -689,7 +692,9 @@ async fn turn(
         owner_command(&agent.store, input);
         return Ok(());
     }
-    let (files, input) = agent.receive(input, uploads).await;
+    let (files, input) = agent
+        .receive(&access::Actor::owner(access::CLI), session, input, uploads)
+        .await;
     let input = input.as_str();
     let mut stdout = std::io::stdout();
     let mut on_event = |event| match event {

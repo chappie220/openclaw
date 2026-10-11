@@ -174,7 +174,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    fn parse(value: &Value) -> Self {
+    pub fn parse(value: &Value) -> Self {
         let int = |path: &str| value.pointer(path).and_then(Value::as_u64).unwrap_or(0);
         Self {
             prompt_tokens: int("/prompt_tokens"),

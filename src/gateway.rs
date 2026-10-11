@@ -445,7 +445,7 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         if let Some(reply) = crate::identity::command(&self.agent.store, &actor, prompt) {
             return Ok(reply);
         }
-        let (files, text) = self.agent.receive(prompt, uploads).await;
+        let (files, text) = self.agent.receive(&actor, session, prompt, uploads).await;
         let mut next = FollowUp { text, files };
         if chatting {
             match self.follow_up(session, &actor, next) {
@@ -821,7 +821,10 @@ async fn run_turn<M: Model + 'static, T: Tools + 'static>(
         });
         return;
     }
-    let (files, text) = gateway.agent.receive(&text, &uploads).await;
+    let (files, text) = gateway
+        .agent
+        .receive(&actor, &session, &text, &uploads)
+        .await;
     let mut next = FollowUp { text, files };
     match gateway.follow_up(&session, &actor, next) {
         Ok(()) => {

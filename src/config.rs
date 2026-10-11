@@ -29,6 +29,7 @@ pub struct Config {
     pub fetch: FetchConfig,
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
+    pub limits: crate::limits::LimitsConfig,
     pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
 }
@@ -434,6 +435,9 @@ pub struct AgentConfig {
     /// startup from `tools.workspace`, never read from the file.
     #[serde(skip)]
     pub workspace: PathBuf,
+    /// `[limits]`, set at startup; never read from `[agent]`.
+    #[serde(skip)]
+    pub limits: crate::limits::LimitsConfig,
 }
 
 /// What a tool category may do without asking.
@@ -560,6 +564,7 @@ impl Default for AgentConfig {
             recall_limit: 5,
             recall_tokens: 800,
             workspace: PathBuf::new(),
+            limits: crate::limits::LimitsConfig::default(),
         }
     }
 }

@@ -76,6 +76,7 @@ const S_GATEWAY: Tr = tr("Gateway", "Gateway");
 const S_QQ: Tr = tr("QQ", "QQ");
 const S_MAIL: Tr = tr("Email", "邮件");
 const S_ACCESS: Tr = tr("Access", "权限");
+const S_LIMITS: Tr = tr("Spending limits", "花费上限");
 const S_SERVICE: Tr = tr("Service", "服务");
 
 const CONFIG_OK: Tr = tr("{} loads", "{} 可以正常加载");
@@ -218,6 +219,19 @@ const SKILLS_GUESTS: Tr = tr(
     "guests may load skills (skills in access.guest): they can read every skill's instructions",
     "访客可以加载 skill（access.guest 里有 skills）：所有 skill 的说明他们都能读到",
 );
+const LIMIT_IS: Tr = tr("{}: ${}", "{}：${}");
+const LIMIT_NONE_TOTAL: Tr = tr(
+    "no limit for the whole agent: set limits.daily_usd or limits.monthly_usd to protect the balance",
+    "整个 agent 没有总上限：设置 limits.daily_usd 或 limits.monthly_usd 可以保护余额",
+);
+const LIMIT_NONE_GUESTS: Tr = tr(
+    "QQ or email is on and guests have no limit: anyone who writes can spend your balance (set limits.guest_daily_usd)",
+    "QQ 或邮件已开启，但访客没有上限：任何发消息的人都能花你的余额（设置 limits.guest_daily_usd）",
+);
+const LIMIT_NO_COSTS: Tr = tr(
+    "{} may not report what calls cost; limits only count the costs it reports",
+    "{} 可能不报告调用费用；上限只能统计它报告的费用",
+);
 const SEARCH_OFF: Tr = tr("off: no web_search tool", "已关闭：没有 web_search 工具");
 const SEARCH_OPENROUTER: Tr = tr(
     "OpenRouter's web plugin, billed per search with the same key",
@@ -301,6 +315,7 @@ pub const ALL: &[Tr] = &[
     S_QQ,
     S_MAIL,
     S_ACCESS,
+    S_LIMITS,
     S_SERVICE,
     CONFIG_OK,
     CONFIG_MISSING,
@@ -353,6 +368,10 @@ pub const ALL: &[Tr] = &[
     MCP_NO_TOOLS,
     MCP_FAILED,
     MCP_GUESTS,
+    LIMIT_IS,
+    LIMIT_NONE_TOTAL,
+    LIMIT_NONE_GUESTS,
+    LIMIT_NO_COSTS,
     SKILLS_OFF,
     SKILLS_NONE,
     SKILL_READY,
@@ -521,6 +540,9 @@ pub async fn run(path: &Path, state: &Path, offline: bool) -> Result<bool> {
 
     report.section(S_ACCESS);
     report.add(access_findings(&config));
+
+    report.section(S_LIMITS);
+    report.add(limits_findings(&config));
 
     report.section(S_SERVICE);
     report.add([if Path::new("/etc/init.d/openclaw-rs").exists() {
@@ -958,6 +980,39 @@ async fn mail_findings(config: &Config, offline: bool) -> Vec<Finding> {
             .collect(),
         Err(err) => vec![fail(MAIL_FAILED.with(&[&format!("{err:#}")]))],
     }
+}
+
+fn limits_findings(config: &Config) -> Vec<Finding> {
+    let limits = &config.limits;
+    let set = |v: Option<f64>| v.filter(|l| *l > 0.0);
+    let mut findings = Vec::new();
+    for (key, value) in [
+        ("limits.daily_usd", limits.daily_usd),
+        ("limits.monthly_usd", limits.monthly_usd),
+        ("limits.guest_daily_usd", limits.guest_daily_usd),
+        ("limits.turn_usd", limits.turn_usd),
+    ] {
+        if let Some(value) = set(value) {
+            findings.push(ok(LIMIT_IS.with(&[key, &crate::limits::money(value)])));
+        }
+    }
+    for (sender, value) in &limits.senders {
+        findings.push(info(LIMIT_IS.with(&[
+            &format!("limits.senders.\"{sender}\""),
+            &crate::limits::money(*value),
+        ])));
+    }
+    if set(limits.daily_usd).is_none() && set(limits.monthly_usd).is_none() {
+        findings.push(info(LIMIT_NONE_TOTAL.now()));
+    }
+    if (config.qq.enabled || config.mail.enabled) && set(limits.guest_daily_usd).is_none() {
+        findings.push(warn(LIMIT_NONE_GUESTS.now()));
+    }
+    let base = config.model.base_url.trim_end_matches('/');
+    if base != DEFAULT_BASE_URL {
+        findings.push(warn(LIMIT_NO_COSTS.with(&[base])));
+    }
+    findings
 }
 
 fn access_findings(config: &Config) -> Vec<Finding> {

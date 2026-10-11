@@ -210,6 +210,11 @@ CREATE TABLE usage (
 );
 CREATE INDEX usage_by_time ON usage(created_at);
 "#,
+        r#"
+-- The sender each call was for (`cli`, `qq:<openid>`, ...), for spending limits.
+ALTER TABLE usage ADD COLUMN actor TEXT;
+CREATE INDEX usage_by_actor ON usage(actor, created_at);
+"#,
     ],
     legacy: &[
         (

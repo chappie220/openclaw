@@ -22,6 +22,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Voice messages to text (QQ, email, Web UI) | ✅ |
 | MCP client (stdio and Streamable HTTP servers) | ✅ |
 | Skills (`SKILL.md`, compatible with OpenClaw and Agent Skills) | ✅ |
+| Spending limits (daily, monthly, per guest, per turn) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -118,6 +119,8 @@ can run from a script.
   refuses to start), and whether a Gateway is running.
 - QQ and email, when enabled: QQ logs in and gets its gateway; email logs
   in over IMAP and SMTP, as `mail check` does.
+- Spending limits: which are set; a warning when QQ or email is on and
+  guests have no limit.
 - Access and service: owners are set when QQ or email is on; whether the
   OpenRC service is installed. The service runs as its own account, so run
   `doctor` as that account to check its config.
@@ -910,6 +913,34 @@ tokens, cached tokens and cost are kept in `runtime.sqlite`:
 openclaw-rs usage            # last 30 days, per session
 openclaw-rs usage --days 1
 ```
+
+### Spending limits
+
+Model calls stop once a limit is reached, so a chatty guest, a tool loop or
+a scheduled job cannot drain the OpenRouter balance:
+
+```toml
+[limits]                  # US dollars; 0 or unset: no limit
+daily_usd = 2             # the whole agent per day (local time), owners included
+monthly_usd = 20          # the whole agent per calendar month
+guest_daily_usd = 0.5     # each sender who is not an owner, per day (default 0.5)
+turn_usd = 0.3            # one reply that keeps calling tools
+[limits.senders]          # per day for named senders, instead of guest_daily_usd
+"qq:<friend openid>" = 2
+```
+
+- What counts: turns, context summaries, acknowledgements, `web_search`
+  through OpenRouter and voice transcription, each for the sender it was for.
+  Scheduled jobs count for whoever created them. The small calls of the
+  guided-conversation and command auto-review models are not counted.
+- A turn is refused before its first call when a limit is reached, and a
+  running turn stops before its next call; the last call can go a little over.
+  The person is told which limit it was and when it resets (owners also learn
+  which setting to change). Voice messages from someone over a limit are not
+  transcribed.
+- Costs are what OpenRouter reports per call, so with another `base_url`
+  limits only count what that provider reports; `doctor` says so.
+- `usage` shows today's and this month's spending against the limits.
 
 ## Command auto-review
 

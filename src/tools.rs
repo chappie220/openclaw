@@ -342,12 +342,21 @@ impl BuiltinTools {
         }
     }
 
-    async fn web_search(&self, args: WebSearchArgs) -> Result<String, String> {
+    async fn web_search(&self, actor: &Actor, args: WebSearchArgs) -> Result<String, String> {
         let search = self.search.as_ref().ok_or("error: web search is off")?;
-        let found = search
+        let (found, usage) = search
             .search(&args.query)
             .await
             .map_err(|e| format!("error: {e:#}"))?;
+        if let Some(usage) = usage {
+            let session = crate::agent::current_session().unwrap_or_default();
+            if let Err(err) =
+                self.store
+                    .record_usage(&session, "search", Some(&actor.id), search.model(), &usage)
+            {
+                eprintln!("usage: cannot record a search: {err:#}");
+            }
+        }
         Ok(truncate(found.as_bytes(), self.config.max_output_bytes))
     }
 
@@ -992,7 +1001,7 @@ impl BuiltinTools {
                 Err(e) => Err(e),
             },
             "web_search" => match parse(call) {
-                Ok(args) => self.web_search(args).await,
+                Ok(args) => self.web_search(actor, args).await,
                 Err(e) => Err(e),
             },
             "browser" => match parse(call) {
