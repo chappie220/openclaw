@@ -1,6 +1,7 @@
 //! Runtime configuration: one TOML file under the state directory, with
 //! environment overrides for secrets.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -26,6 +27,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub browser: BrowserConfig,
     pub fetch: FetchConfig,
+    pub mcp: McpConfig,
     pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
 }
@@ -178,6 +180,55 @@ impl Default for FetchConfig {
             timeout_secs: 20,
             max_bytes: 2_000_000,
             max_chars: 8000,
+        }
+    }
+}
+
+/// MCP servers whose tools the agent may use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// By name; the name prefixes the server's tools (`<name>__<tool>`).
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// One MCP server: a local program (`command`) or a remote endpoint (`url`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub enabled: bool,
+    /// Program speaking MCP on stdin/stdout, e.g. `npx` or `uvx`.
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    /// Extra environment; `${NAME}` reads the Gateway's own.
+    pub env: BTreeMap<String, String>,
+    /// Working directory; default: where openclaw-rs was started.
+    pub cwd: Option<PathBuf>,
+    /// Streamable HTTP endpoint, instead of `command`.
+    pub url: Option<String>,
+    /// HTTP headers, e.g. `Authorization = "Bearer ${TOKEN}"`.
+    pub headers: BTreeMap<String, String>,
+    /// Offer only these tools (by the server's names); empty: all.
+    pub tools: Vec<String>,
+    /// `ask` has every call approved first; `deny` turns the server off.
+    pub permission: Permission,
+    /// Seconds one tool call may take.
+    pub timeout_secs: u64,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            url: None,
+            headers: BTreeMap::new(),
+            tools: Vec::new(),
+            permission: Permission::Allow,
+            timeout_secs: 60,
         }
     }
 }

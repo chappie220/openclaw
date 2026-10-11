@@ -32,10 +32,13 @@ pub enum Capability {
     Browser,
     /// `web_fetch`: reads public web pages.
     WebFetch,
+    /// Tools of the configured MCP servers (`<server>__<tool>`), which can
+    /// do whatever those servers do.
+    Mcp,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 9] = [
+    pub const ALL: [Capability; 10] = [
         Capability::Shell,
         Capability::FilesRead,
         Capability::FilesWrite,
@@ -45,6 +48,7 @@ impl Capability {
         Capability::WebSearch,
         Capability::Browser,
         Capability::WebFetch,
+        Capability::Mcp,
     ];
 
     /// The capability a built-in tool needs; `None` for tools anyone may call.
@@ -59,6 +63,7 @@ impl Capability {
             "web_search" => Capability::WebSearch,
             "browser" => Capability::Browser,
             "web_fetch" => Capability::WebFetch,
+            name if crate::mcp::is_mcp_tool(name) => Capability::Mcp,
             _ => return None,
         })
     }

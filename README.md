@@ -20,6 +20,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Reading web pages without a browser (`web_fetch`) | ✅ |
 | Backup and restore (`backup`, `restore`) | ✅ |
 | Voice messages to text (QQ, email, Web UI) | ✅ |
+| MCP client (stdio and Streamable HTTP servers) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -109,6 +110,7 @@ can run from a script.
   scratch profile, closed again right after).
 - Reading web pages: `web_fetch` reads `https://example.com`, so a host
   that is offline or needs a proxy shows up here.
+- MCP servers: each starts and lists its tools.
 - Web search: SearXNG answers with JSON.
 - Gateway: an address other hosts can reach has a token (else `serve`
   refuses to start), and whether a Gateway is running.
@@ -397,6 +399,50 @@ max_chars = 8000          # text per call
 
 It is the `web_fetch` [capability](#access), which guests have by default.
 
+## MCP servers
+
+Tools from [Model Context Protocol](https://modelcontextprotocol.io) servers
+are offered to the model next to the built-in ones, so the agent can use
+GitHub, Home Assistant, a database or anything else that has an MCP server,
+without the binary growing. Nothing is bundled: a server is a program already
+on the host (spoken to over stdin/stdout) or a remote Streamable HTTP endpoint.
+
+```toml
+[mcp.servers.time]                  # local: started with the Gateway
+command = "uvx"
+args = ["mcp-server-time", "--local-timezone=Asia/Shanghai"]
+
+[mcp.servers.files]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/pi/docs"]
+tools = ["read_text_file", "list_directory", "search_files"]   # only these
+env = { NODE_OPTIONS = "--max-old-space-size=128" }
+
+[mcp.servers.github]                # remote
+url = "https://api.githubcopilot.com/mcp/"
+headers = { Authorization = "Bearer ${GITHUB_TOKEN}" }   # read from the environment
+permission = "ask"                  # approve every call; "deny" turns it off
+timeout_secs = 60                   # per call
+```
+
+- A server's tools are called `<server>__<tool>` (`time__get_current_time`).
+  They start with every `chat`, `ask` and `serve`, all at once, within 30 s.
+  A server that fails to start, or exits later, is left out and started again
+  on the next call to one of its tools.
+- Text comes back as is. Images, audio and files a tool returns are saved
+  under `mcp/` in the workspace, and the model looks at the first image as
+  it does at browser screenshots. A server that changes its tool list is
+  read again after the next call.
+- `${NAME}` in `env` and `headers` is taken from the Gateway's environment,
+  so tokens can live in `/etc/conf.d/openclaw-rs` instead of the config.
+- A server's own processes form a process group that ends with the Gateway.
+- `doctor` starts each server and lists its tools (`--offline` only shows
+  what is configured, since `npx -y` may download).
+
+MCP tools need the `mcp` [capability](#access): owners have it, guests do not
+unless granted, since a server can do whatever it was built for. Use `tools`
+to offer only the harmless ones, or grant `mcp` to specific senders only.
+
 ## Scheduled jobs
 
 `serve` runs jobs on standard 5-field cron schedules in the host's local time.
@@ -580,7 +626,7 @@ guest = ["web_search", "web_fetch"] # what any other sender may use
 ```
 
 Capabilities: `shell`, `files_read` (`read_file`, `list_dir`), `files_write`,
-`memory`, `cron`, `identity`, `web_search`, `web_fetch`, `browser`. `shell`, `files_write` and
+`memory`, `cron`, `identity`, `web_search`, `web_fetch`, `browser`, `mcp`. `shell`, `files_write` and
 `identity` still follow `tools.shell`, `tools.write` and `tools.identity`, and
 `ask` is still declined where nobody can approve.
 

@@ -118,6 +118,23 @@ pub fn guess_mime(name: &str) -> String {
     .into()
 }
 
+/// A file extension for a MIME type, for files saved without a name.
+pub fn extension_for(mime: &str) -> &'static str {
+    match mime.split(';').next().unwrap_or("").trim() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "application/pdf" => "pdf",
+        "application/json" => "json",
+        m if m.starts_with("text/") => "txt",
+        _ => "bin",
+    }
+}
+
 /// A safe file name: the last path component, without control characters,
 /// at most 80 characters, never empty or a dot name.
 fn safe_name(name: &str) -> String {

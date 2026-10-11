@@ -18,6 +18,7 @@ use crate::config::{Permission, ToolsConfig};
 use crate::fetch::Fetcher;
 use crate::identity::Identity;
 use crate::llm::{ToolCall, ToolSpec};
+use crate::mcp::Mcp;
 use crate::review::{Reviewer, Verdict};
 use crate::search::Searcher;
 use crate::store::Store;
@@ -84,6 +85,7 @@ pub struct BuiltinTools {
     search: Option<Searcher>,
     browser: Option<Browser>,
     fetch: Option<Fetcher>,
+    mcp: Option<Mcp>,
     review: Option<Reviewer>,
 }
 
@@ -181,6 +183,7 @@ impl BuiltinTools {
             search: None,
             browser: None,
             fetch: None,
+            mcp: None,
             review: None,
         })
     }
@@ -198,6 +201,34 @@ impl BuiltinTools {
     pub fn with_fetch(mut self, fetch: Option<Fetcher>) -> Self {
         self.fetch = fetch;
         self
+    }
+
+    pub fn with_mcp(mut self, mcp: Option<Mcp>) -> Self {
+        self.mcp = mcp.filter(|m| !m.is_empty());
+        self
+    }
+
+    async fn mcp(&self, name: &str, arguments: &str) -> Result<String, String> {
+        let mcp = self
+            .mcp
+            .as_ref()
+            .ok_or("error: no MCP servers are configured")?;
+        let permission = mcp
+            .permission(name)
+            .ok_or_else(|| format!("error: unknown tool {name}"))?;
+        let arguments = if arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str::<serde_json::Value>(arguments)
+                .map_err(|e| format!("error: arguments are not valid JSON: {e}"))?
+        };
+        let summary: String = arguments.to_string().chars().take(500).collect();
+        self.permit(permission, name, &summary).await?;
+        let out = mcp
+            .call(name, arguments)
+            .await
+            .map_err(|err| format!("error: {err:#}"))?;
+        Ok(truncate(out.as_bytes(), self.config.max_output_bytes))
     }
 
     /// Reviews `shell` commands set to `ask` before anyone is asked.
@@ -854,6 +885,13 @@ impl BuiltinTools {
                 }, "required": ["action"]}),
             ));
         }
+        if let Some(mcp) = &self.mcp {
+            specs.extend(
+                mcp.specs()
+                    .into_iter()
+                    .filter(|spec| mcp.permission(&spec.function.name) != Some(Permission::Deny)),
+            );
+        }
         if self.config.write != Permission::Deny {
             specs.push(ToolSpec::function(
                 "write_file",
@@ -927,6 +965,9 @@ impl BuiltinTools {
             "cron_add" => parse(call).and_then(|args| self.cron_add(actor, args)),
             "cron_list" => self.cron_list(actor),
             "cron_remove" => parse(call).and_then(|args| self.cron_remove(actor, args)),
+            other if crate::mcp::is_mcp_tool(other) => {
+                self.mcp(other, &call.function.arguments).await
+            }
             other => Err(format!("error: unknown tool {other}")),
         }
     }

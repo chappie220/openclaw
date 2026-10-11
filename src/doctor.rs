@@ -70,6 +70,7 @@ const S_MODELS: Tr = tr("Models", "模型");
 const S_BROWSER: Tr = tr("Browser", "浏览器");
 const S_FETCH: Tr = tr("Reading web pages", "读取网页");
 const S_SEARCH: Tr = tr("Web search", "网页搜索");
+const S_MCP: Tr = tr("MCP servers", "MCP 服务器");
 const S_GATEWAY: Tr = tr("Gateway", "Gateway");
 const S_QQ: Tr = tr("QQ", "QQ");
 const S_MAIL: Tr = tr("Email", "邮件");
@@ -186,6 +187,22 @@ const FETCH_PRIVATE: Tr = tr(
     "owners may also read pages on this host and the local network (fetch.private_network)",
     "owner 还可以读取本机和局域网里的页面（fetch.private_network）",
 );
+const MCP_NONE: Tr = tr(
+    "none configured ([mcp.servers.<name>] in config.toml)",
+    "没有配置（在 config.toml 里加 [mcp.servers.<名字>]）",
+);
+const MCP_OFF: Tr = tr("{}: turned off", "{}：已关闭");
+const MCP_CONFIGURED: Tr = tr("{}: {}", "{}：{}");
+const MCP_OK: Tr = tr("{}: {} tool(s): {}", "{}：{} 个工具：{}");
+const MCP_NO_TOOLS: Tr = tr(
+    "{}: started but offers no tools (check its tools filter)",
+    "{}：已启动，但没有提供工具（检查 tools 过滤设置）",
+);
+const MCP_FAILED: Tr = tr("{}: {}", "{}：{}");
+const MCP_GUESTS: Tr = tr(
+    "guests may use MCP tools (mcp in access.guest): they can do whatever the servers can",
+    "访客可以使用 MCP 工具（access.guest 里有 mcp）：服务器能做的事他们都能做",
+);
 const SEARCH_OFF: Tr = tr("off: no web_search tool", "已关闭：没有 web_search 工具");
 const SEARCH_OPENROUTER: Tr = tr(
     "OpenRouter's web plugin, billed per search with the same key",
@@ -263,6 +280,7 @@ pub const ALL: &[Tr] = &[
     S_BROWSER,
     S_FETCH,
     S_SEARCH,
+    S_MCP,
     S_GATEWAY,
     S_QQ,
     S_MAIL,
@@ -312,6 +330,13 @@ pub const ALL: &[Tr] = &[
     FETCH_OK,
     FETCH_FAILED,
     FETCH_PRIVATE,
+    MCP_NONE,
+    MCP_OFF,
+    MCP_CONFIGURED,
+    MCP_OK,
+    MCP_NO_TOOLS,
+    MCP_FAILED,
+    MCP_GUESTS,
     SEARCH_OFF,
     SEARCH_OPENROUTER,
     SEARXNG_OK,
@@ -457,6 +482,9 @@ pub async fn run(path: &Path, state: &Path, offline: bool) -> Result<bool> {
 
     report.section(S_SEARCH);
     report.add(search_findings(&config, offline).await);
+
+    report.section(S_MCP);
+    report.add(mcp_findings(&config, &workspace, offline).await);
 
     report.section(S_GATEWAY);
     report.add(gateway_findings(&config));
@@ -715,6 +743,49 @@ async fn fetch_findings(config: &Config, offline: bool) -> Vec<Finding> {
     }
     if config.fetch.private_network {
         findings.push(info(FETCH_PRIVATE.now()));
+    }
+    findings
+}
+
+/// Starts each server and lists its tools; offline only says what is set,
+/// since starting one may download it (`npx -y ...`).
+async fn mcp_findings(config: &Config, workspace: &Path, offline: bool) -> Vec<Finding> {
+    let servers = &config.mcp.servers;
+    if servers.is_empty() {
+        return vec![info(MCP_NONE.now())];
+    }
+    let mut findings: Vec<Finding> = servers
+        .iter()
+        .filter(|(_, s)| !s.enabled)
+        .map(|(name, _)| info(MCP_OFF.with(&[name])))
+        .collect();
+    if offline {
+        for (name, server) in servers.iter().filter(|(_, s)| s.enabled) {
+            let what = match (&server.command, &server.url) {
+                (Some(command), _) => format!("{command} {}", server.args.join(" ")),
+                (None, Some(url)) => url.clone(),
+                (None, None) => String::new(),
+            };
+            findings.push(info(MCP_CONFIGURED.with(&[name, what.trim()])));
+        }
+    } else {
+        let mcp = crate::mcp::Mcp::connect(&config.mcp, workspace).await;
+        for status in mcp.statuses() {
+            findings.push(match (&status.error, status.tools.len()) {
+                (Some(err), _) => fail(MCP_FAILED.with(&[&status.name, err])),
+                (None, 0) => warn(MCP_NO_TOOLS.with(&[&status.name])),
+                (None, n) => {
+                    ok(MCP_OK.with(&[&status.name, &n.to_string(), &status.tools.join(", ")]))
+                }
+            });
+        }
+    }
+    if config
+        .access
+        .guest
+        .contains(&crate::access::Capability::Mcp)
+    {
+        findings.push(warn(MCP_GUESTS.now()));
     }
     findings
 }

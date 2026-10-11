@@ -18,6 +18,7 @@ mod i18n;
 mod identity;
 mod llm;
 mod mail;
+mod mcp;
 mod memory;
 mod onboard;
 mod qq;
@@ -423,7 +424,7 @@ async fn run(cli: Cli) -> Result<()> {
             if store.identity()?.is_none() {
                 eprintln!("{}", text::FIRST_START.now());
             }
-            let agent = Arc::new(build_agent(&config, &state, store)?);
+            let agent = Arc::new(build_agent(&config, &state, store).await?);
             let bind = bind.unwrap_or_else(|| config.gateway.bind.clone());
             let gateway =
                 gateway::Gateway::new(agent, config.gateway.token(), config.access.clone());
@@ -484,12 +485,12 @@ async fn run(cli: Cli) -> Result<()> {
                 .iter()
                 .map(|path| read_upload(path))
                 .collect::<Result<Vec<_>>>()?;
-            let agent = build_agent(&config, &state, store)?;
+            let agent = build_agent(&config, &state, store).await?;
             turn(&agent, &session, &message, &uploads).await
         }
         Command::Chat { session } => {
             let name = store.identity()?.map(|i| i.name);
-            let agent = build_agent(&config, &state, store)?;
+            let agent = build_agent(&config, &state, store).await?;
             eprintln!(
                 "{}",
                 text::CHAT_BANNER.with(&[
@@ -566,7 +567,7 @@ fn completions_command(
 
 type CliAgent = Agent<llm::Client, BuiltinTools>;
 
-fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
+async fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> {
     let workspace = config
         .tools
         .workspace
@@ -596,6 +597,7 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         )?),
         _ => None,
     };
+    let mcp = mcp::Mcp::connect(&config.mcp, &workspace).await;
     let voice =
         voice::Transcriber::new(&config.model, config.agent.audio_model.as_deref(), &api_key)?;
     Ok(Agent {
@@ -607,6 +609,7 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
             .with_search(search)
             .with_browser(browser::Browser::new(&config.browser, state, &workspace))
             .with_fetch(fetch::Fetcher::new(&config.fetch)?)
+            .with_mcp(Some(mcp))
             .with_review(review),
         store,
         config: config::AgentConfig {
