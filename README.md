@@ -18,6 +18,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Identity setup on first start, web search | ✅ |
 | Browser, using the one installed on the host | ✅ |
 | Reading web pages without a browser (`web_fetch`) | ✅ |
+| Backup and restore (`backup`, `restore`) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -399,6 +400,34 @@ doas openclaw-rs service uninstall           # keeps state and logs
 The service runs as the given account with state in its `~/.openclaw-rs`,
 under `supervise-daemon` with automatic restart. `OPENROUTER_API_KEY`, `OPENCLAW_RS_TOKEN`, `QQ_APP_SECRET`, `MAIL_PASSWORD` and
 `TYPESAFE_API_KEY` from the installing shell are copied into `/etc/conf.d/openclaw-rs` (mode 0600).
+
+## Backup and restore
+
+```sh
+openclaw-rs backup                         # ./openclaw-backup-<date>-<time>.tar.gz
+openclaw-rs backup /mnt/usb/oc.tar.gz --no-workspace
+openclaw-rs restore oc.tar.gz              # on the new host, Gateway stopped
+openclaw-rs restore oc.tar.gz --force      # over existing state
+```
+
+A backup is one ordinary `.tar.gz` (`tar tzf` lists it) with `config.toml`,
+the three databases (`soul.sqlite`: identity and memories; `chats.sqlite`:
+sessions; `runtime.sqlite`: scheduled jobs, the mail queue, usage) and the
+workspace. The browser profile is left out. Databases are copied with SQLite's
+`VACUUM INTO`, so backing up while the Gateway runs is safe, e.g. from the
+system crontab. The file is mode 0600 since the config holds keys and
+passwords; keys only in `/etc/conf.d/openclaw-rs` are not in it.
+
+`restore` refuses while a Gateway is running, and over an existing config or
+state unless `--force`, which moves everything it replaces to
+`<state dir>/before-restore-<time>/` rather than deleting it. The whole
+archive is unpacked and checked first (each database's integrity, the config
+parses), so a damaged backup changes nothing. Only the files a backup writes
+are taken from the archive, and links are skipped. Workspace files are
+merged in: files of the same name are replaced (and kept aside), others stay.
+
+For the service, run both as its account so the right state is used and the
+files keep their owner: `doas -u pi openclaw-rs backup`.
 
 ## QQ (official bot)
 

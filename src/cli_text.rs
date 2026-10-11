@@ -144,6 +144,20 @@ const COMMANDS: &[(&str, Tr)] = &[
         ),
     ),
     (
+        "backup",
+        tr(
+            "Save the config, memory, chats, jobs and workspace to one .tar.gz file",
+            "把配置、记忆、对话、定时任务和工作区保存到一个 .tar.gz 文件",
+        ),
+    ),
+    (
+        "restore",
+        tr(
+            "Restore a backup made with `backup` (stop the Gateway first)",
+            "恢复用 `backup` 做的备份（请先停止 Gateway）",
+        ),
+    ),
+    (
         "init",
         tr(
             "Guided first-time setup: language, OpenRouter key, model",
@@ -216,6 +230,28 @@ const ARGS: &[(&str, &str, Tr)] = &[
     ("*", "version", tr("Print version", "显示版本")),
     ("*", "session", tr("Session name", "会话名")),
     ("ask", "message", tr("Message to send", "要发送的消息")),
+    (
+        "backup",
+        "file",
+        tr(
+            "File to write (default: openclaw-backup-<date>-<time>.tar.gz here)",
+            "要写入的文件（默认：当前目录下的 openclaw-backup-<日期>-<时间>.tar.gz）",
+        ),
+    ),
+    (
+        "backup",
+        "no_workspace",
+        tr("Leave the workspace out", "不包含工作区"),
+    ),
+    ("restore", "file", tr("Backup file", "备份文件")),
+    (
+        "restore",
+        "force",
+        tr(
+            "Replace an existing config and state; what is replaced is moved aside",
+            "替换现有的配置和数据；被替换的文件会移到一旁",
+        ),
+    ),
     (
         "doctor",
         "offline",

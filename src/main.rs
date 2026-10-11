@@ -3,6 +3,7 @@
 mod access;
 mod agent;
 mod attachments;
+mod backup;
 mod browser;
 mod cli_text;
 mod completions;
@@ -110,6 +111,22 @@ enum Command {
         /// Only read the config and this host; contact nothing.
         #[arg(long)]
         offline: bool,
+    },
+    /// Save the config, memory, chats, jobs and workspace to one .tar.gz file.
+    Backup {
+        /// File to write (default: openclaw-backup-<date>-<time>.tar.gz here).
+        file: Option<PathBuf>,
+        /// Leave the workspace out.
+        #[arg(long)]
+        no_workspace: bool,
+    },
+    /// Restore a backup made with `backup` (stop the Gateway first).
+    Restore {
+        /// Backup file.
+        file: PathBuf,
+        /// Replace an existing config and state; what is replaced is moved aside.
+        #[arg(long)]
+        force: bool,
     },
     /// Edit config.toml interactively: model, tools, gateway, QQ, email, search, access.
     Config,
@@ -323,6 +340,22 @@ async fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    // Before loading, so a new host without a config can be restored.
+    if let Command::Backup { file, no_workspace } = &cli.command {
+        let paths = backup::Paths::new(&state, &config_path);
+        let file = file.clone().unwrap_or_else(backup::default_name);
+        backup::backup(&paths, &file, !no_workspace)?.print();
+        return Ok(());
+    }
+    if let Command::Restore { file, force } = &cli.command {
+        let bind = Config::load(&config_path)
+            .map(|c| c.gateway.bind)
+            .unwrap_or_else(|_| config::GatewayConfig::default().bind);
+        backup::ensure_stopped(&bind)?;
+        let paths = backup::Paths::new(&state, &config_path);
+        backup::restore(&paths, file, *force)?.print();
+        return Ok(());
+    }
     if let Command::Init = cli.command {
         onboard::run(&config_path, i18n::current()).await?;
         return Ok(());
@@ -377,7 +410,11 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Service { .. } => unreachable!("handled before state is opened"),
-        Command::Config | Command::Init | Command::Doctor { .. } => {
+        Command::Config
+        | Command::Init
+        | Command::Doctor { .. }
+        | Command::Backup { .. }
+        | Command::Restore { .. } => {
             unreachable!("handled before the config is loaded")
         }
         Command::Completions { .. } => unreachable!("handled before state is opened"),
