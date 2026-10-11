@@ -32,6 +32,8 @@ pub struct ModelInfo {
     /// US dollars per million tokens, in and out; `None` when not listed.
     pub price: Option<(f64, f64)>,
     pub images: bool,
+    /// Takes audio input, so it can transcribe voice messages.
+    pub audio: bool,
     /// Supports tool calls, without which the agent cannot use its tools.
     pub tools: bool,
 }
@@ -151,6 +153,7 @@ fn parse_models(body: &Json) -> Vec<ModelInfo> {
                 context: m.get("context_length").and_then(Json::as_u64).unwrap_or(0),
                 price: price(m, "prompt").zip(price(m, "completion")),
                 images: has("/architecture/input_modalities", "image"),
+                audio: has("/architecture/input_modalities", "audio"),
                 tools: has("/supported_parameters", "tools"),
                 id,
             })
@@ -654,6 +657,7 @@ mod tests {
             context: 200_000,
             price: Some((3.0, 15.0)),
             images,
+            audio: false,
             tools,
         }
     }

@@ -83,6 +83,8 @@ struct Incoming {
     sender: String,
     text: String,
     files: Vec<QqFile>,
+    /// Voice messages QQ transcribed itself.
+    voice: Vec<String>,
 }
 
 /// A file attached to a QQ message, still on QQ's servers.
@@ -340,28 +342,55 @@ fn parse_incoming(event: &str, d: &Value) -> Option<Incoming> {
         }
         _ => return None,
     };
-    let files: Vec<QqFile> = d["attachments"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|a| {
-            let url = a["url"].as_str().filter(|u| !u.is_empty())?.to_owned();
-            let mime = a["content_type"].as_str().map(str::to_owned);
-            let name = a["filename"]
+    let mut files = Vec::new();
+    let mut voice = Vec::new();
+    for a in d["attachments"].as_array().into_iter().flatten() {
+        let mime = a["content_type"].as_str().map(str::to_owned);
+        let is_voice = mime
+            .as_deref()
+            .is_some_and(|m| m == "voice" || m.starts_with("audio/"));
+        if is_voice {
+            // QQ's own speech recognition, free and already done.
+            if let Some(said) = a["asr_refer_text"]
                 .as_str()
-                .filter(|n| !n.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    let ext = mime
-                        .as_deref()
-                        .and_then(|m| m.split('/').nth(1))
-                        .unwrap_or("bin");
-                    format!("qq-file.{ext}")
+                .filter(|t| !t.trim().is_empty())
+            {
+                voice.push(said.trim().to_owned());
+                continue;
+            }
+            // The original is SILK, which models do not take; QQ also offers WAV.
+            if let Some(wav) = a["voice_wav_url"].as_str().filter(|u| !u.is_empty()) {
+                files.push(QqFile {
+                    name: "qq-voice.wav".into(),
+                    mime: Some("audio/wav".into()),
+                    url: wav.to_owned(),
                 });
-            Some(QqFile { name, mime, url })
-        })
-        .collect();
-    if text.is_empty() && files.is_empty() {
+                continue;
+            }
+        }
+        let Some(url) = a["url"].as_str().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let name = a["filename"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let ext = match mime.as_deref() {
+                    Some("voice") => "silk",
+                    m => m.and_then(|m| m.split('/').nth(1)).unwrap_or("bin"),
+                };
+                format!("qq-file.{ext}")
+            });
+        // "voice" is not a MIME type; the name says what the file is.
+        let mime = mime.filter(|m| m.contains('/'));
+        files.push(QqFile {
+            name,
+            mime,
+            url: url.to_owned(),
+        });
+    }
+    if text.is_empty() && files.is_empty() && voice.is_empty() {
         return None;
     }
     Some(Incoming {
@@ -370,6 +399,7 @@ fn parse_incoming(event: &str, d: &Value) -> Option<Incoming> {
         sender,
         text,
         files,
+        voice,
     })
 }
 
@@ -569,7 +599,13 @@ fn handle<M: Model + 'static, T: Tools + 'static>(
                 Err(err) => problems.push(format!("{err:#}")),
             }
         }
-        let text = crate::attachments::with_problems(&incoming.text, &problems);
+        let heard: Vec<String> = incoming
+            .voice
+            .iter()
+            .map(|t| crate::voice::qq_transcript(t))
+            .collect();
+        let text = crate::voice::with_notes(&incoming.text, &heard);
+        let text = crate::attachments::with_problems(&text, &problems);
         let reply = match gateway
             .chat_unattended_with(actor, &session, &text, &uploads)
             .await
@@ -733,6 +769,7 @@ mod tests {
             model: Echo,
             summarizer: None,
             vision: None,
+            voice: None,
             tools: NoTools,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -817,6 +854,35 @@ mod tests {
     }
 
     #[test]
+    fn voice_messages_use_qq_transcripts_or_wav() {
+        let voice = json!({"id": "m5", "author": {"user_openid": "U"}, "content": "",
+        "attachments": [
+            {"content_type": "voice", "filename": "a.amr", "url": "https://multimedia.nt.qq.com.cn/a",
+             "asr_refer_text": " 你好 "},
+            {"content_type": "voice", "url": "https://multimedia.nt.qq.com.cn/b",
+             "voice_wav_url": "https://multimedia.nt.qq.com.cn/b.wav", "asr_refer_text": ""},
+            {"content_type": "voice", "url": "https://multimedia.nt.qq.com.cn/c"}
+        ]});
+        let parsed = parse_incoming("C2C_MESSAGE_CREATE", &voice).unwrap();
+        assert_eq!(parsed.voice, ["你好"]);
+        assert_eq!(
+            parsed.files,
+            [
+                QqFile {
+                    name: "qq-voice.wav".into(),
+                    mime: Some("audio/wav".into()),
+                    url: "https://multimedia.nt.qq.com.cn/b.wav".into(),
+                },
+                QqFile {
+                    name: "qq-file.silk".into(),
+                    mime: None,
+                    url: "https://multimedia.nt.qq.com.cn/c".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn downloads_only_from_qq_media_hosts() {
         let api = "https://api.bot.qq.com";
         let ok = |u: &str| download_allowed(&reqwest::Url::parse(u).unwrap(), api);
@@ -879,6 +945,7 @@ mod tests {
                 sender: "U1".into(),
                 text: "你好".into(),
                 files: Vec::new(),
+                voice: Vec::new(),
             })
         );
         let group = json!({"id": "m2", "group_openid": "G1", "author": {"member_openid": "M1"}, "content": " /天气 "});

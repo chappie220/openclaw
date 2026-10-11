@@ -28,6 +28,7 @@ mod setup;
 mod store;
 mod tools;
 mod usage;
+mod voice;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -595,10 +596,13 @@ fn build_agent(config: &Config, state: &Path, store: Store) -> Result<CliAgent> 
         )?),
         _ => None,
     };
+    let voice =
+        voice::Transcriber::new(&config.model, config.agent.audio_model.as_deref(), &api_key)?;
     Ok(Agent {
         model: llm::Client::new(&config.model, api_key)?,
         summarizer,
         vision,
+        voice: Some(voice),
         tools: BuiltinTools::new(workspace.clone(), config.tools.clone(), store.clone())?
             .with_search(search)
             .with_browser(browser::Browser::new(&config.browser, state, &workspace))
@@ -636,11 +640,7 @@ async fn turn(
         owner_command(&agent.store, input);
         return Ok(());
     }
-    let (files, problems) = agent.save_uploads(uploads);
-    for problem in &problems {
-        eprintln!("{}", text::ERROR.with(&[problem]));
-    }
-    let input = attachments::with_problems(input, &problems);
+    let (files, input) = agent.receive(input, uploads).await;
     let input = input.as_str();
     let mut stdout = std::io::stdout();
     let mut on_event = |event| match event {

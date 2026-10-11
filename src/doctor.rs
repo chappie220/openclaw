@@ -131,6 +131,16 @@ const VISION_BLIND: Tr = tr(
     "the image model {} cannot see images: pick another with `openclaw-rs init`",
     "图片模型 {} 不能看图片：用 `openclaw-rs init` 另选一个",
 );
+const HEARS: Tr = tr("{} transcribes voice messages", "{} 能把语音消息转成文字");
+const DEAF_NO_AUDIO: Tr = tr(
+    "{} cannot take audio and agent.audio_model is not set: voice messages from email or the Web UI stay untranscribed (QQ's own transcripts still work)",
+    "{} 不能接收音频，也没有设置 agent.audio_model：邮件和 Web UI 发来的语音不会转成文字（QQ 自带的识别结果仍然可用）",
+);
+const AUDIO_DEAF: Tr = tr(
+    "the audio model {} cannot take audio: pick one whose input includes audio",
+    "音频模型 {} 不能接收音频：请换一个支持音频输入的模型",
+);
+const ROLE_AUDIO: Tr = tr("agent.audio_model", "agent.audio_model");
 const ROLE_MAIN: Tr = tr("model.model", "model.model");
 const ROLE_SUMMARY: Tr = tr("agent.summary_model", "agent.summary_model");
 const ROLE_VISION: Tr = tr("agent.vision_model", "agent.vision_model");
@@ -279,6 +289,10 @@ pub const ALL: &[Tr] = &[
     BLIND_NO_VISION,
     VISION_IS,
     VISION_BLIND,
+    HEARS,
+    DEAF_NO_AUDIO,
+    AUDIO_DEAF,
+    ROLE_AUDIO,
     ROLE_MAIN,
     ROLE_SUMMARY,
     ROLE_VISION,
@@ -511,6 +525,7 @@ fn model_findings(config: &Config, models: Option<&[ModelInfo]>) -> Vec<Finding>
     let set = |m: &Option<String>| m.clone().filter(|m| !m.trim().is_empty());
     let main = config.model_id().ok().map(str::to_owned);
     let vision = set(&config.agent.vision_model);
+    let audio = set(&config.agent.audio_model);
     let mut findings = Vec::new();
     if let Some(vision) = &vision {
         findings.push(info(VISION_IS.with(&[vision])));
@@ -526,6 +541,7 @@ fn model_findings(config: &Config, models: Option<&[ModelInfo]>) -> Vec<Finding>
         (ROLE_MAIN, &main),
         (ROLE_SUMMARY, &set(&config.agent.summary_model)),
         (ROLE_VISION, &vision),
+        (ROLE_AUDIO, &audio),
         (ROLE_SEARCH, &search),
     ] {
         if let Some(id) = id
@@ -543,6 +559,18 @@ fn model_findings(config: &Config, models: Option<&[ModelInfo]>) -> Vec<Finding>
             (None, false) => findings.push(warn(BLIND_NO_VISION.with(&[&info.id]))),
             (Some(_), _) => {}
         }
+        match (&audio, info.audio) {
+            (None, true) => findings.push(ok(HEARS.with(&[&info.id]))),
+            (None, false) => findings.push(warn(DEAF_NO_AUDIO.with(&[&info.id]))),
+            (Some(_), _) => {}
+        }
+    }
+    if let Some(info) = audio.as_deref().and_then(find) {
+        findings.push(if info.audio {
+            ok(HEARS.with(&[&info.id]))
+        } else {
+            fail(AUDIO_DEAF.with(&[&info.id]))
+        });
     }
     if let Some(info) = vision.as_deref().and_then(find) {
         findings.push(if info.images {
@@ -834,6 +862,7 @@ mod tests {
             context: 0,
             price: None,
             images,
+            audio: images,
             tools,
         }
     }
@@ -857,12 +886,13 @@ mod tests {
         let mut config = Config::default();
         config.model.model = "a/sees".into();
         let found = model_findings(&config, Some(&catalog));
-        assert_eq!(statuses(&found), [Status::Ok], "{found:?}");
+        assert_eq!(statuses(&found), [Status::Ok, Status::Ok], "{found:?}");
 
-        // A main model that cannot see images and no image model is a warning.
+        // A main model that cannot see images or hear audio, with no image or
+        // audio model, is two warnings.
         config.model.model = "a/blind".into();
         let found = model_findings(&config, Some(&catalog));
-        assert_eq!(statuses(&found), [Status::Warn], "{found:?}");
+        assert_eq!(statuses(&found), [Status::Warn, Status::Warn], "{found:?}");
 
         // A blind image model, a missing summary model and a model without tools fail.
         config.model.model = "a/no-tools".into();

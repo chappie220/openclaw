@@ -19,6 +19,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | Browser, using the one installed on the host | ✅ |
 | Reading web pages without a browser (`web_fetch`) | ✅ |
 | Backup and restore (`backup`, `restore`) | ✅ |
+| Voice messages to text (QQ, email, Web UI) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -210,6 +211,31 @@ model. When the model given the images refuses them, the call is retried
 once with the files only listed, and the reply ends with a note in your
 language saying the images were not looked at and to set (or change)
 `agent.vision_model`.
+
+## Voice messages
+
+Voice messages become text when they arrive, so the model and the history
+only see words:
+
+- **QQ:** QQ sends its own speech recognition with each voice message; that
+  is used as is, free, with nothing downloaded. Without it, the WAV version QQ
+  offers is downloaded and transcribed as below.
+- **Email, Web UI, `ask --attach`:** audio attachments (wav, mp3, ogg, m4a,
+  aac, flac, aiff; up to 10 MB, three per message) are sent to a model with
+  audio input once and the transcript is added to the message. The file
+  stays in `inbox/`.
+
+The message then reads, for example,
+`[Voice message inbox/3fa2…-qq-voice.wav, transcribed: 明天早上八点叫我起床]`.
+When a file cannot be transcribed (an AMR or SILK file, a model without audio
+input), the note says why, and the model can tell the sender.
+
+```toml
+[agent]
+audio_model = "..."   # any OpenRouter model with audio input; default: the main model
+```
+
+`doctor` says whether the main model (or `audio_model`) takes audio.
 
 ## Stopping a turn
 

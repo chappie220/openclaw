@@ -131,6 +131,8 @@ pub struct Agent<M: Model, T: Tools> {
     pub summarizer: Option<M>,
     /// Answers the calls that carry images; `model` when not set.
     pub vision: Option<M>,
+    /// Transcribes voice messages when they arrive.
+    pub voice: Option<crate::voice::Transcriber>,
     pub tools: T,
     pub store: Store,
     pub config: AgentConfig,
@@ -193,6 +195,19 @@ impl<M: Model, T: Tools> Agent<M, T> {
     /// say which could not be kept, for the message text.
     pub fn save_uploads(&self, uploads: &[Upload]) -> (Vec<Attachment>, Vec<String>) {
         crate::attachments::save_all(&self.config.workspace, uploads)
+    }
+
+    /// Saves files that came with a message and transcribes its voice
+    /// messages: the files, and the message text with notes about files that
+    /// could not be kept and the transcripts.
+    pub async fn receive(&self, text: &str, uploads: &[Upload]) -> (Vec<Attachment>, String) {
+        let (files, problems) = self.save_uploads(uploads);
+        let text = crate::attachments::with_problems(text, &problems);
+        let notes = match &self.voice {
+            Some(voice) => voice.notes(&self.config.workspace, &files).await,
+            None => Vec::new(),
+        };
+        (files, crate::voice::with_notes(&text, &notes))
     }
 
     async fn turn(
@@ -771,6 +786,7 @@ mod tests {
             ])),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -838,6 +854,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -944,6 +961,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1063,6 +1081,7 @@ mod tests {
             }])),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Stuck,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1138,6 +1157,7 @@ mod tests {
             model,
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1343,6 +1363,7 @@ mod tests {
             }])),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig::default(),
@@ -1413,6 +1434,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1458,6 +1480,7 @@ mod tests {
             },
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Camera(dir.path().to_owned(), Default::default()),
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {
@@ -1664,6 +1687,7 @@ mod tests {
             model: Scripted(Mutex::new(looping)),
             summarizer: None,
             vision: None,
+            voice: None,
             tools: Echo,
             store: Store::open_in_memory().unwrap(),
             config: AgentConfig {

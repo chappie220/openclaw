@@ -172,6 +172,15 @@ const SECTIONS: &[Section] = &[
                 kind: Kind::Text,
             },
             Field {
+                path: &["agent", "audio_model"],
+                label: tr("Audio model", "音频模型"),
+                help: tr(
+                    "Model that transcribes voice messages (email, Web UI, QQ when QQ sends no transcript). Reset (-) to use the main model; set it when the main model has no audio input.",
+                    "把语音消息转成文字的模型（邮件、Web UI，以及 QQ 没给识别结果时）。输入 - 恢复为主模型；主模型不支持音频输入时需要设置。",
+                ),
+                kind: Kind::Text,
+            },
+            Field {
                 path: &["agent", "recall_limit"],
                 label: tr("Memories recalled per message", "每条消息自动召回的记忆数"),
                 help: tr(
@@ -953,9 +962,9 @@ mod tests {
         )
         .unwrap();
         // Model (section 2): new id, keep key, two fallbacks, keep retries, cache by number,
-        // a bad then a good budget, reset summary model, keep image model,
-        // recall, max steps and both guide fields.
-        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\n\ns\n";
+        // a bad then a good budget, reset summary model, keep image and audio
+        // models, recall, max steps and both guide fields.
+        let script = "2\na/new\n\nb/one, c/two ,\n\n3\nlots\n32000\n-\n\n\n\n\n\n\ns\n";
         let out = drive(&path, script);
         assert!(out.contains("\"lots\" is not a whole number"), "{out}");
         assert!(out.contains("Saved"), "{out}");
