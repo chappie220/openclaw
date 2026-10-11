@@ -23,6 +23,7 @@ Single-binary Rust rewrite of OpenClaw. No plugins: every feature is built in.
 | MCP client (stdio and Streamable HTTP servers) | ✅ |
 | Skills (`SKILL.md`, compatible with OpenClaw and Agent Skills) | ✅ |
 | Spending limits (daily, monthly, per guest, per turn) | ✅ |
+| Updates from GitHub Releases (`update`, optional auto-update) | ✅ |
 
 ## Build for Raspberry Pi (Alpine, aarch64)
 
@@ -36,6 +37,9 @@ scp target/aarch64-unknown-linux-musl/release/openclaw-rs pi:/usr/local/bin/
 ```
 
 Or build on the Pi itself: `apk add cargo build-base && cargo build --release`.
+
+Or download a release binary (`openclaw-rs-aarch64-unknown-linux-musl`)
+from GitHub Releases; later versions then come with [`update`](#updates).
 
 ## Usage
 
@@ -121,6 +125,8 @@ can run from a script.
   in over IMAP and SMTP, as `mail check` does.
 - Spending limits: which are set; a warning when QQ or email is on and
   guests have no limit.
+- Updates: this version and platform, whether a newer release exists, and
+  whether `update.auto` can replace the binary.
 - Access and service: owners are set when QQ or email is on; whether the
   OpenRC service is installed. The service runs as its own account, so run
   `doctor` as that account to check its config.
@@ -537,6 +543,40 @@ doas openclaw-rs service uninstall           # keeps state and logs
 The service runs as the given account with state in its `~/.openclaw-rs`,
 under `supervise-daemon` with automatic restart. `OPENROUTER_API_KEY`, `OPENCLAW_RS_TOKEN`, `QQ_APP_SECRET`, `MAIL_PASSWORD` and
 `TYPESAFE_API_KEY` from the installing shell are copied into `/etc/conf.d/openclaw-rs` (mode 0600).
+
+## Updates
+
+```sh
+openclaw-rs update --check     # is there a newer release?
+doas openclaw-rs update        # install it, and restart the service if it runs
+doas openclaw-rs update --rollback   # back to the binary the last update replaced
+```
+
+`update` takes the latest release of `update.repo` on GitHub, downloads the
+binary for this platform, checks it against the release's `SHA256SUMS`,
+makes sure it runs and reports the new version, and only then replaces the
+current binary, which is kept as `<binary>.old`. Run it as whoever owns the
+binary (root for `/usr/local/bin`).
+
+The Gateway also looks for a new release once a day and logs it. With
+`auto = true` it installs it on its own and restarts once no turn is
+running, in place (same process, so `supervise-daemon` keeps watching it);
+the browser and MCP servers are started again. That needs the service
+account to be able to write the binary, so keep it somewhere that account
+owns (e.g. `/home/pi/bin/openclaw-rs`, then `service install` again);
+`doctor` warns when it cannot.
+
+```toml
+[update]
+check = true                   # look once a day and log a new version
+auto = false                   # also install it and restart
+check_hours = 24
+repo = "chappie220/openclaw"   # where releases come from
+```
+
+Releases are published by pushing a tag that matches `Cargo.toml`'s version
+(`git tag v0.2.0 && git push origin v0.2.0`): the Release workflow builds
+the aarch64 and x86_64 musl binaries and their `SHA256SUMS`.
 
 ## Backup and restore
 

@@ -30,6 +30,7 @@ mod setup;
 mod skills;
 mod store;
 mod tools;
+mod update;
 mod usage;
 mod voice;
 
@@ -115,6 +116,15 @@ enum Command {
         /// Only read the config and this host; contact nothing.
         #[arg(long)]
         offline: bool,
+    },
+    /// Install the latest release from GitHub, or go back to the previous binary.
+    Update {
+        /// Only say whether a newer version exists.
+        #[arg(long)]
+        check: bool,
+        /// Put back the binary the last update replaced.
+        #[arg(long, conflicts_with = "check")]
+        rollback: bool,
     },
     /// List, install or remove skills.
     Skills {
@@ -380,6 +390,12 @@ async fn run(cli: Cli) -> Result<()> {
         backup::restore(&paths, file, *force)?.print();
         return Ok(());
     }
+    // Before loading, so a config this version cannot read can still be
+    // fixed by the next one.
+    if let Command::Update { check, rollback } = cli.command {
+        let config = Config::load(&config_path).unwrap_or_default();
+        return update::run(&config.update, check, rollback, &config.gateway.bind).await;
+    }
     if let Command::Init = cli.command {
         onboard::run(&config_path, i18n::current()).await?;
         return Ok(());
@@ -455,7 +471,8 @@ async fn run(cli: Cli) -> Result<()> {
         | Command::Init
         | Command::Doctor { .. }
         | Command::Backup { .. }
-        | Command::Restore { .. } => {
+        | Command::Restore { .. }
+        | Command::Update { .. } => {
             unreachable!("handled before the config is loaded")
         }
         Command::Completions { .. } | Command::Skills { .. } => {
@@ -502,6 +519,8 @@ async fn run(cli: Cli) -> Result<()> {
                 tokio::spawn(mail::run(bot, gateway.clone()));
             }
             tokio::spawn(gateway.clone().run_scheduler());
+            let idle = gateway.clone();
+            tokio::spawn(update::watch(config.update.clone(), move || idle.idle()));
             gateway::serve(gateway, &bind).await
         }
         Command::Sessions { action } => sessions(&store, action.unwrap_or(SessionsAction::List)),

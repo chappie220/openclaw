@@ -30,6 +30,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub limits: crate::limits::LimitsConfig,
+    pub update: crate::update::UpdateConfig,
     pub guide: GuideConfig,
     pub access: crate::access::AccessConfig,
 }

@@ -582,6 +582,29 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        title: tr("Updates", "更新"),
+        fields: &[
+            Field {
+                path: &["update", "check"],
+                label: tr("Look for new versions", "检查新版本"),
+                help: tr(
+                    "The Gateway checks GitHub Releases once a day and logs a new version.",
+                    "Gateway 每天检查一次 GitHub Releases，发现新版本就写进日志。",
+                ),
+                kind: Kind::Bool,
+            },
+            Field {
+                path: &["update", "auto"],
+                label: tr("Install updates on their own", "自动安装更新"),
+                help: tr(
+                    "The Gateway installs a new version (checksum checked, old binary kept) and restarts when no turn is running. The service account must be able to write the binary.",
+                    "Gateway 自动安装新版本（会校验 checksum，保留旧版本），并在没有对话进行时重启。服务账号需要能写入程序文件。",
+                ),
+                kind: Kind::Bool,
+            },
+        ],
+    },
+    Section {
         title: tr("Skills", "Skills"),
         fields: &[Field {
             path: &["skills", "enabled"],

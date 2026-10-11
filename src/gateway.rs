@@ -366,6 +366,12 @@ impl<M: Model + 'static, T: Tools + 'static> Gateway<M, T> {
         locks.entry(session.to_owned()).or_default().clone()
     }
 
+    /// Whether no turn is running in any session.
+    pub fn idle(&self) -> bool {
+        let locks = self.session_locks.lock().unwrap_or_else(|p| p.into_inner());
+        locks.values().all(|lock| lock.try_lock().is_ok())
+    }
+
     pub fn store(&self) -> &crate::store::Store {
         &self.agent.store
     }

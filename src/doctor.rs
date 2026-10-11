@@ -77,6 +77,7 @@ const S_QQ: Tr = tr("QQ", "QQ");
 const S_MAIL: Tr = tr("Email", "邮件");
 const S_ACCESS: Tr = tr("Access", "权限");
 const S_LIMITS: Tr = tr("Spending limits", "花费上限");
+const S_UPDATE: Tr = tr("Updates", "更新");
 const S_SERVICE: Tr = tr("Service", "服务");
 
 const CONFIG_OK: Tr = tr("{} loads", "{} 可以正常加载");
@@ -232,6 +233,36 @@ const LIMIT_NO_COSTS: Tr = tr(
     "{} may not report what calls cost; limits only count the costs it reports",
     "{} 可能不报告调用费用；上限只能统计它报告的费用",
 );
+const UPDATE_VERSION: Tr = tr("this is {} for {}", "当前版本 {}，平台 {}");
+const UPDATE_OFF: Tr = tr(
+    "the Gateway does not look for new versions (update.check = false)",
+    "Gateway 不检查新版本（update.check = false）",
+);
+const UPDATE_NOTIFY: Tr = tr(
+    "the Gateway logs new versions; update.auto = true installs them on its own",
+    "Gateway 发现新版本时会写进日志；设置 update.auto = true 可自动安装",
+);
+const UPDATE_AUTO: Tr = tr(
+    "new versions are installed on their own, and the Gateway restarts when no turn is running",
+    "新版本会自动安装，Gateway 会在没有对话进行时重启",
+);
+const UPDATE_CANNOT_WRITE: Tr = tr(
+    "update.auto is on but {} cannot be replaced by this account: keep the binary where the service account can write it, or update with `doas openclaw-rs update`",
+    "已开启 update.auto，但当前账号无法替换 {}：请把程序放在服务账号能写入的位置，或用 `doas openclaw-rs update` 更新",
+);
+const UPDATE_LATEST: Tr = tr(
+    "up to date ({} is the latest release)",
+    "已是最新（最新版本是 {}）",
+);
+const UPDATE_NEWER: Tr = tr(
+    "version {} is available: run `openclaw-rs update`",
+    "有新版本 {}：运行 `openclaw-rs update`",
+);
+const UPDATE_NO_ASSET: Tr = tr(
+    "the latest release ({}) has no binary for {}",
+    "最新版本（{}）没有 {} 平台的程序",
+);
+const UPDATE_FAILED: Tr = tr("cannot check for updates: {}", "无法检查更新：{}");
 const SEARCH_OFF: Tr = tr("off: no web_search tool", "已关闭：没有 web_search 工具");
 const SEARCH_OPENROUTER: Tr = tr(
     "OpenRouter's web plugin, billed per search with the same key",
@@ -316,6 +347,7 @@ pub const ALL: &[Tr] = &[
     S_MAIL,
     S_ACCESS,
     S_LIMITS,
+    S_UPDATE,
     S_SERVICE,
     CONFIG_OK,
     CONFIG_MISSING,
@@ -368,6 +400,15 @@ pub const ALL: &[Tr] = &[
     MCP_NO_TOOLS,
     MCP_FAILED,
     MCP_GUESTS,
+    UPDATE_VERSION,
+    UPDATE_OFF,
+    UPDATE_NOTIFY,
+    UPDATE_AUTO,
+    UPDATE_CANNOT_WRITE,
+    UPDATE_LATEST,
+    UPDATE_NEWER,
+    UPDATE_NO_ASSET,
+    UPDATE_FAILED,
     LIMIT_IS,
     LIMIT_NONE_TOTAL,
     LIMIT_NONE_GUESTS,
@@ -543,6 +584,9 @@ pub async fn run(path: &Path, state: &Path, offline: bool) -> Result<bool> {
 
     report.section(S_LIMITS);
     report.add(limits_findings(&config));
+
+    report.section(S_UPDATE);
+    report.add(update_findings(&config, offline).await);
 
     report.section(S_SERVICE);
     report.add([if Path::new("/etc/init.d/openclaw-rs").exists() {
@@ -980,6 +1024,51 @@ async fn mail_findings(config: &Config, offline: bool) -> Vec<Finding> {
             .collect(),
         Err(err) => vec![fail(MAIL_FAILED.with(&[&format!("{err:#}")]))],
     }
+}
+
+async fn update_findings(config: &Config, offline: bool) -> Vec<Finding> {
+    use crate::update;
+    let update = &config.update;
+    let mut findings = vec![info(
+        UPDATE_VERSION.with(&[update::VERSION, update::TARGET]),
+    )];
+    findings.push(match (update.check, update.auto) {
+        (false, _) => info(UPDATE_OFF.now()),
+        (true, false) => info(UPDATE_NOTIFY.now()),
+        (true, true) => ok(UPDATE_AUTO.now()),
+    });
+    if update.check
+        && update.auto
+        && let Ok(binary) = std::env::current_exe()
+        && !writable_dir(&binary)
+    {
+        findings.push(warn(
+            UPDATE_CANNOT_WRITE.with(&[&binary.display().to_string()]),
+        ));
+    }
+    if !offline {
+        findings.push(match update::latest(update).await {
+            Ok(release) if !release.has_binary() => {
+                warn(UPDATE_NO_ASSET.with(&[&release.version, update::TARGET]))
+            }
+            Ok(release) if release.is_newer() => warn(UPDATE_NEWER.with(&[&release.version])),
+            Ok(release) => ok(UPDATE_LATEST.with(&[&release.version])),
+            Err(err) => warn(UPDATE_FAILED.with(&[&format!("{err:#}")])),
+        });
+    }
+    findings
+}
+
+/// Whether this account can replace `binary` (write its directory).
+fn writable_dir(binary: &Path) -> bool {
+    let Some(dir) = binary.parent() else {
+        return false;
+    };
+    let Ok(dir) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: access only reads the NUL-terminated path.
+    unsafe { libc::access(dir.as_ptr(), libc::W_OK) == 0 }
 }
 
 fn limits_findings(config: &Config) -> Vec<Finding> {

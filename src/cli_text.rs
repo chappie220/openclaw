@@ -144,6 +144,13 @@ const COMMANDS: &[(&str, Tr)] = &[
         ),
     ),
     (
+        "update",
+        tr(
+            "Install the latest release from GitHub, or go back to the previous binary",
+            "从 GitHub 安装最新版本，或者回退到上一个版本",
+        ),
+    ),
+    (
         "skills",
         tr("List, install or remove skills", "列出、安装或删除 skill"),
     ),
@@ -280,6 +287,22 @@ const ARGS: &[(&str, &str, Tr)] = &[
         tr("Replace skills with the same name", "替换同名的 skill"),
     ),
     ("skills remove", "name", tr("Skill name", "skill 名")),
+    (
+        "update",
+        "check",
+        tr(
+            "Only say whether a newer version exists",
+            "只检查有没有新版本",
+        ),
+    ),
+    (
+        "update",
+        "rollback",
+        tr(
+            "Put back the binary the last update replaced",
+            "恢复上次更新前的程序",
+        ),
+    ),
     (
         "restore",
         "force",
